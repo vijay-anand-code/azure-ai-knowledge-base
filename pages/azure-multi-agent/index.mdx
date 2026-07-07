@@ -1,1 +1,97 @@
+# Azure Multi-Agent Foundry
 
+A multi-agent Azure operations assistant running on Microsoft Foundry. Routes user requests to specialist agents that read and selectively write across Azure resources, Azure DevOps, and Microsoft Entra ID.
+
+> The live workflow runs at **ai.azure.com/nextgen** under the "New Foundry" UI. Anything agents can't perform directly is escalated to Jira via Composio MCP.
+
+---
+
+## What this delivers
+
+The `AzureEndToEnd` workflow exposes one chat endpoint that:
+
+- Classifies the user request into one of three domains: **Azure**, **DevOps**, or **Entra**
+- Enumerates Azure subscriptions and classifies them as `prod` / `nonprod` by name
+- Routes to a domain agent that lists/inspects resources or performs nonprod writes
+- For prod-write or out-of-scope requests, files a Jira Story in the `SCRUM` project via Composio
+
+---
+
+## Architecture
+
+```
+User message
+     │
+     ▼
+┌─────────────────────┐
+│   ParentAgent       │  ← classifies domain + prod/nonprod
+│   (router)          │
+└──────┬──────────────┘
+       │
+  ┌────┴────────────────────────┐
+  │            │                │
+  ▼            ▼                ▼
+AzureAgent  DevOpsAgent   EntraAgent
+  │
+  ├── SubDiscovery   (list subscriptions)
+  ├── AzureRetrieve  (read resources)
+  └── prod-write → Jira via Composio
+```
+
+---
+
+## Agent breakdown
+
+| Agent | Responsibility | Can write to prod? |
+|---|---|---|
+| `ParentAgent` | Routes request, classifies domain | No |
+| `AzureAgent` | Azure resource reads + nonprod writes | Nonprod only |
+| `DevOpsAgent` | Azure DevOps pipelines, repos, work items | Nonprod only |
+| `EntraAgent` | Microsoft Entra ID users, groups, apps | Nonprod only |
+
+---
+
+## Key components
+
+**ParentAgent router** — The entry point. Reads the user message, decides which specialist agent handles it, and whether the target is prod or nonprod.
+
+**SubDiscovery** — Enumerates all Azure subscriptions the managed identity has access to. Classifies each as prod or nonprod based on the subscription name pattern.
+
+**AzureRetrieve** — Reads Azure resources (VMs, storage, networking) using the managed identity. No write access.
+
+**MCP tools** — Model Context Protocol tools expose external actions (Jira, DevOps) as callable functions the agents can invoke.
+
+**Composio integration** — Bridges the agents to Jira. When a prod-write is requested, the agent calls Composio which creates a Jira Story with full context.
+
+**MicrosoftEntra tools** — Read/write access to Entra ID objects scoped to the managed identity's permissions.
+
+---
+
+## Why multi-agent vs single agent
+
+A single agent handling Azure + DevOps + Entra would have a massive system prompt that degrades instruction-following, no separation of concerns, and no ability to scope permissions per domain. Multi-agent gives each specialist a focused prompt, its own tools, and its own permission scope. The router keeps classification logic separate from execution.
+
+---
+
+## Reading order
+
+Follow the sidebar pages in this order:
+
+1. [Prerequisites & setup](/azure-multi-agent/prerequisites)
+2. [Azure permissions & MI](/azure-multi-agent/azure-permissions)
+3. [MCP tools](/azure-multi-agent/mcp-tools)
+4. [Jira (Composio) setup](/azure-multi-agent/jira-setup)
+5. [Agents & system prompts](/azure-multi-agent/agents-prompts)
+6. [Workflow (AzureEndToEnd)](/azure-multi-agent/workflow)
+7. [Prod vs non-prod handling](/azure-multi-agent/prod-nonprod)
+8. [Publishing to Teams](/azure-multi-agent/publishing-teams)
+9. [Testing & troubleshooting](/azure-multi-agent/testing)
+10. [Evaluations](/azure-multi-agent/evaluations)
+
+---
+
+## What this section does NOT cover
+
+- General Azure fundamentals (see Microsoft Learn)
+- How to get access to the Azure subscription (talk to your manager)
+- LangChain concepts used inside the agents (see the [LangChain section](/langchain))
