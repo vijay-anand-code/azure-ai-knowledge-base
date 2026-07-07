@@ -1,1 +1,78 @@
+import { Cards, Card, Callout, Steps, Step } from 'nextra/components'
 
+# Azure AI Knowledge Base
+
+Internal engineering knowledge base — everything the team has built, learned, and documented. If you're new, start here.
+
+<Callout type="info">
+  **New joiner?** Read each topic's Overview page first, then follow the numbered sub-pages in order. You don't need to touch the GitHub repo to understand what's been built.
+</Callout>
+
+## What's in here
+
+Each section covers one technology or system the team works with. Every section has:
+- **Overview** — what it is, why we use it, how it fits our stack
+- **Architecture diagram** — visual map of how pieces connect
+- **Step-by-step docs** — setup, configuration, gotchas
+- **Code reference** — real code from our repos, explained inline
+
+---
+
+## Topics
+
+<Cards>
+  <Card
+    title="☁ Azure Multi-Agent Foundry"
+    href="/azure-multi-agent"
+    arrow
+  />
+  <Card
+    title="🔗 LangChain"
+    href="/langchain"
+    arrow
+  />
+  <Card
+    title="📦 Container Apps"
+    href="/container-apps"
+    arrow
+  />
+  <Card
+    title="⚙ GitHub Actions"
+    href="/github-actions"
+    arrow
+  />
+</Cards>
+
+---
+
+## Start here if you're new
+
+<Steps>
+
+### Read the overview for your assigned topic
+
+Each topic's Overview page explains what it does in plain English before touching any code.
+
+### Follow the sub-pages in sidebar order
+
+The sidebar is ordered — Prerequisites before Setup, Setup before Agents, and so on. Don't skip ahead.
+
+### Check the architecture diagram
+
+Every topic has a diagram showing how all the pieces connect. This gives you the mental model before reading the detailed docs.
+
+### Look at the code examples last
+
+Once you understand the concept, the code section shows real implementation from our repos with line-by-line explanations.
+
+</Steps>
+
+---
+
+## Adding new content
+
+When the team learns something new, add it here so the next person doesn't have to start from scratch.
+
+<Callout type="warning">
+  To add a new topic, create a new folder under `pages/` with an `index.mdx` and a `_meta.json`. Copy the structure from any existing section.
+</Callout>
