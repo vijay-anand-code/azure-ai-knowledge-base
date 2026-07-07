@@ -1,1 +1,9 @@
-
+{
+  "index": "Overview",
+  "concepts": "Core concepts",
+  "deployment": "Deployment guide",
+  "networking": "Networking & ingress",
+  "scaling": "Scaling & revisions",
+  "managed-identity": "Managed identity",
+  "code-examples": "Code examples"
+}
