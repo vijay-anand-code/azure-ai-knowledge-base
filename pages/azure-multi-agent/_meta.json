@@ -1,1 +1,13 @@
-
+{
+  "index": "Overview",
+  "prerequisites": "Prerequisites & setup",
+  "azure-permissions": "Azure permissions & MI",
+  "mcp-tools": "MCP tools",
+  "jira-setup": "Jira (Composio) setup",
+  "agents-prompts": "Agents & system prompts",
+  "workflow": "Workflow (AzureEndToEnd)",
+  "prod-nonprod": "Prod vs non-prod handling",
+  "publishing-teams": "Publishing to Teams",
+  "testing": "Testing & troubleshooting",
+  "evaluations": "Evaluations"
+}
