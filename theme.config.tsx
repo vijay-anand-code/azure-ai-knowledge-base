@@ -1,5 +1,6 @@
 import React from 'react'
 import { DocsThemeConfig } from 'nextra-theme-docs'
+import { useRouter } from 'next/router'
 
 const AzureLogo = () => (
   <span style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -47,6 +48,10 @@ const config: DocsThemeConfig = {
     text: 'Edit this page on GitHub →',
   },
 
+  feedback: {
+    content: null,
+  },
+
   footer: {
     text: (
       <span style={{ fontSize: '13px' }}>
@@ -54,6 +59,19 @@ const config: DocsThemeConfig = {
       </span>
     ),
   },
+
+  // Hide sidebar and TOC on homepage
+  main: ({ children }) => {
+    const { pathname } = useRouter()
+    if (pathname === '/') {
+      return (
+        <div style={{ padding: '2rem', maxWidth: 960, margin: '0 auto' }}>
+          {children}
+        </div>
+      )
+    }
+    return <>{children}</>
+  },
 }
 
-export default config
+export default config 
