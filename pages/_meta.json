@@ -1,1 +1,7 @@
-
+{
+  "index": "Home",
+  "azure-multi-agent": "Azure Multi-Agent Foundry",
+  "langchain": "LangChain",
+  "container-apps": "Container Apps",
+  "github-actions": "GitHub Actions"
+}
