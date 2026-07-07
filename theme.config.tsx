@@ -31,11 +31,6 @@ const config: DocsThemeConfig = {
     toggleButton: true,
   },
 
-  toc: {
-    backToTop: true,
-    title: 'On this page',
-  },
-
   navigation: { prev: true, next: true },
   darkMode: true,
 
