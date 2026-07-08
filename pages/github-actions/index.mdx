@@ -4,40 +4,60 @@ A built-in automation engine inside every GitHub repo. No third-party tools, no 
 
 ---
 
-## Why this section exists
+## What is it, really?
 
-When we started using GitHub Actions to deploy our Container Apps and run agent evaluations, there wasn't a single place that explained it for someone coming in cold. This section fixes that.
+Think of GitHub Actions like a personal assistant sitting inside your GitHub repo.
 
-It's based on a beginner course by Aaron — the transcript is the source of truth, not a paraphrase of the docs.
+Every time something happens — you push code, open a PR, merge a branch — GitHub Actions wakes up and asks: *"Is there a workflow for this?"* If yes, it runs it automatically.
 
----
-
-## What you get from this section
-
-| Page | What it covers |
-|---|---|
-| [What is it?](/github-actions/what-is-it) | The three core benefits and why GitHub Actions over Jenkins or CircleCI |
-| [Core concepts](/github-actions/core-concepts) | Workflows, jobs, steps, runners — explained plainly |
-| [Workflow file](/github-actions/workflow-file) | Breaking down every line of a real `.yml` file |
-| [CI/CD pipeline](/github-actions/cicd-pipeline) | Build → test → deploy wired together with `needs` |
-| [Use cases](/github-actions/use-cases) | What our team actually uses it for |
+No manual steps. No forgetting to run tests. No "it works on my machine" deploys.
 
 ---
 
-## Read this first
+## The three things it does well
 
-A few things the course glosses over too quickly:
+**Automates the boring stuff**
 
-**The `needs` keyword is the most important concept in CI/CD pipelines.** Without it, all your jobs run in parallel — a failed test won't stop a deploy. Always chain your jobs explicitly.
+Stop manually running tests, building code, or deploying apps. Actions handles all of it for you whenever you push or open a PR.
 
-**Pin your action versions** (`@v4` not just `@latest`). If a marketplace action releases a breaking change and you're unpinned, your workflow silently breaks.
+**Lives inside GitHub**
 
-**YAML indentation errors are the #1 beginner mistake.** Use a linter or the GitHub editor, which highlights formatting issues in real time.
+Workflows are YAML files in your repo — version controlled, visible to your team, and no third-party CI dashboard to manage. Same repo, same PR process, same access controls.
+
+**10,000+ prebuilt actions**
+
+The GitHub Marketplace has ready-made actions for almost everything — checkout, deploy, notify Slack, run tests, and more. Before writing custom scripts, always check there first.
+
+> Think of it like: every time something happens in your repo (a push, a PR, a schedule) — GitHub Actions can automatically respond and run tasks for you.
 
 ---
 
 ## How does it compare to Jenkins or CircleCI?
 
-GitHub Actions lives inside your repo — the workflow files are version controlled alongside your code. No separate CI server to manage, no credentials to a third-party dashboard to hand out. If someone can see the repo, they can see the workflows.
+GitHub Actions lives inside your repo. No separate server to manage, no third-party login to hand out. If someone can read the repo, they can read the workflows.
 
-Jenkins is more powerful for complex enterprise setups but requires a dedicated server and a lot of configuration overhead. CircleCI is good but it's another tool with another login. For a team already on GitHub, Actions is the obvious default.
+Jenkins is powerful but needs a dedicated server and a lot of config overhead. CircleCI is good but it's another tool with another dashboard. For a team already on GitHub, Actions is the obvious choice.
+
+---
+
+## What's in this section
+
+I went through this in stages — concepts first, then hands-on. Each page here matches one stage:
+
+| Page | What it covers |
+|---|---|
+| [What is it?](/github-actions/what-is-it) | The concepts before touching any code |
+| [Core concepts](/github-actions/core-concepts) | Workflows, jobs, steps, runners explained plainly |
+| [Workflow file](/github-actions/workflow-file) | My first real workflow — hello world, line by line |
+| [CI/CD pipeline](/github-actions/cicd-pipeline) | Build, test, and deploy wired together with real code |
+| [Use cases](/github-actions/use-cases) | What our team actually uses it for |
+
+---
+
+## Read this before anything else
+
+**The `needs` keyword is everything.** Without it, all your jobs run at the same time. A failed test won't stop a deploy. Always chain your jobs explicitly.
+
+**Pin your action versions.** Use `@v4` not `@latest`. If someone releases a breaking update, your workflow breaks silently on the next run.
+
+**YAML indentation is your biggest enemy.** Two spaces per level. No tabs. Ever. The GitHub editor highlights errors in real time — use it.
