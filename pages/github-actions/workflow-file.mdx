@@ -1,0 +1,136 @@
+# My first workflow file
+
+This was my first hands-on workflow. It checks out the repo code and prints the contents of a text file. Simple — but it's enough to understand how every part connects.
+
+---
+
+## The full file
+
+```yaml
+name: hello-world          # display name in the Actions tab
+
+on: push                   # trigger: runs whenever anyone pushes to any branch
+
+jobs:
+  hello-world-job:         # job name (can be anything descriptive)
+    runs-on: ubuntu-latest # runner: use GitHub's Ubuntu Linux VM
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4   # downloads the repo onto the runner
+
+      - run: echo "$(cat hello_world.txt)"  # prints the file contents to logs
+```
+
+---
+
+## What each line actually does
+
+### `name: hello-world`
+
+This is just the display name. It shows up in the Actions tab in your repo so you know which workflow is which. When you have 5 workflows, good names matter.
+
+---
+
+### `on: push`
+
+This is the trigger. Every time anyone pushes a commit to this repo (any branch), this workflow starts.
+
+You can be more specific:
+
+```yaml
+on:
+  push:
+    branches: [main]   # only triggers on pushes to main
+```
+
+But for learning, `on: push` is fine — it fires on everything.
+
+---
+
+### `jobs:`
+
+This is where you define what actually happens. You can have multiple jobs, and by default they run in parallel. Our hello world only has one.
+
+---
+
+### `hello-world-job:`
+
+The name of our job. This shows up in the Actions tab under the workflow run. Call it something that describes what the job does.
+
+---
+
+### `runs-on: ubuntu-latest`
+
+Tells GitHub: spin up an Ubuntu Linux virtual machine for this job. It's a fresh machine with nothing on it — no code, no files, nothing from previous runs.
+
+`ubuntu-latest` always uses the most recent stable Ubuntu version GitHub supports. For most workflows, this is all you need.
+
+---
+
+### `steps:`
+
+The list of things to do inside this job, in order. Step 1 runs first, then step 2, and so on. If a step fails, the job stops.
+
+---
+
+### `uses: actions/checkout@v4`
+
+This is the most important step in almost every workflow. Without it, your runner has no idea your code exists.
+
+`actions/checkout` is a prebuilt action from GitHub that downloads your repo's code onto the runner. The `@v4` pins it to version 4.
+
+Without this step, the next step (`cat hello_world.txt`) would fail because the file doesn't exist on the runner yet.
+
+---
+
+### `run: echo "$(cat hello_world.txt)"`
+
+This runs a shell command directly on the runner — same as typing it in your terminal. `cat hello_world.txt` reads the file, `echo` prints it to the Actions log.
+
+---
+
+## What happens end to end
+
+1. You commit this file to `.github/workflows/hello-world.yml`
+2. That commit is a push — so the workflow triggers immediately
+3. GitHub spins up a fresh Ubuntu VM
+4. Step 1: `checkout` downloads your repo code onto the VM
+5. Step 2: `echo "$(cat hello_world.txt)"` prints the file contents
+6. Job completes with a green checkmark
+7. VM is thrown away — nothing persists to the next run
+
+You can watch every step live in the **Actions tab** of your repo.
+
+---
+
+## Common mistakes at this stage
+
+**Forgetting `checkout`**
+
+If you skip the checkout step and try to read a file, you'll get a "file not found" error. The runner starts blank — your code isn't there until you explicitly check it out.
+
+**Wrong indentation**
+
+YAML is whitespace-sensitive. Two spaces per level, no tabs.
+
+This is wrong:
+```yaml
+steps:
+- name: Check out    # ← needs to be indented 2 spaces under steps
+```
+
+This is correct:
+```yaml
+steps:
+  - name: Check out  # ← 2 spaces in
+```
+
+**Using `@latest` instead of a pinned version**
+
+```yaml
+uses: actions/checkout@latest   # ❌ don't do this
+uses: actions/checkout@v4       # ✅ pin to a specific version
+```
+
+If the action releases a breaking change and you're on `@latest`, your workflow silently breaks on the next run.

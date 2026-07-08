@@ -1,0 +1,134 @@
+# Use cases
+
+What our team actually uses GitHub Actions for, plus patterns worth knowing for future reference.
+
+---
+
+## What we use it for
+
+### Deploying Container Apps on merge to `main`
+
+Every time a PR merges into main, a workflow builds the Docker image, pushes it to Azure Container Registry, and updates the Container App revision. No one manually deploys anything.
+
+The workflow chain looks like this:
+
+```
+PR merged to main
+     │
+     ▼
+build Docker image
+     │
+     ▼
+push to Azure Container Registry
+     │
+     ▼
+update Container App revision (new version goes live)
+```
+
+### Running agent evaluations in CI
+
+When someone changes an agent's system prompt or tools, a workflow automatically runs the evaluation suite. If the eval score drops below a set threshold, the PR check fails — the change can't merge until the score recovers.
+
+### Controlled prod deployments
+
+Pushes to `main` deploy to nonprod automatically. For production, we use `workflow_dispatch` — someone has to manually click "run" in the Actions tab. That manual step is the human gate before anything hits production.
+
+```yaml
+on:
+  push:
+    branches: [main]       # auto-deploys to nonprod
+  workflow_dispatch:        # manual trigger for prod
+```
+
+---
+
+## Useful patterns to know
+
+### Notifications to Teams or Slack
+
+Trigger a message whenever something specific happens — a new issue, a deployment, a failed build.
+
+```yaml
+name: notify on failure
+
+on:
+  workflow_run:
+    workflows: [build-test-deploy]
+    types: [completed]
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: send Teams message
+        run: |
+          curl -X POST "${{ secrets.TEAMS_WEBHOOK }}" \
+          -H "Content-Type: application/json" \
+          -d '{"text": "Build failed on main — check the Actions tab"}'
+```
+
+### Scheduled jobs
+
+Anything that should run on a timer rather than a code event:
+
+```yaml
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # every Monday at 9am UTC
+```
+
+Useful for weekly reports, cleanup scripts, or sending a standup reminder to the team channel.
+
+### Running tests on every PR
+
+Stop broken code from ever merging:
+
+```yaml
+on:
+  pull_request:
+    branches: [main]    # fires whenever a PR targets main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+      - run: npm install
+      - run: npm test
+```
+
+Every PR now shows a green check or red X before anyone reviews it. Reviewers know at a glance whether the code even passes tests.
+
+### Matrix builds — test across multiple versions
+
+Run the same job in parallel across different environments:
+
+```yaml
+jobs:
+  test:
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]   # three parallel jobs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm test
+```
+
+Three jobs run simultaneously — one per Node version. Useful when you need to make sure your code works across versions without running them one by one.
+
+---
+
+## What to learn next
+
+Once you're comfortable with the basics here:
+
+- **Reusable workflows** — when the same job appears in multiple workflow files, extract it into a reusable workflow that other repos can call with `uses:`
+- **Environments and secrets** — store API keys and credentials securely in GitHub Settings → Secrets, reference them as `${{ secrets.MY_KEY }}`
+- **GitHub Marketplace** — always search before writing custom scripts. Most integrations (Slack, Azure, Docker, Jira) already exist as actions

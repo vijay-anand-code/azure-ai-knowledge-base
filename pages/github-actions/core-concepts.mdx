@@ -1,0 +1,174 @@
+# Core concepts
+
+Five things to understand before writing any workflow. Everything in GitHub Actions is built from these.
+
+---
+
+## 1. Workflow
+
+A workflow is a YAML file that defines an automated process. It lives in a specific folder in your repo:
+
+```
+your-repo/
+└── .github/
+    └── workflows/
+        ├── hello-world.yml       # your first workflow
+        └── build-test-deploy.yml # your CI/CD pipeline
+```
+
+You can have as many workflow files as you want. Each one is independent. One for CI, one for deployment, one for scheduled cleanup — whatever makes sense.
+
+**Real world:** Think of a workflow like an SOP (Standard Operating Procedure) document. It says "when X happens, do Y, then Z." The difference is that this SOP actually runs itself.
+
+---
+
+## 2. Event (trigger)
+
+Every workflow needs at least one event that starts it. Without a trigger, the workflow never runs.
+
+```yaml
+on:
+  push:              # fires when someone pushes code
+```
+
+Common triggers:
+
+| Event | When it fires |
+|---|---|
+| `push` | Someone pushes a commit or tag |
+| `pull_request` | A PR is opened, updated, or closed |
+| `schedule` | A cron schedule (e.g. every Monday 9am) |
+| `workflow_dispatch` | Manually triggered from the Actions tab |
+
+You can filter by branch too:
+
+```yaml
+on:
+  push:
+    branches: [main]   # only fires on pushes to main, not other branches
+```
+
+**Real world:** The event is like a doorbell. You don't run to the door all day — you wait for the bell to ring. The `on` keyword defines what rings the bell.
+
+---
+
+## 3. Jobs
+
+A job is a group of steps that run on the same machine. By default, jobs run in **parallel** — they all start at the same time.
+
+```yaml
+jobs:
+  build:       # this job starts immediately
+    ...
+  test:        # this also starts immediately (at the same time as build!)
+    ...
+```
+
+If you want them to run in order, you use `needs`:
+
+```yaml
+jobs:
+  build:
+    ...
+  test:
+    needs: build   # waits for build to finish successfully before starting
+    ...
+  deploy:
+    needs: test    # waits for test to finish before starting
+    ...
+```
+
+**Real world:** Imagine building a house. You can't install the roof before the walls are up. `needs` is the rule that says "walls first, then roof." Without it, the roof crew shows up on day one and has nothing to work with.
+
+> **Critical:** Jobs are completely independent. Each job gets a fresh machine with nothing on it. If your test job needs the code, it has to check it out again. If it needs Node, it has to install it again. This feels repetitive but it's intentional — each job can use different tools and versions.
+
+---
+
+## 4. Runners
+
+A runner is the machine that actually executes your job. Every job needs one.
+
+```yaml
+runs-on: ubuntu-latest   # use GitHub's Ubuntu Linux VM
+```
+
+Two types:
+
+**GitHub-hosted runners** — GitHub spins up a brand new virtual machine for your job, runs it, then throws the machine away. You never manage it.
+
+```yaml
+runs-on: ubuntu-latest    # Linux (most common)
+runs-on: windows-latest   # Windows
+runs-on: macos-latest     # macOS
+```
+
+**Self-hosted runners** — A machine you own and manage. GitHub Actions connects to it and runs jobs there. Useful when you need specific hardware or network access that GitHub's machines don't have.
+
+For most things, use `ubuntu-latest`. It's free for public repos, fast, and almost every CLI tool works on Linux.
+
+**Real world:** The runner is like a contractor. GitHub sends them the job description (your workflow), they show up with their own tools (the VM), do the work, and leave. Next time, a fresh contractor shows up — no memory of what happened before.
+
+---
+
+## 5. Steps
+
+Steps are the individual tasks inside a job. They run one after another, in the order you write them.
+
+```yaml
+steps:
+  - name: Check out code          # step 1
+    uses: actions/checkout@v4
+
+  - name: Install Node            # step 2 (runs after step 1)
+    uses: actions/setup-node@v4
+    with:
+      node-version: '20.x'
+
+  - name: Install packages        # step 3
+    run: npm install
+
+  - name: Run tests               # step 4
+    run: npm test
+```
+
+Two types of steps:
+
+**`uses`** — runs a prebuilt action from the marketplace
+
+```yaml
+- uses: actions/checkout@v4   # downloads your repo code onto the runner
+```
+
+**`run`** — runs any shell command you'd type in a terminal
+
+```yaml
+- run: npm install            # same as typing this in your terminal
+- run: npm test
+```
+
+If any step fails, the job stops. Steps after the failed one don't run.
+
+**Real world:** Steps are like a recipe. You can't frost the cake before it's baked. You can't run tests before installing the packages. Order matters, and if you mess up a step, you stop and fix it before moving on.
+
+---
+
+## How it all fits together
+
+```
+Workflow file (.yml)
+│
+├── on: push          ← Event: what triggers this
+│
+└── jobs:
+    ├── build         ← Job 1: runs on ubuntu-latest
+    │   └── steps:
+    │       ├── checkout code    ← Step 1
+    │       ├── install node     ← Step 2
+    │       └── npm run build    ← Step 3
+    │
+    └── test          ← Job 2: needs build to pass first
+        └── steps:
+            ├── checkout code    ← Step 1 (repeated — fresh machine)
+            ├── install node     ← Step 2 (repeated)
+            └── npm test         ← Step 3
+```

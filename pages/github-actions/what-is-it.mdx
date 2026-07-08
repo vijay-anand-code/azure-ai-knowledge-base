@@ -1,0 +1,70 @@
+# What is GitHub Actions?
+
+GitHub Actions automates the way you build, test, and deploy your code — directly from your GitHub repository. It's not a separate product. It's built into every repo, zero setup required.
+
+---
+
+## A real-world analogy
+
+Imagine you work at a restaurant. Every time a new order comes in (event), the kitchen automatically starts cooking (workflow), different chefs handle different dishes in parallel (jobs), and each chef follows a recipe step by step (steps).
+
+GitHub Actions works exactly like that — but for your code.
+
+- **Order comes in** = you push code to GitHub
+- **Kitchen starts cooking** = your workflow triggers
+- **Different chefs** = different jobs running (build, test, deploy)
+- **Recipe steps** = the individual commands inside each job
+
+---
+
+## The three core benefits
+
+### 1. Efficiency — automate the boring stuff
+
+Before GitHub Actions, every developer on the team had to manually run tests before merging. Someone would forget. Bugs would slip through. Deployments were done by hand and someone always got it slightly wrong.
+
+With Actions, the moment you push code:
+- Tests run automatically
+- Build errors get caught immediately
+- Deployments happen the same way every single time
+
+### 2. It lives inside GitHub — no third-party tools
+
+Other CI/CD tools need a separate account, a separate dashboard, and separate credentials to manage. GitHub Actions is already inside your repo.
+
+The workflow files sit next to your code. They go through the same code review process. If someone has access to the repo, they can see the workflows. No extra logins, no extra tools.
+
+### 3. Custom workflows — you control exactly what happens
+
+Simple pipeline or complex multi-environment deployment — you define it. The YAML file is the source of truth. If it's in the file, it runs. If it's not, it doesn't.
+
+---
+
+## The GitHub Marketplace
+
+GitHub has a marketplace with 10,000+ prebuilt actions. Before writing any custom script, search there first.
+
+Common ones you'll use on every project:
+
+| Action | What it does |
+|---|---|
+| `actions/checkout@v4` | Downloads your repo code onto the runner |
+| `actions/setup-node@v4` | Installs Node.js on the runner |
+| `actions/upload-pages-artifact@v3` | Packages your build for GitHub Pages |
+| `actions/deploy-pages@v4` | Deploys the artifact to GitHub Pages |
+
+> **Important:** Always pin to a specific version like `@v4`. Never use `@latest`. If the action author releases a breaking change, your unpinned workflow breaks on the next run — and you won't know why until you check the logs.
+
+---
+
+## Why not Jenkins or CircleCI?
+
+| | GitHub Actions | Jenkins | CircleCI |
+|---|---|---|---|
+| Where it lives | Inside your GitHub repo | Separate server you manage | Third-party platform |
+| Setup needed | None | Significant | Account + config |
+| Workflow files | YAML in your repo | Jenkinsfile + server config | YAML on their platform |
+| Cost for public repos | Free | Infrastructure cost | Limited free tier |
+| Third-party integration | Not needed | Required | Required |
+
+For a team already on GitHub, Actions is the obvious default. You get CI/CD without leaving the platform you're already using.

@@ -1,0 +1,226 @@
+# CI/CD pipeline — build, test, deploy
+
+After hello world, I built a real pipeline. Three jobs: build the app, test it, then deploy it. Each job only runs if the previous one succeeded.
+
+This is the pattern you'll use for almost every real project.
+
+---
+
+## Stage 1 — Build and test
+
+I started with just build and test before adding deploy. Here's the full file with comments explaining every line:
+
+```yaml
+name: build-test-deploy   # name shown in the Actions tab
+
+on: push                  # trigger on every push to any branch
+
+jobs:
+
+  # ─── JOB 1: BUILD ───────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest   # fresh Ubuntu VM for this job
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4   # download repo code onto the runner
+                                    # without this, npm can't find your files
+
+      - name: use node.js
+        uses: actions/setup-node@v4  # install Node.js on the runner
+        with:
+          node-version: '20.x'       # pin to Node 20 (LTS)
+
+      - run: npm install    # install all packages from package.json
+      - run: npm run build  # build the app (generates output files)
+
+  # ─── JOB 2: TEST ────────────────────────────────────────────
+  test:
+    needs: build            # ← only runs if the build job succeeded
+                            # without this, test and build run at the same time
+    runs-on: ubuntu-latest  # fresh VM — completely separate from the build VM
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4   # have to check out again — fresh machine
+                                    # doesn't know anything about the build job
+
+      - name: use node.js
+        uses: actions/setup-node@v4  # have to install node again — same reason
+        with:
+          node-version: '20.x'
+
+      - run: npm install   # have to install packages again — fresh machine
+      - run: npm test      # runs your test suite
+```
+
+---
+
+## Why does everything repeat in the test job?
+
+This confused me at first. Why do I have to checkout and install Node again in the test job when I just did it in build?
+
+Because **jobs are completely independent**. Each job gets a brand new machine. The build job's machine gets thrown away after it finishes. The test job starts on a completely separate, blank machine.
+
+Think of it like two different contractors. Contractor A builds the thing. When they're done, they leave. Contractor B arrives to test it — they need to bring their own tools and get their own copy of the blueprints.
+
+The upside: each job can use different tools. The test job could run on Windows while the build job runs Linux. You have full control per job.
+
+---
+
+## The `needs` keyword — the most critical part
+
+```yaml
+test:
+  needs: build
+```
+
+Without `needs`, build and test start at exactly the same time. The test job might finish before the build even starts — and it would either fail or test stale code.
+
+With `needs: build`, the test job waits. If build fails, test never runs. If build succeeds, test starts.
+
+**Real world:** You wouldn't test a car before the engine is installed. `needs` is that common sense rule, enforced automatically.
+
+---
+
+## Stage 2 — Adding deploy
+
+After getting build and test working, I added the deploy job. Here's the full three-job pipeline:
+
+```yaml
+name: build-test-deploy
+
+on: push
+
+jobs:
+
+  # ─── JOB 1: BUILD ───────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+
+      - name: use node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - run: npm install
+      - run: npm run build
+
+  # ─── JOB 2: TEST ────────────────────────────────────────────
+  test:
+    needs: build           # waits for build ✓
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+
+      - name: use node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - run: npm install
+      - run: npm test
+
+  # ─── JOB 3: DEPLOY ──────────────────────────────────────────
+  deploy:
+    needs: test            # waits for test ✓ (which already waited for build)
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write         # allow this job to write to GitHub Pages
+      id-token: write      # allow GitHub to verify who is deploying
+
+    environment:
+      name: Production     # links to the Production environment in repo Settings
+      url: ${{ steps.deployment.outputs.page_url }}  # grabs the live URL after deploy
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # GitHub auto-provides this token
+                                              # gives the workflow permission to write
+
+      - name: use node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: configure GitHub Pages
+        uses: actions/configure-pages@v4
+        with:
+          static_site_generator: next   # tells Pages this is a Next.js project
+
+      - run: npm install
+      - run: npm run build   # build again — fresh machine, needs its own build
+
+      - name: upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out    # the folder Next.js builds into
+
+      - name: deploy to GitHub Pages
+        id: deployment   # give this step an ID so we can reference its output above
+        uses: actions/deploy-pages@v4
+```
+
+---
+
+## The chain in action
+
+```
+push to repo
+     │
+     ▼
+  build ──── fails? → stops here, test and deploy never run
+     │
+     ▼ (only if build passed)
+   test ──── fails? → stops here, deploy never runs
+     │
+     ▼ (only if test passed)
+  deploy ──── pushes to GitHub Pages
+```
+
+This is continuous delivery. Every push that passes all checks gets deployed automatically. You never manually deploy.
+
+---
+
+## The deploy job explained
+
+**`permissions`**
+
+```yaml
+permissions:
+  pages: write
+  id-token: write
+```
+
+The workflow needs to tell GitHub what it's allowed to do. `pages: write` lets it publish to GitHub Pages. `id-token: write` lets GitHub verify the deployment identity. Without these, the deploy step fails with a permission error.
+
+**`${{ secrets.GITHUB_TOKEN }}`**
+
+GitHub automatically creates this token for every workflow run. You don't set it up — it just exists. It's the key that lets your workflow authenticate with GitHub. You declare it in the checkout step so the rest of the deploy job has write access.
+
+**Artifacts**
+
+The build generates static files in an `out/` folder. The `upload-pages-artifact` action packages them up. The `deploy-pages` action sends the package to GitHub Pages. Think of the artifact as a ZIP file — build creates it, upload packages it, deploy ships it.
+
+---
+
+## Before deploying — two things to set up in GitHub
+
+**1. Create a Production environment**
+
+Go to your repo → Settings → Environments → New environment → name it `Production`.
+
+You can add approval rules here (require someone to approve before deploy runs). Leave default for now.
+
+**2. Enable GitHub Pages**
+
+Go to Settings → Pages → under Build and deployment → set Source to **GitHub Actions**.
+
+After both are set up, your next push runs the full pipeline and deploys automatically.
