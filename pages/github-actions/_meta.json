@@ -1,9 +1,8 @@
 {
   "index": "Overview",
-  "concepts": "Core concepts",
-  "deployment": "Deployment guide",
-  "networking": "Networking & ingress",
-  "scaling": "Scaling & revisions",
-  "managed-identity": "Managed identity",
-  "code-examples": "Code examples"
+  "what-is-it": "What is it?",
+  "core-concepts": "Core concepts",
+  "workflow-file": "Workflow file",
+  "cicd-pipeline": "CI/CD pipeline",
+  "use-cases": "Use cases"
 }
