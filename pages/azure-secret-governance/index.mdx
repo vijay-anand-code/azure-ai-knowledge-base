@@ -1,0 +1,143 @@
+# Azure Secret Governance
+
+An automated system that monitors Azure App Registration client secrets across your tenant,
+raises Jira incidents, sends Teams alerts, and rotates expiring secrets on a weekly schedule —
+with no manual intervention.
+
+> The system runs as two containers inside a single Azure Container App, triggered weekly by
+> Azure Automation Runbooks. All credentials are managed via a User-Assigned Managed Identity
+> — no client secrets stored in code or config files.
+
+---
+
+## What this delivers
+
+The governance system exposes a single Container App endpoint that:
+
+- **Scans** all App Registrations in your Entra ID tenant and classifies secrets by urgency
+- **Raises Jira tickets** automatically with the right severity (P1/P2/P3) and links the epic
+- **Sends Teams Adaptive Card alerts** to the configured channel with days remaining
+- **Rotates secrets** for P1/P2/P3 secrets automatically and stores new values in Key Vault
+- **Updates SharePoint** with a live audit trail — every secret has a row showing its full lifecycle
+- **Closes the loop** via Jira automation — when an engineer resolves the ticket, SharePoint
+  updates to `Rotated` within seconds, no manual update needed
+
+---
+
+## Architecture
+
+```
+Azure Automation Runbooks (weekly schedule)
+        │
+        ▼
+Container App — secret-governance-v2
+┌─────────────────────────────────────────────────────┐
+│  Container 1 — LangChain Agent  (port 8000, public) │
+│    POST /run           ← triggered by runbook        │
+│    POST /chat          ← Teams bot conversations     │
+│    POST /jira-webhook  ← Jira ticket close events    │
+│    POST /teams-webhook ← Teams Bot Service messages  │
+│                                                      │
+│  Container 2 — Monitor REST API (port 8001, internal)│
+│    POST /tools/run_secret_monitoring                 │
+│    POST /tools/fetch_azure_secrets                   │
+│    POST /tools/write_sharepoint_row                  │
+│    POST /tools/create_jira_ticket                    │
+│    POST /tools/update_on_jira_close                  │
+└─────────────────────────────────────────────────────┘
+        │                         │
+        ▼                         ▼
+Microsoft Graph API          Azure Key Vault
+  - Entra ID (App Regs)        - Config secrets
+  - SharePoint list            - Rotated secret values
+  - Teams alerts
+```
+
+---
+
+## Secret expiry buckets
+
+| Bucket | Days remaining | Severity | What the system does |
+|--------|---------------|----------|--------------------|
+| **P1** | 0 – 7 days | CRITICAL | Jira ticket + Teams alert + SharePoint row + Auto-rotation |
+| **P2** | 8 – 30 days | WARNING | Jira ticket + Teams alert + SharePoint row + Auto-rotation |
+| **P3** | 31 – 60 days | INFO | Jira ticket + SharePoint row + Auto-rotation |
+| **B0** | 61+ days | SAFE | Logged only — no SharePoint entry, no Jira ticket |
+| **ExpiredManualReview** | -1 to -7 days | EXPIRED | Jira ticket + Teams alert — **NOT auto-rotated** |
+| **Ignore** | -8+ days | — | Completely skipped |
+
+> **ExpiredManualReview secrets are never auto-rotated.** A secret that has already expired
+> may be actively in use by an application that will break on rotation without coordination.
+> The system flags it for human review instead.
+
+---
+
+## Key components
+
+**Monitoring runbook** — Runs weekly. Scans all App Registrations via Microsoft Graph,
+classifies each secret into a bucket, raises Jira tickets, sends Teams alerts, and writes
+rows to the SharePoint `SecretAlertRegistry` list.
+
+**Rotation runbook** — Runs weekly after monitoring. Reads only actionable SharePoint rows
+(smart OData filtering — skips already-rotated secrets). Creates new secrets sequentially,
+stores values in Key Vault, and updates SharePoint to `RotatedPendingDeployment`.
+
+**Container 1 (LangChain Agent)** — The external-facing API. Receives runbook triggers,
+Teams bot messages, and Jira webhook events. Uses LangChain to orchestrate tool calls
+against Container 2.
+
+**Container 2 (Monitor REST API)** — The internal API that does the actual work: reading
+Entra ID, writing to SharePoint, creating Jira tickets, sending Teams alerts. Called by
+Container 1 over localhost — never exposed externally.
+
+**UAMI (User-Assigned Managed Identity)** — The system's identity. Authenticates to
+Microsoft Graph, Key Vault, and Container Registry using managed identity — no client
+secrets anywhere in the codebase.
+
+**SecretAlertRegistry** — A SharePoint list that serves as the audit trail. Every monitored
+secret has a row. The rotation status moves from `JiraRaised` → `RotatedPendingDeployment`
+→ `Rotated` as the lifecycle progresses.
+
+**Jira webhook** — When an engineer resolves a Jira ticket after deploying the rotated secret,
+Jira automation fires a webhook to Container 1. Container 1 calls Container 2 directly
+(no GPT-4o involved) and updates SharePoint to `Rotated` within 2–3 seconds.
+
+**Teams bot** — A standalone module in Container 1. Admins can type `@SecretBot status`
+or ask natural language questions in a Teams channel and get live answers from the agent.
+
+---
+
+## Why two containers instead of one
+
+A single container handling both the LangChain agent and the monitoring tools would mix
+concerns — the agent's conversational logic with the low-level Graph API calls. Splitting
+them gives:
+
+- **Container 1** can be replaced or upgraded without touching monitoring logic
+- **Container 2** can be called directly (e.g. from the Jira webhook) without going through
+  the LangChain agent — which avoids Azure OpenAI rate limits for simple operations
+- **Independent scaling** — Container 2 can handle batch SharePoint writes in parallel while
+  Container 1 handles the agent conversation
+
+---
+
+## Reading order
+
+Follow the sidebar pages in this order:
+
+1. [Infrastructure & provisioning](/azure-secret-governance/infrastructure)
+2. [SharePoint setup](/azure-secret-governance/sharepoint)
+3. [GitHub Actions CI/CD](/azure-secret-governance/github-actions)
+4. [Jira automation](/azure-secret-governance/jira)
+5. [Dashboard](/azure-secret-governance/dashboard)
+6. [Teams bot](/azure-secret-governance/teams-bot)
+
+---
+
+## What this section does NOT cover
+
+- General Azure fundamentals (see Microsoft Learn)
+- How to get access to the Azure subscription (talk to your manager)
+- LangChain concepts used inside Container 1 (see the [LangChain section](/langchain))
+- Azure Container Apps internals (see the [Container Apps section](/container-apps))
+- GitHub Actions basics (see the [GitHub Actions section](/github-actions))
