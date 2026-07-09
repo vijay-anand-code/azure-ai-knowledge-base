@@ -49,6 +49,18 @@ const topics = [
     iconBg: 'rgba(251,146,60,0.15)',
     accentColor: '#fb923c',
   },
+  {
+    icon: '🔐',
+    title: 'Azure Secret Governance',
+    href: '/azure-secret-governance',
+    desc: 'Automated monitoring, alerting, and rotation of Azure App Registration secrets. Raises Jira tickets, sends Teams alerts, and auto-rotates expiring secrets weekly.',
+    status: 'Ready',
+    statusColor: '#16a34a',
+    statusBg: 'rgba(22,163,74,0.15)',
+    pages: '7 pages',
+    iconBg: 'rgba(239,68,68,0.15)',
+    accentColor: '#ef4444',
+  },
 ]
 
 const steps = [
@@ -258,9 +270,9 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* Stats */}
+          {/* Stats — updated to reflect 5 topics, 2 ready */}
           <div style={{ display: 'flex', gap: 10, marginTop: '2rem' }}>
-            {[['4', 'Topics covered', '#3b82f6'], ['1', 'Ready to read', '#10b981'], ['3', 'In progress', '#f59e0b'], ['Jul 2026', 'Last updated', '#8b5cf6']].map(([val, label, color]) => (
+            {[['5', 'Topics covered', '#3b82f6'], ['2', 'Ready to read', '#10b981'], ['3', 'In progress', '#f59e0b'], ['Jul 2026', 'Last updated', '#8b5cf6']].map(([val, label, color]) => (
               <div key={label} className="stat-card">
                 <div style={{ fontSize: 20, fontWeight: 700, color: color as string, marginBottom: 2 }}>{val}</div>
                 <div style={{ fontSize: 11, color: '#475569', fontWeight: 500 }}>{label}</div>
