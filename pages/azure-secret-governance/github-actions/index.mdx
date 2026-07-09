@@ -1,0 +1,392 @@
+---
+title: GitHub Actions CI/CD
+description: Automated container builds and deployments triggered on every code push
+---
+
+import { Callout, Steps, Tabs, Tab } from 'nextra/components'
+
+# GitHub Actions CI/CD
+
+Every time you push code to the `main` branch, GitHub Actions automatically builds the changed
+container images, pushes them to Azure Container Registry, and deploys them to the Container App.
+No more running `az acr build` and `az containerapp update` manually.
+
+---
+
+## What changed — before and after
+
+**Before GitHub Actions:**
+
+```bash
+# Every code change required running these manually
+az acr build --registry acrsecretmonitor0103 --image secret-governance/monitor-mcp:latest ./container-2
+az containerapp update --name secret-governance-v2 --container-name monitor-mcp --image ...
+```
+
+**After GitHub Actions — just push:**
+
+```bash
+git add container-2/main.py
+git commit -m "Fix SharePoint update logic"
+git push   # ← GitHub does the rest automatically in ~2 minutes
+```
+
+---
+
+## How authentication works — OIDC (no passwords)
+
+Traditional CI/CD stores Azure credentials as GitHub Secrets (client ID + client secret).
+This system uses **OIDC (OpenID Connect)** instead — GitHub gets a temporary token that
+lasts 5 minutes, so there are no long-lived secrets to manage or rotate.
+
+```
+GitHub Actions starts
+      ↓
+GitHub generates a short-lived OIDC token (valid 5 minutes)
+      ↓
+Azure checks: "Do I trust GitHub Actions for this repo?"
+      ↓ (yes — we configured a federated credential)
+Azure issues an access token
+      ↓
+GitHub uses token to run az acr build and az containerapp update
+      ↓
+Token expires automatically — nothing to clean up
+```
+
+---
+
+## One-time setup
+
+<Steps>
+
+### Create App Registration for GitHub Actions
+
+This App Registration is only for GitHub Actions — it has no relationship to the
+governance system's UAMI or other App Registrations.
+
+```bash
+# Create the App Registration
+az ad app create --display-name "github-actions-secret-governance"
+# Copy the "appId" from the output — this is your CLIENT_ID
+```
+
+### Create Service Principal
+
+```bash
+# Replace <APP_ID> with the appId from the previous step
+az ad sp create --id <APP_ID>
+# Copy the "id" from the output — this is your SP_OBJECT_ID
+```
+
+### Add federated credential (the OIDC trust)
+
+This tells Azure: "Trust GitHub Actions running for this specific repository on the main branch."
+
+```bash
+APP_ID="<APP_ID_FROM_STEP_1>"
+
+# Create the federated credential config
+cat > /tmp/fed.json << 'EOF'
+{
+  "name": "github-actions-federation",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:YOUR_ORG/secret-governance-app:ref:refs/heads/main",
+  "description": "GitHub Actions OIDC for secret-governance-app",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+EOF
+
+az ad app federated-credential create \
+  --id $APP_ID \
+  --parameters "@/tmp/fed.json"
+```
+
+<Callout type="warning">
+  The `subject` field must exactly match your GitHub repo path and branch.
+  For `vijay-anand-code/secret-governance-app` on `main`, it would be:
+  `repo:vijay-anand-code/secret-governance-app:ref:refs/heads/main`
+</Callout>
+
+### Grant Azure permissions to the Service Principal
+
+```bash
+SP_OBJECT_ID="<SP_OBJECT_ID_FROM_STEP_2>"
+SUBSCRIPTION_ID="<YOUR_SUBSCRIPTION_ID>"
+RG="<YOUR_RESOURCE_GROUP>"
+ACR_NAME="<YOUR_ACR_NAME>"
+
+# Contributor on Resource Group — needed to update the Container App
+az role assignment create \
+  --assignee $SP_OBJECT_ID \
+  --role "Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG"
+
+# AcrPush on Container Registry — needed to push built images
+az role assignment create \
+  --assignee $SP_OBJECT_ID \
+  --role "AcrPush" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG/providers/Microsoft.ContainerRegistry/registries/$ACR_NAME"
+```
+
+### Add GitHub Secrets
+
+Go to your GitHub repository → **Settings → Secrets and variables → Actions → New repository secret**
+
+Add these three secrets — these are not passwords, just IDs:
+
+| Secret name | Value |
+|-------------|-------|
+| `AZURE_CLIENT_ID` | The `appId` from Step 1 |
+| `AZURE_TENANT_ID` | Your Azure tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Your Azure subscription ID |
+
+### Add the workflow file
+
+Create `.github/workflows/deploy.yml` in your `secret-governance-app` repository.
+The workflow file is already provided — copy it from the infra repo to your app repo.
+
+</Steps>
+
+---
+
+## How the workflow file works
+
+```yaml
+# .github/workflows/deploy.yml
+
+name: Deploy Secret Governance
+
+on:
+  # AUTO TRIGGER: runs when you push changes to container-1/ or container-2/ folders
+  # If you change a file outside these folders (e.g. README), nothing deploys
+  push:
+    branches:
+      - main
+    paths:
+      - 'container-1/**'   # only triggers if container-1 files changed
+      - 'container-2/**'   # only triggers if container-2 files changed
+
+  # MANUAL TRIGGER: adds a "Run workflow" button in the GitHub Actions tab
+  # Useful when you want to redeploy without a code change
+  workflow_dispatch:
+    inputs:
+      container:
+        description: 'Which container to deploy?'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both          # rebuild and deploy both containers
+          - container-1   # rebuild and deploy Container 1 only
+          - container-2   # rebuild and deploy Container 2 only
+
+# PERMISSIONS: required for OIDC authentication
+# id-token: write allows GitHub to request a short-lived Azure token
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  # JOB 1: Detect which containers actually changed
+  # This prevents unnecessary rebuilds — if you only changed container-2/main.py,
+  # there's no reason to rebuild container-1
+  detect-changes:
+    name: Detect Changed Containers
+    runs-on: ubuntu-latest
+    outputs:
+      container1: ${{ steps.changes.outputs.container1 }}
+      container2: ${{ steps.changes.outputs.container2 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # need last 2 commits to compare what changed
+
+      - name: Detect changes
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger: use the dropdown selection
+            SELECTION="${{ github.event.inputs.container }}"
+            echo "container1=$([ '$SELECTION' = 'both' ] || [ '$SELECTION' = 'container-1' ] && echo true || echo false)" >> $GITHUB_OUTPUT
+            echo "container2=$([ '$SELECTION' = 'both' ] || [ '$SELECTION' = 'container-2' ] && echo true || echo false)" >> $GITHUB_OUTPUT
+          else
+            # Push trigger: check git diff for changed files
+            if git diff --name-only HEAD~1 HEAD | grep -q "^container-1/"; then
+              echo "container1=true" >> $GITHUB_OUTPUT
+            else
+              echo "container1=false" >> $GITHUB_OUTPUT
+            fi
+            if git diff --name-only HEAD~1 HEAD | grep -q "^container-2/"; then
+              echo "container2=true" >> $GITHUB_OUTPUT
+            else
+              echo "container2=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  # JOB 2: Build and deploy Container 2 (Monitor API) FIRST
+  # Container 2 must deploy before Container 1 to avoid
+  # "ContainerAppOperationInProgress" errors when both try to update at the same time
+  deploy-container-2:
+    name: Build & Deploy Container 2 (Monitor API)
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.container2 == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}       # GitHub Secret — not a password
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}       # GitHub Secret — not a password
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }} # GitHub Secret — not a password
+
+      - name: Build and push Container 2 image
+        run: |
+          # az acr build runs the Docker build entirely in Azure — no local Docker needed
+          # Tags with both the commit SHA (for rollback) and "latest"
+          az acr build \
+            --registry acrsecretmonitor0103 \
+            --resource-group Foundry-Project \
+            --image secret-governance/monitor-mcp:${{ github.sha }} \
+            --image secret-governance/monitor-mcp:latest \
+            ./container-2
+
+      - name: Update Container App — Container 2
+        run: |
+          # Deploy the new image to the running Container App
+          # Uses the commit SHA tag so Azure pulls the exact new image
+          az containerapp update \
+            --name secret-governance-v2 \
+            --resource-group Foundry-Project \
+            --container-name monitor-mcp \
+            --image acrsecretmonitor0103.azurecr.io/secret-governance/monitor-mcp:${{ github.sha }}
+
+  # JOB 3: Build and deploy Container 1 (LangChain Agent) AFTER Container 2
+  # "needs: [detect-changes, deploy-container-2]" means this waits for Job 2 to finish
+  # "always()" + result checks allow this to run even if Container 2 was skipped
+  deploy-container-1:
+    name: Build & Deploy Container 1 (LangChain Agent)
+    runs-on: ubuntu-latest
+    needs: [detect-changes, deploy-container-2]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.container1 == 'true' &&
+      (needs.deploy-container-2.result == 'success' || needs.deploy-container-2.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push Container 1 image
+        run: |
+          az acr build \
+            --registry acrsecretmonitor0103 \
+            --resource-group Foundry-Project \
+            --image secret-governance/langchain-agent:${{ github.sha }} \
+            --image secret-governance/langchain-agent:latest \
+            ./container-1
+
+      - name: Update Container App — Container 1
+        run: |
+          az containerapp update \
+            --name secret-governance-v2 \
+            --resource-group Foundry-Project \
+            --container-name langchain-agent \
+            --image acrsecretmonitor0103.azurecr.io/secret-governance/langchain-agent:${{ github.sha }}
+
+      - name: Verify health
+        run: |
+          # Wait 30 seconds for the new container to start up
+          sleep 30
+          # Check the /health endpoint — fails the job if the container is not responding
+          FQDN=$(az containerapp show \
+            --name secret-governance-v2 \
+            --resource-group Foundry-Project \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          curl --fail https://$FQDN/health
+```
+
+---
+
+## Day-to-day usage
+
+<Tabs items={['Automatic (recommended)', 'Manual trigger', 'Emergency rollback']}>
+  <Tab>
+    ```bash
+    # Edit your code, then just push
+    # GitHub Actions detects which container changed and deploys only that one
+
+    git add container-2/decision_engine.py
+    git commit -m "Fix B0 secrets being written to SharePoint"
+    git push
+
+    # Output in GitHub Actions:
+    # ✅ Detect Changed Containers    — 6s
+    # ⊘ Build Container 1             — skipped (no changes)
+    # ✅ Build Container 2             — 1m 18s (only changed container rebuilt)
+    # ✅ Deployment Summary            — 2s
+    ```
+  </Tab>
+  <Tab>
+    ```
+    GitHub → secret-governance-app → Actions → Deploy Secret Governance → Run workflow
+
+    Choose:
+    ┌─────────────────────────────┐
+    │ Which container to deploy?  │
+    │ ○ both          ← redeploy everything
+    │ ○ container-1   ← LangChain agent only
+    │ ● container-2   ← Monitor API only
+    └─────────────────────────────┘
+    ```
+  </Tab>
+  <Tab>
+    ```bash
+    # Each deploy tags the image with the commit SHA
+    # To roll back to a previous version:
+
+    # 1. Find the commit SHA you want to roll back to
+    git log --oneline -10
+
+    # 2. Update the Container App to use that specific image tag
+    az containerapp update \
+      --name secret-governance-v2 \
+      --resource-group Foundry-Project \
+      --container-name monitor-mcp \
+      --image acrsecretmonitor0103.azurecr.io/secret-governance/monitor-mcp:<COMMIT_SHA>
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Troubleshooting
+
+### ContainerAppOperationInProgress error
+
+This happens when both containers try to deploy at exactly the same time.
+The workflow prevents this by deploying Container 2 first and Container 1 second.
+If you see this error from a manual `az containerapp update`, wait 2 minutes and retry.
+
+### MSAL token cache errors in Azure CLI
+
+If you see `Can't find token from MSAL cache` after `az login`, clear the cache:
+
+```bash
+az account clear
+az cache purge
+rm -f ~/.azure/msal_token_cache.*
+az login
+```
+
+### Workflow didn't trigger on push
+
+The workflow only triggers when files inside `container-1/` or `container-2/` change.
+If you pushed changes to other files (runbooks, docs, infra), use the manual trigger instead.

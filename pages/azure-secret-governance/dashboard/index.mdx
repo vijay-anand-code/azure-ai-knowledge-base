@@ -1,0 +1,217 @@
+---
+title: Dashboard
+description: Live interactive dashboard showing secret expiry status — hosted on Azure Static Web Apps
+---
+
+import { Callout, Steps, Tabs, Tab } from 'nextra/components'
+
+# Dashboard
+
+An interactive HTML dashboard that reads live data from the `SecretAlertRegistry` SharePoint
+list and displays it with KPI cards, charts, and a filterable table.
+Hosted on Azure Static Web Apps (free tier — $0/month).
+
+---
+
+## What it shows
+
+- **KPI cards** — Total secrets monitored, P1 Critical count, P2 Warning count, Rotated count
+- **Donut chart** — secrets broken down by expiry bucket (P1/P2/P3/B0/Expired)
+- **Bar chart** — secrets broken down by alert status (JiraRaised/TeamsAlerted/Escalated/Rotated...)
+- **Filter buttons** — click P1 to show only critical secrets in the table
+- **Live table** — all secrets with Jira ticket links, expiry dates, days remaining, tenant name
+- **Microsoft 365 login** — only SharePoint site members can see the data
+
+---
+
+## How access control works
+
+The dashboard uses Microsoft Authentication Library (MSAL.js) — users sign in with their
+existing Microsoft 365 account. The Graph API token issued is scoped to that user's own
+permissions — so if a user is not a member of the ContosoIT SharePoint site, they see no data.
+
+```
+User opens dashboard URL
+      ↓
+MSAL.js checks for existing Microsoft 365 session (silent)
+      ↓ (if already logged in to M365 — no popup needed)
+Gets a Graph API token scoped to that user's account
+      ↓
+Calls Graph API to read SecretAlertRegistry
+      ↓
+Graph returns only data the user has permission to see
+      ↓
+Dashboard renders live data
+```
+
+---
+
+## Setup
+
+<Steps>
+
+### Create an App Registration for the dashboard
+
+```bash
+# Create the App Registration
+az ad app create --display-name "secret-governance-dashboard"
+# Copy the "appId" from the output
+```
+
+Then configure it in the portal:
+
+**Entra ID → App registrations → secret-governance-dashboard → Authentication**
+
+1. Click **Add a platform → Single-page application**
+2. Redirect URI: `https://<YOUR_STATIC_WEB_APP_URL>` *(add after Step 3)*
+3. Tick **Access tokens** and **ID tokens**
+4. Save
+
+**API permissions → Add a permission → Microsoft Graph → Delegated → Sites.Read.All**
+
+- Click **Grant admin consent**
+
+<Callout type="info">
+  `Sites.Read.All` Delegated is appropriate here because the user authenticates with their
+  own Microsoft 365 account. The token is scoped to what that user can already access —
+  so users without SharePoint site membership automatically see no data.
+  This is different from the UAMI's `Sites.Selected` which is for system-level access.
+</Callout>
+
+### Update the dashboard config
+
+Open `dashboard/index.html` and update the `CONFIG` section at the top of the `<script>` block:
+
+```javascript
+// dashboard/index.html
+// Update these values for your environment
+
+const CONFIG = {
+  // App Registration client ID from Step 1
+  clientId: "9008f91e-e0bb-42d0-9a24-f58f8f17cd3a",
+
+  // Your Azure tenant ID
+  tenantId: "70afdd80-5f5b-4a09-a90d-383f126e8c33",
+
+  // Full composite SharePoint site ID (hostname,siteCollectionId,webId)
+  siteId: "contoso.sharepoint.com,eb7d38df-...,d35b6bd8-...",
+
+  // SecretAlertRegistry list ID
+  listId: "25b457eb-cf85-4c11-b712-cfa882898c6b",
+
+  // Your Jira base URL — used to generate clickable ticket links in the table
+  jiraBaseUrl: "https://yourcompany.atlassian.net",
+};
+```
+
+### Create the Azure Static Web App
+
+```bash
+# Free tier — $0/month
+az staticwebapp create \
+  --name secret-governance-dashboard \
+  --resource-group <YOUR_RG> \
+  --location "eastasia" \
+  --sku Free
+```
+
+### Deploy the dashboard
+
+```bash
+# Get the deployment token
+TOKEN=$(az staticwebapp secrets list \
+  --name secret-governance-dashboard \
+  --resource-group <YOUR_RG> \
+  --query "properties.apiKey" -o tsv)
+
+# Create a folder with just the dashboard file
+mkdir -p ~/dashboard
+cp ~/index.html ~/dashboard/index.html
+
+# Deploy using SWA CLI (no global install needed — npx downloads it)
+cd ~
+npx @azure/static-web-apps-cli deploy ~/dashboard \
+  --deployment-token $TOKEN \
+  --env production
+```
+
+### Add redirect URI to App Registration
+
+After deployment you get a URL like `https://salmon-pebble-123456.azurestaticapps.net`.
+
+**Entra ID → App registrations → secret-governance-dashboard → Authentication**
+
+Add this URL as a redirect URI in the Single-page application platform.
+
+### Test the dashboard
+
+Open the URL in a browser. You should see:
+
+1. **Sign in with Microsoft** button
+2. Click it → Microsoft 365 login popup (or silent if already signed in)
+3. Dashboard loads with live data from SharePoint
+
+</Steps>
+
+---
+
+## Embedding in SharePoint
+
+You can embed the dashboard directly on a SharePoint page so users see it without
+opening a separate URL.
+
+**SharePoint page → Edit → Add web part → Embed → paste:**
+
+```html
+<iframe
+  src="https://salmon-pebble-123456.azurestaticapps.net"
+  width="100%"
+  height="950"
+  frameborder="0">
+</iframe>
+```
+
+<Callout type="warning">
+  SharePoint blocks iframes from external domains by default.
+  A SharePoint admin must allow your Static Web App domain:
+
+  **SharePoint Admin Center → Settings → Pages → Allowed iframe domains**
+
+  Add: `salmon-pebble-123456.azurestaticapps.net`
+</Callout>
+
+---
+
+## Deploying updates
+
+When you update `index.html`, redeploy with the same command:
+
+```bash
+# Upload new index.html to Cloud Shell, then:
+cp ~/index.html ~/dashboard/index.html
+cd ~
+npx @azure/static-web-apps-cli deploy ~/dashboard \
+  --deployment-token $TOKEN \
+  --env production
+```
+
+The `$TOKEN` variable is the deployment token from Step 3. If you lost it:
+
+```bash
+TOKEN=$(az staticwebapp secrets list \
+  --name secret-governance-dashboard \
+  --resource-group <YOUR_RG> \
+  --query "properties.apiKey" -o tsv)
+```
+
+---
+
+## Cost
+
+| Resource | Tier | Monthly cost |
+|----------|------|-------------|
+| Azure Static Web Apps | Free | **$0** |
+| Bandwidth (dashboard loads) | Included | **$0** |
+| Custom domain (optional) | Included in Free | **$0** |
+
+The Free tier supports 100GB bandwidth/month — more than enough for any internal dashboard.

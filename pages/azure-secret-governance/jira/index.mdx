@@ -1,0 +1,237 @@
+---
+title: Jira Automation
+description: Auto-update SharePoint when Jira tickets are resolved — no manual updates needed
+---
+
+import { Callout, Steps, Tabs, Tab } from 'nextra/components'
+
+# Jira Automation
+
+When an engineer resolves a Jira ticket after deploying a rotated secret, SharePoint
+automatically updates the row's `AlertStatus` to `Rotated` within seconds.
+No one needs to open SharePoint and manually update a row.
+
+---
+
+## Real world example
+
+> **Tuesday 14:30** — Engineer deploys the new secret for `PaymentService-Prod`.
+> They open Jira and resolve ticket `KAN-1442`.
+>
+> **Tuesday 14:30:03** — Jira automation fires a webhook to the Container App.
+>
+> **Tuesday 14:30:05** — SharePoint row for `KAN-1442` updates from
+> `RotatedPendingDeployment` → `Rotated`. The engineer never touched SharePoint.
+
+---
+
+## Why we bypass LangChain for this
+
+The original design sent the webhook through the LangChain agent (which uses GPT-4o).
+This was slow and unreliable:
+
+| Approach | Speed | Cost | Reliability |
+|----------|-------|------|-------------|
+| Via LangChain (old) | 30–60 seconds | ~$0.01 per webhook | Hit rate limits (429) |
+| Direct Container 2 call (current) | 2–3 seconds | $0 | Always works |
+
+The webhook endpoint now calls Container 2 directly — no AI reasoning needed to update
+a SharePoint field.
+
+```
+Jira resolves ticket
+      ↓
+POST /jira-webhook  (Container 1)
+      ↓
+Extract ticket key from payload
+      ↓
+POST /tools/update_on_jira_close  (Container 2 — direct, no GPT-4o)
+      ↓
+Find SharePoint row where JiraTicketKey = KAN-1442
+      ↓
+Update AlertStatus → "Rotated"
+Update RotationDetectedDate → today
+      ↓
+Done in 2-3 seconds
+```
+
+---
+
+## Setup
+
+<Steps>
+
+### Create the Jira automation rule
+
+In Jira, go to:
+
+**Project Settings → Automation → Create rule**
+
+### Configure the trigger
+
+Set the trigger to fire when a ticket moves to resolved:
+
+| Field | Value |
+|-------|-------|
+| **Trigger** | Work item transitioned |
+| **To status** | Resolved *(or Done / Closed — whichever your project uses)* |
+
+### Add the webhook action
+
+Add an action: **Send web request**
+
+| Field | Value |
+|-------|-------|
+| **URL** | `https://<YOUR_CONTAINER_APP_FQDN>/jira-webhook` |
+| **HTTP method** | POST |
+| **Headers** | `Content-Type: application/json` |
+| **Body** | See below |
+
+```json
+{
+  "issue": {
+    "key": "{{issue.key}}",
+    "fields": {
+      "status": {
+        "name": "{{issue.status.name}}"
+      }
+    }
+  }
+}
+```
+
+The `{{issue.key}}` and `{{issue.status.name}}` are Jira smart values — they get filled in
+with the actual ticket details when the automation fires.
+
+### Name and enable the rule
+
+- **Rule name:** `Trigger Secret Agent on Ticket Close`
+- Click **Enable**
+
+</Steps>
+
+---
+
+## How the webhook endpoint works
+
+```python
+# container-1/main.py
+# This endpoint receives the POST from Jira automation
+
+@app.post("/jira-webhook")
+async def jira_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return Response(status_code=200)   # always return 200 to Jira even on parse errors
+
+    # Extract the ticket key and new status from Jira's payload
+    issue  = payload.get("issue", {})
+    key    = issue.get("key") or payload.get("issueKey", "Unknown")
+    status = (issue.get("fields", {}).get("status", {}).get("name") or "").lower()
+
+    # Only act when the ticket is actually closed — ignore transitions to In Progress etc.
+    closed_statuses = {"done", "closed", "resolved"}
+    if status in closed_statuses:
+        # Fire the SharePoint update as a background task — return 200 to Jira immediately
+        # This prevents Jira from timing out if SharePoint is slow to respond
+        asyncio.create_task(_update_sharepoint_on_close(key))
+        return {"status": "accepted", "issue": key}
+
+    # For non-closing transitions, acknowledge but do nothing
+    return {"status": "received", "issue": key, "action": "none"}
+
+
+async def _update_sharepoint_on_close(jira_key: str):
+    """
+    Directly calls Container 2 to update SharePoint.
+    No LangChain, no GPT-4o — just a simple HTTP call.
+    """
+    try:
+        today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        result = await _call_monitor("update_on_jira_close", {
+            "jira_key": jira_key,
+            "today":    today,
+        })
+        log.info("SharePoint updated for %s: %s rows marked Rotated", jira_key, result.get("updated", 0))
+    except Exception as e:
+        log.exception("Failed to update SharePoint for %s: %s", jira_key, e)
+```
+
+```python
+# container-2/main.py
+# This endpoint does the actual SharePoint update
+
+@app.post("/tools/update_on_jira_close")
+async def api_update_on_jira_close(req: JiraCloseReq):
+    """
+    Finds all SharePoint rows where JiraTicketKey matches the closed ticket
+    and marks them as Rotated.
+    """
+    sp_data = await get_sharepoint_state()
+    today   = req.today
+    updated = 0
+
+    for item in sp_data.get("items", []):
+        f = item.get("fields", {})
+        # Find the row that belongs to this Jira ticket
+        if f.get("JiraTicketKey") == req.jira_key:
+            await write_sharepoint_row(item["id"], {
+                "AlertStatus":          "Rotated",           # final status
+                "RotationDetectedDate": today,               # when rotation was confirmed
+                "ExpiryNotice":         "Rotated — Completed",
+                "LastChecked":          today,
+            })
+            updated += 1
+
+    return {"updated": updated, "jira_key": req.jira_key}
+```
+
+---
+
+## Verifying the automation works
+
+After setting up, test by resolving a Jira ticket that has a corresponding SharePoint row:
+
+1. Go to Jira → find a ticket with status `RotatedPendingDeployment` in SharePoint
+2. Resolve the ticket
+3. Check the Jira automation audit log: **Project Settings → Automation → Audit log**
+4. You should see: **"Trigger Secret Agent on Ticket Close" → SUCCESS**
+5. Check SharePoint — the row should now show `AlertStatus: Rotated`
+
+### Check container logs if something goes wrong
+
+```bash
+az containerapp logs show \
+  --name secret-governance-v2 \
+  --resource-group <YOUR_RG> \
+  --container langchain-agent \
+  --tail 30
+
+# Look for these lines:
+# INFO: Jira webhook received: KAN-1442 → 'resolved'
+# INFO: Ticket KAN-1442 closed — updating SharePoint directly (no AI)
+# INFO: SharePoint updated for KAN-1442: 1 rows marked Rotated
+```
+
+<Callout type="info">
+  If Jira shows the webhook fired successfully but SharePoint didn't update,
+  check the container logs. The most common cause is the `JiraTicketKey` field
+  in SharePoint not matching exactly — check for extra spaces or different casing.
+</Callout>
+
+---
+
+## Jira project setup
+
+Before automation can raise tickets, the system needs a Jira project configured:
+
+| Setting | Where to find it |
+|---------|-----------------|
+| **Jira base URL** | Your Atlassian URL e.g. `https://yourcompany.atlassian.net` |
+| **Project key** | Project → Project settings → Details → Key (e.g. `KAN`) |
+| **Epic key** | Create an epic named "Secret Governance" and copy its key (e.g. `KAN-1`) |
+| **Issue type** | Usually `Task` or `Incident` — check your project's issue types |
+| **API token** | Atlassian account → Security → Create and manage API tokens |
+
+Store all of these in Key Vault — the system reads them at startup.

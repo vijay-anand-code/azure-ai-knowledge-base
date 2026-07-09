@@ -1,0 +1,351 @@
+---
+title: Teams Bot
+description: Query the secret governance system directly from a Teams channel
+---
+
+import { Callout, Steps, FileTree, Tabs, Tab } from 'nextra/components'
+
+# Teams Bot
+
+Admins can query the secret governance system directly from a Microsoft Teams channel.
+Type `status` or ask in natural language — the bot calls the LangChain agent, runs the
+right tools, and replies in the channel.
+
+---
+
+## Real world example
+
+```
+[Secret Governance channel — 09:15 Monday]
+
+Vijay Anand: @SecretBot critical
+
+SecretBot:   📊 P1 Critical Secrets — Expiring within 7 days
+
+             **PaymentService-Prod** (KAN-1442)
+             Expires: 2026-07-08 | 4 days remaining | Status: Escalated
+
+             **AuthService-API** (KAN-1443)
+             Expires: 2026-07-09 | 5 days remaining | Status: RotatedPendingDeployment
+
+             **ReportingApp** (KAN-1450)
+             Expires: 2026-07-10 | 6 days remaining | Status: JiraRaised
+
+             3 secrets require immediate attention.
+
+[09:16]
+
+Vijay Anand: @SecretBot show status of KAN-1442
+
+SecretBot:   **KAN-1442** — [CRITICAL] Azure Secret Expiry - PaymentService-Prod - 4 days
+             Status: RESOLVED ✅
+             Rotation completed — waiting for deployment confirmation.
+```
+
+---
+
+## Available commands
+
+| Command | What it does |
+|---------|-------------|
+| `status` | Overall summary — how many P1, P2, P3, rotated |
+| `critical` | All P1 secrets expiring within 7 days |
+| `expiring` | All secrets expiring within 30 days |
+| `pending` | Secrets with `RotatedPendingDeployment` status |
+| `help` | Show all available commands |
+
+Natural language also works:
+
+```
+@SecretBot what secrets expire this week?
+@SecretBot show me all secrets for PaymentService
+@SecretBot how many secrets are pending rotation?
+@SecretBot show status of KAN-1442
+```
+
+---
+
+## Architecture
+
+```
+Teams channel (admin types "@SecretBot critical")
+      ↓
+Azure Bot Service (receives the message)
+      ↓
+POST /teams-webhook  (Container 1)
+      ↓
+teams_bot.py extracts the message text, maps to instruction
+      ↓
+LangChain agent processes the question
+      ↓
+Calls tools: get_sharepoint_state, get_jira_issue, etc.
+      ↓
+_send_teams_reply() posts the formatted answer back
+      ↓
+Bot replies in the Teams channel within seconds
+```
+
+---
+
+## Code structure
+
+The Teams bot is a standalone module — completely isolated from the rest of the system.
+To disable it, comment out 6 lines in `main.py`.
+
+<FileTree>
+  <FileTree.Folder name="container-1" defaultOpen>
+    <FileTree.File name="main.py" label="main.py — imports teams_bot (6 lines)" />
+    <FileTree.File name="teams_bot.py" label="teams_bot.py — all Teams bot code here" />
+  </FileTree.Folder>
+</FileTree>
+
+```python
+# container-1/main.py
+# Teams bot is enabled by these 6 lines — comment them all out to disable
+
+from teams_bot import router as teams_router   # imports the bot router
+import teams_bot
+teams_bot.configure(
+    bot_app_id     = _kv_get("BOT-APP-ID"),     # bot's App Registration client ID
+    bot_app_secret = _kv_get("BOT-APP-SECRET"), # bot's client secret from Key Vault
+    bot_tenant_id  = _kv_get("BOT-TENANT-ID"),  # tenant where the bot is registered
+    get_agent_fn   = _get_agent,                # injects the LangChain agent
+)
+app.include_router(teams_router)   # registers /teams-webhook on the FastAPI app
+```
+
+---
+
+## Setup
+
+<Steps>
+
+### Create App Registration for the bot
+
+```bash
+# This App Registration is the bot's identity — separate from everything else
+az ad app create --display-name "secret-governance-bot"
+# Copy the "appId" — this is your BOT_APP_ID
+```
+
+### Create a client secret for the bot
+
+```bash
+# The bot needs a client secret to get Bot Framework tokens
+az ad app credential reset \
+  --id <BOT_APP_ID> \
+  --display-name "BotSecret" \
+  --query "password" -o tsv
+# Copy the output immediately — shown only once
+```
+
+### Create the Service Principal
+
+```bash
+# Required so the App Registration can be used as a bot identity
+az ad sp create --id <BOT_APP_ID>
+```
+
+### Create Azure Bot Service
+
+```bash
+az bot create \
+  --resource-group <YOUR_RG> \
+  --name secret-governance-bot \
+  --app-type SingleTenant \
+  --appid <BOT_APP_ID> \
+  --tenant-id <YOUR_TENANT_ID> \
+  --location "global" \
+  --sku F0 \
+  --endpoint "https://<CONTAINER_APP_FQDN>/teams-webhook"
+```
+
+<Callout type="info">
+  **F0 is the free tier** — includes 10,000 messages per month at no cost.
+  This is more than sufficient for an internal admin tool.
+</Callout>
+
+### Add Microsoft Teams channel
+
+```bash
+az bot msteams create \
+  --resource-group <YOUR_RG> \
+  --name secret-governance-bot
+```
+
+### Store credentials in Key Vault
+
+```bash
+az keyvault secret set \
+  --vault-name <YOUR_KV> \
+  --name "BOT-APP-ID" \
+  --value "<BOT_APP_ID>"
+
+az keyvault secret set \
+  --vault-name <YOUR_KV> \
+  --name "BOT-APP-SECRET" \
+  --value "<SECRET_FROM_STEP_2>"
+
+az keyvault secret set \
+  --vault-name <YOUR_KV> \
+  --name "BOT-TENANT-ID" \
+  --value "<YOUR_TENANT_ID>"
+```
+
+### Create the Teams app package
+
+Create a folder `teams-app/` with 3 files:
+
+```
+teams-app/
+├── manifest.json      ← bot description (update 3 values below)
+├── icon-color.png     ← 192×192 pixels — your company bot icon
+└── icon-outline.png   ← 32×32 pixels — outline version
+```
+
+**manifest.json** — update the 3 placeholder values:
+
+```json
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "<BOT_APP_ID>",
+  "developer": {
+    "name": "IT Team",
+    "websiteUrl": "https://<CONTAINER_APP_FQDN>",
+    "privacyUrl": "https://<CONTAINER_APP_FQDN>",
+    "termsOfUseUrl": "https://<CONTAINER_APP_FQDN>"
+  },
+  "name": {
+    "short": "SecretBot",
+    "full": "Azure Secret Governance Bot"
+  },
+  "description": {
+    "short": "Monitor Azure secret expiry status",
+    "full": "Query secret expiry status, Jira ticket status, and get alerts about expiring Azure App Registration secrets."
+  },
+  "icons": {
+    "color": "icon-color.png",
+    "outline": "icon-outline.png"
+  },
+  "accentColor": "#0078D4",
+  "bots": [
+    {
+      "botId": "<BOT_APP_ID>",
+      "scopes": ["personal", "team", "groupChat"],
+      "commandLists": [{
+        "scopes": ["personal", "team", "groupChat"],
+        "commands": [
+          {"title": "status",   "description": "Show summary of all secret expiry statuses"},
+          {"title": "critical", "description": "Show P1 critical secrets expiring within 7 days"},
+          {"title": "expiring", "description": "Show secrets expiring this month"},
+          {"title": "pending",  "description": "Show secrets pending deployment"},
+          {"title": "help",     "description": "Show all available commands"}
+        ]
+      }]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["<CONTAINER_APP_FQDN>"]
+}
+```
+
+Zip the 3 files (the files must be at the root of the zip, not in a subfolder):
+
+```powershell
+# Windows PowerShell
+Compress-Archive -Path teams-app\* -DestinationPath secret-governance-bot.zip
+```
+
+### Upload to Teams
+
+1. Open **Microsoft Teams → Apps → Manage your apps**
+2. Click **Upload an app → Upload an app to your org's app catalog**
+3. Select `secret-governance-bot.zip`
+4. Click **Add**
+
+### Add bot to your channel
+
+1. Go to the Teams channel where you want alerts (e.g. `#secret-governance`)
+2. Click **+** at the top to add an app
+3. Search `SecretBot`
+4. Click **Add to a team → select your channel → Set up a bot**
+
+</Steps>
+
+---
+
+## Enable / Disable
+
+To disable the Teams bot without removing it from the codebase:
+
+```python
+# container-1/main.py
+# Comment out these 6 lines to disable:
+
+# from teams_bot import router as teams_router
+# import teams_bot
+# teams_bot.configure(
+#     bot_app_id     = _kv_get("BOT-APP-ID"),
+#     bot_app_secret = _kv_get("BOT-APP-SECRET"),
+#     bot_tenant_id  = _kv_get("BOT-TENANT-ID"),
+#     get_agent_fn   = _get_agent,
+# )
+# app.include_router(teams_router)
+```
+
+Then push the change — GitHub Actions will redeploy Container 1 automatically.
+The `/teams-webhook` endpoint simply won't exist in the new revision.
+
+---
+
+## Troubleshooting
+
+### Bot receives message but doesn't reply
+
+Check container logs for the bot token error:
+
+```bash
+az containerapp logs show \
+  --name secret-governance-v2 \
+  --resource-group <YOUR_RG> \
+  --container langchain-agent \
+  --tail 30
+
+# Look for:
+# ERROR:teams-bot:Failed to send Teams reply: Client error '401 Unauthorized'
+```
+
+**Fix:** The Service Principal may be missing. Run:
+
+```bash
+az ad sp create --id <BOT_APP_ID>
+```
+
+Then restart the container:
+
+```bash
+az containerapp revision restart \
+  --name secret-governance-v2 \
+  --resource-group <YOUR_RG> \
+  --revision <LATEST_REVISION_NAME>
+```
+
+### Bot replies with rate limit error
+
+Azure OpenAI has a tokens-per-minute limit. If you send many queries in quick succession,
+the agent hits a 429 error. The bot will reply with an error message asking you to retry.
+
+**Fix:** Increase the TPM quota in Azure Portal:
+
+**Azure OpenAI → Model deployments → your deployment → Edit → Tokens per minute → increase to 100K**
+
+### Manifest upload fails with parsing error
+
+Ensure:
+- `id` field is a valid GUID format with dashes: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+- `manifestVersion` is `"1.16"` not `"1.17"` (1.17 has stricter validation)
+- No `packageName` field (removed in newer schema versions)
+- Icons are exactly 192×192 and 32×32 pixels respectively
+- The zip contains files at the root, not inside a subfolder

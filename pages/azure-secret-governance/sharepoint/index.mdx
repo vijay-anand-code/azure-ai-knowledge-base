@@ -1,0 +1,242 @@
+---
+title: SharePoint Setup
+description: Create the SecretAlertRegistry list and configure it for secret governance tracking
+---
+
+import { Callout, Steps, Tabs, Tab } from 'nextra/components'
+
+# SharePoint Setup
+
+The `SecretAlertRegistry` SharePoint list is the central audit trail for all monitored secrets.
+Every App Registration secret gets a row here — the system updates it automatically as secrets
+move through their lifecycle from monitoring → alert → rotation → resolved.
+
+---
+
+## Real world example of a list row
+
+| AppName | ExpiryBucket | AlertStatus | JiraTicketKey | ExpirationDate | LastChecked |
+|---------|-------------|-------------|---------------|----------------|-------------|
+| PaymentService-Prod | P1 | Escalated | KAN-1442 | 2026-07-08 | 2026-07-04 |
+| AuthService-API | P2 | TeamsAlerted | KAN-1443 | 2026-07-20 | 2026-07-04 |
+| ReportingApp | P3 | JiraRaised | KAN-1450 | 2026-08-01 | 2026-07-04 |
+| DataPipeline | B0 | — | — | 2026-10-15 | — |
+
+---
+
+## Create the SharePoint site
+
+<Steps>
+
+### Create a team site
+
+1. Go to [sharepoint.com](https://sharepoint.com) → **+ Create site → Team site**
+2. Site name: `Contoso IT` *(or your preferred name)*
+3. Click **Next → Finish**
+
+### Get the Site ID and List ID
+
+You need these two GUIDs for the Key Vault secrets. Run these commands:
+
+```bash
+# Replace <hostname> with e.g. contoso.sharepoint.com
+# Replace <sitename> with your site name e.g. ContosoIT
+az rest --method get \
+  --url 'https://graph.microsoft.com/v1.0/sites/<hostname>:/sites/<sitename>' \
+  --query id -o tsv
+
+# The output is a composite ID in this format:
+# contoso.sharepoint.com,eb7d38df-4022-4b6a-91ac-10f177c65098,d35b6bd8-064b-49c1-8f15-b1ad9aaf23c1
+#                        ↑ site collection ID                  ↑ web ID
+# Use the FULL string including both GUIDs and commas
+```
+
+```bash
+# Replace <SITE_ID> with the full composite ID from above
+az rest --method get \
+  --url 'https://graph.microsoft.com/v1.0/sites/<SITE_ID>/lists' \
+  --query "value[?displayName=='SecretAlertRegistry'].id" -o tsv
+```
+
+<Callout type="info">
+  You can also find the List ID directly from the browser URL when you're in the list settings:
+  **List → Settings → URL contains** `List=%7B25b457eb-...%7D`
+  Decode `%7B` = `{` and `%7D` = `}` — the GUID in between is your List ID.
+</Callout>
+
+### Create the SecretAlertRegistry list
+
+Inside the team site → **New → List → Blank list**
+- Name: `SecretAlertRegistry`
+- Click **Create**
+
+### Add all required columns
+
+The `Title` column is already there — rename it to `AppID` first, then add the rest.
+
+| Column name | Type | Notes |
+|-------------|------|-------|
+| **AppID** *(rename Title)* | Single line of text | Rename the default Title column |
+| **AppName** | Single line of text | Display name of the App Registration |
+| **SecretID** | Single line of text | The secret's keyId GUID |
+| **SecretDescription** | Multiple lines of text | The secret's display name |
+| **ExpirationDate** | Date and time | Date only format |
+| **AlertStatus** | Choice | See choices below |
+| **JiraTicketKey** | Single line of text | e.g. KAN-96 |
+| **JiraTicketCreatedDate** | Date and time | Date only format |
+| **AlertSentDate** | Date and time | Date only format |
+| **LastChecked** | Date and time | Date only format |
+| **ExpiryNotice** | Single line of text | Human-readable status e.g. "Secret Expiring in 4 days" |
+| **RotationDetectedDate** | Date and time | Date only format |
+| **NewSecretKeyId** | Single line of text | GUID of the newly created secret |
+| **NewSecretVaultName** | Single line of text | Key Vault secret name for the new value |
+| **TenantID** | Single line of text | Auto-stamped by the system |
+| **TenantName** | Single line of text | Auto-stamped by the system |
+| **AlertHistory** | Hyperlink or Picture | Link column for audit trail |
+| **ExpiryBucket** | Single line of text | Auto-set — P1, P2, P3, B0, ExpiredManualReview |
+| **Counter** | Number | Default value: 1 — used for SharePoint Quick Charts |
+
+### Configure AlertStatus choices
+
+When creating the `AlertStatus` column, select **Choice** as the type and enter these values
+**exactly as shown** — spelling and capitalisation must match:
+
+| Choice value | When the system sets this |
+|-------------|--------------------------|
+| `Monitoring` | Secret is tracked, no action needed yet (B0 safe secrets) |
+| `JiraRaised` | A Jira incident ticket has been created |
+| `TeamsAlerted` | A Teams alert has been sent |
+| `Escalated` | Secret is critically close to expiry (P1) |
+| `RotatedPendingDeployment` | New secret generated — waiting for team to deploy it |
+| `Rotated` | Secret has been rotated and deployment confirmed |
+| `ExpiredManualReview` | Secret recently expired — requires manual review |
+| `JiraClosed-Unverified` | Jira ticket closed but rotation could not be verified |
+| `Resolved` | Secret has been fully resolved |
+| `Ignored` | Secret is intentionally excluded from monitoring |
+
+<Callout type="warning">
+  A typo in any choice value will cause incorrect system behaviour.
+  The system checks these values by exact string match.
+</Callout>
+
+### Index the AlertStatus column
+
+This is required before the rotation runbook's smart filtering will work.
+Without indexing, SharePoint rejects OData filter queries with HTTP 400.
+
+**SharePoint → SecretAlertRegistry → List settings → Indexed columns → Create a new index**
+
+- Primary column: `AlertStatus`
+- Click **Create**
+
+This is a one-time setup. Once indexed, the column supports OData filtering
+and the list can scale to 50,000+ rows without performance issues.
+
+</Steps>
+
+---
+
+## How smart filtering works
+
+The rotation runbook used to fetch ALL rows from SharePoint every run, which caused:
+- 1hr 40min runtime for 807 rows
+- Risk of exceeding the 3-hour Azure Automation limit at scale
+
+Now it only fetches rows where action is actually needed:
+
+```python
+# runbook_rotation.py
+# Instead of fetching all rows, we ask SharePoint to filter server-side
+
+status_filter = " or ".join([
+    # Phase A: check if Jira tickets have been closed for these
+    "fields/AlertStatus eq 'RotatedPendingDeployment'",
+    # Phase B: these secrets need rotation
+    "fields/AlertStatus eq 'JiraRaised'",
+    "fields/AlertStatus eq 'TeamsAlerted'",
+    "fields/AlertStatus eq 'Escalated'",
+    "fields/AlertStatus eq 'ExpiredManualReview'",
+])
+
+# SharePoint only returns rows matching the filter — skips "Rotated", "Monitoring" etc.
+# This turns a 1hr 40min run into 20-30 minutes
+url = (
+    f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+    f"/lists/{SHAREPOINT_LIST_ID}/items"
+    f"?$expand=fields"
+    f"&$filter={urllib.parse.quote(status_filter)}"
+)
+```
+
+| Scenario | Before smart filtering | After smart filtering |
+|----------|----------------------|----------------------|
+| 807 rows, 50 actionable | Fetches all 807 | Fetches only 50 |
+| 3,000 rows, 100 actionable | Fetches all 3,000 | Fetches only 100 |
+| Runtime | 1hr 40 mins | ~20–30 mins |
+
+---
+
+## Update existing rows with Counter column
+
+The `Counter` column (value: 1) is needed for SharePoint Quick Charts to work.
+Run this to update all existing rows:
+
+```powershell
+# Get a Graph API token
+$token = az account get-access-token --resource "https://graph.microsoft.com" --query accessToken -o tsv
+
+$siteId = "<YOUR_SITE_ID>"
+$listId = "<YOUR_LIST_ID>"
+$headers = @{
+    Authorization  = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+# Fetch all item IDs (paginate through results)
+$allItems = @()
+$url = "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$listId/items?`$select=id&`$top=500"
+do {
+    $response = Invoke-RestMethod -Uri $url -Headers $headers
+    $allItems += $response.value
+    $url = $response.'@odata.nextLink'   # follow pagination until no more pages
+} while ($url)
+
+Write-Host "Updating $($allItems.Count) rows..."
+
+# Set Counter = 1 on every row
+foreach ($item in $allItems) {
+    Invoke-RestMethod \
+        -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$listId/items/$($item.id)" \
+        -Method PATCH \
+        -Headers $headers \
+        -Body '{"fields": {"Counter": 1}}'
+}
+
+Write-Host "Done! All rows updated with Counter = 1"
+```
+
+---
+
+## Clean up B0 rows
+
+B0 secrets (61+ days safe) are no longer written to SharePoint — they are logged only.
+To remove existing B0 rows from earlier runs:
+
+```powershell
+$token = az account get-access-token --resource "https://graph.microsoft.com" --query accessToken -o tsv
+$headers = @{Authorization = "Bearer $token"}
+
+# Fetch only B0 rows using the indexed AlertStatus filter
+$url = "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$listId/items?`$filter=fields/ExpiryBucket eq 'B0'&`$select=id"
+$items = Invoke-RestMethod -Uri $url -Headers $headers
+Write-Host "Found $($items.value.Count) B0 rows to delete"
+
+# Delete each B0 row
+foreach ($item in $items.value) {
+    Invoke-RestMethod \
+        -Uri "https://graph.microsoft.com/v1.0/sites/$siteId/lists/$listId/items/$($item.id)" \
+        -Method DELETE \
+        -Headers $headers
+}
+Write-Host "Done! All B0 rows removed"
+```
