@@ -2,6 +2,7 @@
   "index": "Overview",
   "infrastructure": "Infrastructure & provisioning",
   "sharepoint": "SharePoint setup",
+  "runbooks": "Runbooks",
   "github-actions": "GitHub Actions CI/CD",
   "jira": "Jira automation",
   "dashboard": "Dashboard",
