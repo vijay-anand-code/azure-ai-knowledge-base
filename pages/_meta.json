@@ -1,8 +1,7 @@
 {
   "index": "Home",
-  "azure-secret-governance": "Azure Secret Governance",
-  "azure-multi-agent": "Azure Multi Agent",
+  "azure-multi-agent": "Azure Multi-Agent Foundry",
+  "langchain": "LangChain",
   "container-apps": "Container Apps",
-  "github-actions": "GitHub Actions",
-  "langchain": "LangChain"
+  "github-actions": "GitHub Actions"
 }
