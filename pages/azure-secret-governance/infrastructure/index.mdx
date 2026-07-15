@@ -1,6 +1,6 @@
 ---
 title: Infrastructure Setup
-description: Provision all Azure resources with a single Bicep command
+description: Provision all Azure resources and configure UAMI permissions for secret governance
 ---
 
 import { Callout, Steps, FileTree, Tabs, Tab } from 'nextra/components'
@@ -23,15 +23,13 @@ Container Registry, Container App Environment, and Automation Account.
 | Resource | What it does |
 |----------|-------------|
 | **Resource Group** | Container for all project resources |
-| **User-Assigned Managed Identity (UAMI)** | The system's identity — authenticates to Graph API, Key Vault, ACR with no passwords |
+| **User-Assigned Managed Identity (UAMI)** | The system's identity — authenticates to Graph API, Key Vault, and ACR with no passwords |
 | **Key Vault — config** | Stores Jira, Teams, SharePoint, and OpenAI credentials |
 | **Key Vault — rotation** | Stores newly generated secret values after rotation |
 | **Azure Container Registry** | Stores the Docker images for Container 1 and Container 2 |
 | **Container App Environment** | The runtime environment for both containers |
-| **Azure Automation Account** | Runs the weekly monitoring and rotation runbooks |
+| **Azure Automation Account** | Runs the weekly discovery, monitoring, and rotation runbooks |
 | **Log Analytics Workspace** | Captures all container and runbook logs |
-
-All RBAC role assignments are wired up automatically — no manual permission setup needed.
 
 ---
 
@@ -64,13 +62,6 @@ az login
 
 ## Repository structure
 
-Clone both repositories before starting:
-
-```bash
-git clone https://github.com/<YOUR_ORG>/secret-governance-app.git
-git clone https://github.com/<YOUR_ORG>/secret-governance-infra.git
-```
-
 <FileTree>
   <FileTree.Folder name="secret-governance-infra" defaultOpen>
     <FileTree.Folder name="infra" defaultOpen>
@@ -82,8 +73,11 @@ git clone https://github.com/<YOUR_ORG>/secret-governance-infra.git
       <FileTree.File name="deploy.parameters.json" />
     </FileTree.Folder>
     <FileTree.Folder name="runbooks">
+      <FileTree.File name="runbook_discovery.py" />
       <FileTree.File name="runbook_monitoring.py" />
       <FileTree.File name="runbook_rotation.py" />
+      <FileTree.File name="runbook_owner_sync.py" />
+      <FileTree.File name="runbook_cleanup_sharepoint.py" />
     </FileTree.Folder>
   </FileTree.Folder>
   <FileTree.Folder name="secret-governance-app">
@@ -110,129 +104,106 @@ git clone https://github.com/<YOUR_ORG>/secret-governance-infra.git
 
 ### Get your Azure Object ID
 
-You need your personal Object ID to grant yourself Key Vault access during deployment:
-
 ```bash
-# This prints your user Object ID — copy the GUID it returns
 az ad signed-in-user show --query id -o tsv
-
-# Example output:
-# a1b2c3d4-e5f6-7890-abcd-ef1234567890
+# Example output: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
 ### Fill in foundation.parameters.json
 
-Open `secret-governance-infra/infra/foundation.parameters.json` and update these four values:
-
 ```json
 {
   "parameters": {
-    "location": {
-      // Azure region — pick the one closest to your users
-      // Options: eastasia, eastus, westeurope, southindia, australiaeast
-      "value": "eastasia"
-    },
-    "resourceGroupName": {
-      // Name for your new resource group
-      // Convention: use your company name + -secret-governance-rg
-      "value": "contoso-secret-governance-rg"
-    },
-    "prefix": {
-      // Short prefix used to name ALL resources — 3-8 lowercase letters, no spaces
-      // Example: "secgov" creates secgov-uami, secgovacr, secgov-kv-config, etc.
-      "value": "secgov"
-    },
-    "adminObjectId": {
-      // Your Object ID from the command above
-      "value": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-    }
+    "location":          { "value": "eastasia" },
+    "resourceGroupName": { "value": "contoso-secret-governance-rg" },
+    "prefix":            { "value": "secgov" },
+    "adminObjectId":     { "value": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
   }
 }
 ```
-
-<Callout type="warning">
-  The prefix is used to name all resources. Choose something short and meaningful.
-  Once deployed, resource names cannot be changed without redeploying everything.
-</Callout>
 
 ### Run the foundation deployment
 
 ```bash
 cd secret-governance-infra/infra
 
-# This single command creates ALL Azure resources
-# Takes 3-5 minutes to complete
 az deployment sub create \
   --location eastasia \
   --template-file foundation.bicep \
   --parameters '@foundation.parameters.json'
 ```
 
-When complete, it prints output values like this:
+### Grant UAMI Microsoft Graph permissions
 
-```
-uamiResourceId      = /subscriptions/.../secgov-uami
-uamiClientId        = 17c0380e-395b-4b6b-bebb-bfd1dc439530
-configKeyVaultUrl   = https://secgov-kv-config.vault.azure.net/
-rotationKeyVaultUrl = https://secgov-kv-rotation.vault.azure.net/
-acrLoginServer      = secgovacr.azurecr.io
-containerAppEnvName = secgov-cae
+The UAMI needs exactly two Graph API permissions. No more — these two cover everything
+the system needs to discover, monitor, and rotate secrets.
+
+```powershell
+Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
+
+$uamiSpId   = "<UAMI_SERVICE_PRINCIPAL_OBJECT_ID>"
+$graphAppId  = "00000003-0000-0000-c000-000000000000"
+$graphSp     = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
+
+# Grant Application.ReadWrite.OwnedBy
+$role1 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.ReadWrite.OwnedBy" }
+New-MgServicePrincipalAppRoleAssignment `
+    -ServicePrincipalId $uamiSpId `
+    -PrincipalId        $uamiSpId `
+    -ResourceId         $graphSp.Id `
+    -AppRoleId          $role1.Id
+
+# Grant Sites.Selected
+$role2 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.ReadWrite.All" }
+New-MgServicePrincipalAppRoleAssignment `
+    -ServicePrincipalId $uamiSpId `
+    -PrincipalId        $uamiSpId `
+    -ResourceId         $graphSp.Id `
+    -AppRoleId          $role2.Id
+
+Write-Host "✓ Permissions granted"
 ```
 
 <Callout type="warning">
-  **Save these output values** — you will need them when populating Key Vault secrets
-  and deploying the Container App.
+  Grant admin consent after adding permissions — go to **Azure Portal → App Registrations
+  → your UAMI app → API Permissions → Grant admin consent**.
 </Callout>
 
-### Grant UAMI Microsoft Graph permissions
+### Add UAMI as owner on App Registrations
 
-The UAMI needs two Graph API permissions to read App Registrations and write secrets:
+The UAMI must be listed as an owner on each App Registration it should manage.
+This is a one-time setup per app — do it via PowerShell since the Azure Portal
+owner picker only shows users, not managed identities.
 
-```bash
-# Store the UAMI's service principal ID
-SP_ID=$(az ad sp list \
-  --filter "appId eq '<UAMI_CLIENT_ID_FROM_ABOVE>'" \
-  --query "[0].id" -o tsv)
+```powershell
+# Resolve UAMI service principal object ID
+$uamiClientId = "<UAMI_CLIENT_ID>"
+$uamiSp = Get-MgServicePrincipal -Filter "appId eq '$uamiClientId'"
+$uamiObjectId = $uamiSp.Id
 
-# Store the Microsoft Graph service principal ID
-GRAPH_SP=$(az ad sp list \
-  --filter "appId eq '00000003-0000-0000-c000-000000000000'" \
-  --query "[0].id" -o tsv)
-
-# Get the exact role ID for Application.ReadWrite.All in YOUR tenant
-# (role IDs can vary slightly between tenants)
-az rest \
-  --method GET \
-  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$GRAPH_SP/appRoles" \
-  --query "value[?value=='Application.ReadWrite.All'].{Name:value, ID:id}" \
-  -o table
-```
-
-Then grant the permission using the role ID from the output above:
-
-```bash
-# Create the JSON body and save to a temp file (avoids shell escaping issues)
-cat > /tmp/role-assignment.json << EOF
-{
-  "principalId": "$SP_ID",
-  "resourceId": "$GRAPH_SP",
-  "appRoleId": "<ROLE_ID_FROM_ABOVE>"
+# Add UAMI as owner on a specific app
+$appObjectId = "<APP_REGISTRATION_OBJECT_ID>"
+New-MgApplicationOwnerByRef -ApplicationId $appObjectId -BodyParameter @{
+    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$uamiObjectId"
 }
-EOF
-
-az rest \
-  --method POST \
-  --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$SP_ID/appRoleAssignments" \
-  --headers "Content-Type=application/json" \
-  --body "@/tmp/role-assignment.json"
 ```
 
-Repeat for `Application.Read.All` and `Sites.Selected`.
+For initial bulk setup across all existing App Registrations, use the
+`runbook_bulk_add_uami_owner.py` runbook — it handles all apps in parallel
+and skips apps where UAMI is already an owner.
 
-### Grant UAMI SharePoint site access (Sites.Selected)
+<Callout type="info">
+  **Why OwnedBy instead of ReadWrite.All?**
+  `Application.ReadWrite.OwnedBy` allows the UAMI to read ALL app registrations
+  (reads are unrestricted) but write operations — creating new secrets during rotation —
+  are limited to apps where UAMI is listed as an owner. This is least-privilege:
+  the system cannot accidentally modify apps it doesn't manage.
+</Callout>
 
-`Sites.Selected` restricts the UAMI to only your specific SharePoint site — not all sites
-in the tenant. This must be granted via Graph Explorer since there is no Azure CLI command for it.
+### Grant UAMI SharePoint site access
+
+`Sites.Selected` restricts the UAMI to only your specific SharePoint site.
+Grant it via Graph Explorer since there is no Azure CLI command for it.
 
 1. Go to [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
 2. Sign in with your admin account
@@ -248,23 +219,15 @@ POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
   "grantedToIdentities": [{
     "application": {
       "id": "<UAMI_CLIENT_ID>",
-      "displayName": "secret-governance-uami"
+      "displayName": "uami-secret-monitor"
     }
   }]
 }
 ```
 
-<Callout type="info">
-  Use only the **site collection ID** (first GUID after the hostname) in the URL — not the
-  full composite site ID with both GUIDs. Graph Explorer handles the rest.
-</Callout>
-
 ### Populate Key Vault secrets
 
-Fill in `keyvault-secrets.parameters.json` with your service credentials, then run:
-
 ```bash
-# This populates ALL Key Vault secrets in one command
 az deployment group create \
   --resource-group <YOUR_RG> \
   --template-file keyvault-secrets.bicep \
@@ -274,24 +237,15 @@ az deployment group create \
 ### Build and deploy the Container App
 
 ```bash
-ACR="<YOUR_ACR_LOGIN_SERVER>"   # e.g. secgovacr.azurecr.io
+ACR="<YOUR_ACR_LOGIN_SERVER>"
 RG="<YOUR_RESOURCE_GROUP>"
 
-# Build Container 2 first (Monitor API)
-az acr build \
-  --registry $ACR \
-  --resource-group $RG \
-  --image secret-governance/monitor-mcp:latest \
-  ./container-2
+az acr build --registry $ACR --resource-group $RG \
+  --image secret-governance/monitor-mcp:latest ./container-2
 
-# Build Container 1 (LangChain Agent)
-az acr build \
-  --registry $ACR \
-  --resource-group $RG \
-  --image secret-governance/langchain-agent:latest \
-  ./container-1
+az acr build --registry $ACR --resource-group $RG \
+  --image secret-governance/langchain-agent:latest ./container-1
 
-# Deploy both containers to Container App
 az deployment group create \
   --resource-group $RG \
   --template-file deploy.bicep \
@@ -304,19 +258,61 @@ az deployment group create \
 
 ## UAMI permissions reference
 
-The UAMI is the system's identity — it authenticates to everything using managed identity,
-so there are no client secrets to manage or rotate.
+The system uses exactly two Microsoft Graph permissions. This is intentional — no broader
+permissions are needed.
 
 | Permission | Type | Purpose |
 |-----------|------|---------|
-| `Application.Read.All` | Application | Read all App Registrations and their secret expiry dates |
-| `Application.ReadWrite.All` | Application | Create new secrets during rotation |
-| `Sites.Selected` | Application | Read/write the SecretAlertRegistry SharePoint list only |
+| `Application.ReadWrite.OwnedBy` | Application | Read all App Registrations (reads are unrestricted). Write — create new secrets — only on apps where UAMI is listed as owner |
+| `Sites.Selected` | Application | Read/write the SecretAlertRegistry SharePoint list only — not all sites in the tenant |
 | `Key Vault Secrets User` | RBAC role | Read config secrets from Key Vault |
 | `Key Vault Secrets Officer` | RBAC role | Write new secret values to rotation Key Vault |
 | `AcrPull` | RBAC role | Pull container images from Azure Container Registry |
 
 <Callout type="warning">
-  **Do not grant `Directory.Read.All` or `Sites.ReadWrite.All`.** These are broader than needed.
-  The system uses `Sites.Selected` which limits SharePoint access to only your specific site.
+  **Do not grant `Application.Read.All`, `Application.ReadWrite.All`, or `Sites.ReadWrite.All`.**
+  These are broader than needed. `Application.ReadWrite.OwnedBy` covers everything the system
+  requires — read all apps, write only owned apps.
+</Callout>
+
+---
+
+## Runbook schedule
+
+All three runbooks run on a weekly schedule in this exact order:
+
+| Time | Runbook | What it does |
+|------|---------|-------------|
+| `00:00` | `runbook_discovery.py` | Scans all 255 apps, stamps `AppOwners` to SharePoint |
+| `00:30` | `runbook_monitoring.py` | Triggers monitoring container — raises Jira tickets and Teams alerts |
+| `01:00` | `runbook_rotation.py` | Rotates P1/P2/P3 secrets, stores new values in Key Vault |
+
+<Callout type="info">
+  The 30-minute gap between discovery and monitoring ensures SharePoint rows have correct
+  `AppOwners` values before monitoring reads them.
+</Callout>
+
+---
+
+## Key Vault secrets reference
+
+| Secret name | Example value | Used by |
+|-------------|--------------|---------|
+| `GRAPH-TENANT-ID` | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | All runbooks |
+| `GRAPH-TENANT-NAME` | `contoso.onmicrosoft.com` | Monitoring container |
+| `SHAREPOINT-SITE-ID` | `contoso.sharepoint.com,abc...,def...` | All runbooks |
+| `SHAREPOINT-LIST-ID` | `25b457eb-cf85-4c11-b712-cfa882898c6b` | All runbooks |
+| `JIRA-BASE-URL` | `https://contoso.atlassian.net` | Monitoring + rotation |
+| `JIRA-API-TOKEN` | `ATATT3x...` | Monitoring + rotation |
+| `JIRA-USER-EMAIL` | `admin@contoso.com` | Monitoring + rotation |
+| `JIRA-PROJECT-KEY` | `KAN` | Monitoring |
+| `JIRA-EPIC-KEY` | `KAN-161` | Monitoring |
+| `JIRA-ISSUE-TYPE` | `Incident` | Monitoring |
+| `TEAMS-WEBHOOK-URL` | `https://...webhook.office.com/...` | Monitoring |
+| `OWNER-EMAIL` | `uami-secret-monitor` | Monitoring + rotation |
+
+<Callout type="warning">
+  `OWNER-EMAIL` should be set to the **display name** of your UAMI (e.g. `uami-secret-monitor`).
+  The monitoring and rotation runbooks use this to filter SharePoint rows — only rows where
+  `AppOwners` contains this value are actioned.
 </Callout>
