@@ -1,9 +1,8 @@
 {
-  "index": "Overview",
-  "infrastructure": "Infrastructure & provisioning",
-  "sharepoint": "SharePoint setup",
-  "github-actions": "GitHub Actions CI/CD",
-  "jira": "Jira automation",
-  "dashboard": "Dashboard",
-  "teams-bot": "Teams bot"
+  "index": "Home",
+  "azure-secret-governance": "Azure Secret Governance",
+  "azure-multi-agent": "Azure Multi Agent",
+  "container-apps": "Container Apps",
+  "github-actions": "GitHub Actions",
+  "langchain": "LangChain"
 }
