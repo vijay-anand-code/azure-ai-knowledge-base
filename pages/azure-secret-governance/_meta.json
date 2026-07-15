@@ -5,6 +5,7 @@
   "runbooks": "Runbooks",
   "github-actions": "GitHub Actions CI/CD",
   "jira": "Jira automation",
+  "source-code": "Source Code",
   "dashboard": "Dashboard",
   "teams-bot": "Teams bot"
 }
