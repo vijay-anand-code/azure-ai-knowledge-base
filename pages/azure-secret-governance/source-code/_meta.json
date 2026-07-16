@@ -1,8 +1,10 @@
 {
   "index": "Overview",
-  "discovery-runbook": "Discovery Runbook",
-  "monitoring-runbook": "Monitoring Runbook",
-  "rotation-runbook": "Rotation Runbook",
-  "container-1-langchain-agent": "Container 1 — LangChain Agent",
-  "container-2-monitor-api": "Container 2 — Monitor API"
+  "runbook-discovery": "runbook_discovery.py",
+  "runbook-monitoring": "runbook_monitoring.py",
+  "runbook-rotation": "runbook_rotation.py",
+  "container1-main": "main.py (Container 1)",
+  "container1-teams-bot": "teams_bot.py",
+  "container2-main": "main.py (Container 2)",
+  "container2-decision-engine": "decision_engine.py"
 }
