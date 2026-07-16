@@ -1,1 +1,541 @@
+---
+title: runbook_rotation.py
+description: Rotates expiring secrets, stores new values in Key Vault, and updates Jira and SharePoint
+---
 
+import { Callout } from 'nextra/components'
+
+# runbook_rotation.py
+
+**Location:** `secret-governance-infra/runbooks/runbook_rotation.py`
+
+**Runtime:** Python 3.10 — Azure Automation Account
+
+**Schedule:** Weekly at `01:00`, 1 hour after monitoring.
+
+**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1/P2/P3 secrets owned by the configured owner (Phase B). New secret values are stored in the rotation Key Vault and a comment is posted to the Jira ticket with retrieval instructions.
+
+---
+
+## Key design decisions
+
+| Decision | Reason |
+|----------|--------|
+| Two-phase design | Phase A closes the loop on already-rotated secrets before Phase B generates new ones — avoids double-rotation |
+| `NewSecretVaultName` guard | If this field is already set on a row, the secret is skipped — idempotent even if the runbook runs twice |
+| Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
+| 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
+| `OWNER-EMAILS` (comma-separated) | Supports multi-owner environments. Falls back to legacy `OWNER-EMAIL` single-value secret for backwards compatibility |
+| urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
+
+---
+
+## Required configuration
+
+**Automation Variables:**
+
+| Variable | Value |
+|----------|-------|
+| `ROTATOR_KV_URL` | Config Key Vault URL (holds Jira, SharePoint, Graph credentials) |
+| `ROTATION_KV_URL` | Rotation Key Vault URL (where new secret values are stored) |
+| `UAMI_CLIENT_ID` | UAMI client ID |
+
+**Key Vault secrets (in `ROTATOR_KV_URL`):**
+
+| Secret | Purpose |
+|--------|---------|
+| `GRAPH-TENANT-ID` | Azure tenant ID |
+| `GRAPH-TENANT-NAME` | Tenant display name |
+| `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
+| `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
+| `JIRA-BASE-URL` | Jira instance URL |
+| `JIRA-API-TOKEN` | Jira API token |
+| `JIRA-USER-EMAIL` | Jira account email |
+| `OWNER-EMAILS` | Comma-separated owner filter (e.g. `uami-secret-monitor, admin@contoso.com`) |
+
+<Callout type="warning">
+  The runbook will only rotate secrets for apps where `AppOwners` in SharePoint contains
+  at least one value from `OWNER-EMAILS`. Apps where the UAMI is not an Entra owner
+  return HTTP 403 from the Graph `addPassword` endpoint — a second layer of enforcement.
+</Callout>
+
+---
+
+## Source
+
+```python
+"""
+runbook_rotation.py — Azure Automation Runbook
+===============================================
+Purpose : Run the secret rotation cycle directly — NO AI, NO LangChain
+Schedule: Every 7 days, 1 hour after runbook_monitoring.py
+Runtime : Python 3.10 (Azure Automation)
+
+Uses only built-in Python libraries (urllib, json, base64) for HTTP calls.
+No httpx dependency — avoids asyncio/httpcore issues in Automation runtime.
+
+Changes vs previous version:
+  - Added "Discovered" to ACTIONABLE_STATUSES — rows stamped by discovery
+    runbook but not yet processed by monitoring are now eligible for rotation
+    if rotation is triggered manually before monitoring runs.
+  - OWNER-EMAIL → OWNER-EMAILS (comma-separated) for multi-owner support.
+    Phase B filters by any-of-list match against AppOwners column.
+    Falls back to legacy OWNER-EMAIL secret if OWNER-EMAILS not found.
+
+Required Automation Variables:
+  ROTATOR_KV_URL   — Key Vault URL holding rotation config secrets
+  ROTATION_KV_URL  — Key Vault URL where new secrets are stored
+  UAMI_CLIENT_ID   — User-assigned Managed Identity client ID
+"""
+
+from __future__ import annotations
+
+import base64 as _b64
+import json
+import logging
+import re
+import sys
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import datetime, timezone, timedelta
+from typing import Any, Callable
+
+import automationassets
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+log = logging.getLogger("rotation-runbook")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTOMATION VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_var(name: str) -> str:
+    value = automationassets.get_automation_variable(name)
+    if not value:
+        raise ValueError(f"Automation Variable '{name}' is not set.")
+    return str(value).strip()
+
+ROTATOR_KV_URL  = _get_var("ROTATOR_KV_URL")
+ROTATION_KV_URL = _get_var("ROTATION_KV_URL")
+UAMI_CLIENT_ID  = _get_var("UAMI_CLIENT_ID")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AZURE CLIENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_credential  = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+_config_kv   = SecretClient(vault_url=ROTATOR_KV_URL,  credential=_credential)
+_rotation_kv = SecretClient(vault_url=ROTATION_KV_URL, credential=_credential)
+
+def _kv_get(name: str) -> str:
+    try:
+        return _config_kv.get_secret(name).value
+    except Exception as exc:
+        raise RuntimeError(f"Required KV secret '{name}' could not be loaded: {exc}") from exc
+
+log.info("Loading rotation config secrets from Key Vault...")
+GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
+GRAPH_TENANT_NAME  = _kv_get("GRAPH-TENANT-NAME")
+JIRA_BASE_URL      = _kv_get("JIRA-BASE-URL")
+JIRA_API_TOKEN     = _kv_get("JIRA-API-TOKEN")
+JIRA_USER_EMAIL    = _kv_get("JIRA-USER-EMAIL")
+SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
+SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-LIST-ID")
+
+try:
+    _owner_emails_raw = _kv_get("OWNER-EMAILS").strip()
+except Exception:
+    try:
+        _owner_emails_raw = _kv_get("OWNER-EMAIL").strip()
+    except Exception:
+        _owner_emails_raw = ""
+
+OWNER_EMAILS = [e.strip().lower() for e in _owner_emails_raw.split(",") if e.strip()]
+log.info("Config secrets loaded.")
+log.info("Owner filter (%d emails): %s", len(OWNER_EMAILS), OWNER_EMAILS)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLOSED_NAMES              = {"done", "closed", "resolved"}
+ACTIONABLE_STATUSES       = {
+    "Discovered", "JiraRaised", "TeamsAlerted",
+    "Escalated", "Expired", "ExpiredManualReview",
+}
+ROTATION_ELIGIBLE_BUCKETS = {"P1", "P2", "P3"}
+DEFAULT_ROTATION_THRESHOLD = 60
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _http(method: str, url: str, headers: dict, body: dict | None = None,
+          timeout: int = 30) -> dict:
+    data = json.dumps(body).encode("utf-8") if body else None
+    req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8")[:300]
+        raise RuntimeError(f"HTTP {e.code} {method} {url}: {body_text}") from e
+
+def _get(url: str, hdrs: dict, timeout: int = 30) -> dict:
+    return _http("GET", url, hdrs, timeout=timeout)
+
+def _post(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
+    return _http("POST", url, {**hdrs, "Content-Type": "application/json"}, body, timeout)
+
+def _patch(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
+    return _http("PATCH", url, {**hdrs, "Content-Type": "application/json"}, body, timeout)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPH TOKEN
+# ─────────────────────────────────────────────────────────────────────────────
+
+_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _graph_token() -> str:
+    return _graph_credential.get_token("https://graph.microsoft.com/.default").token
+
+def _auth_hdrs() -> dict:
+    return {"Authorization": f"Bearer {_graph_token()}"}
+
+def _jira_auth() -> str:
+    return "Basic " + _b64.b64encode(f"{JIRA_USER_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+
+def _jira_hdrs() -> dict:
+    return {"Authorization": _jira_auth(), "Content-Type": "application/json", "Accept": "application/json"}
+
+def _sanitize_kv_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9-]", "-", name)
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return cleaned[:127]
+
+def _classify_bucket(days: int) -> str:
+    if days >= 61:       return "P4"
+    if 31 <= days <= 60: return "P3"
+    if 8  <= days <= 30: return "P2"
+    if 0  <= days <= 7:  return "P1"
+    if -7 <= days <= -1: return "ExpiredManualReview"
+    return "Ignore"
+
+def _days_remaining(expiration_iso: str, now: datetime) -> int | None:
+    try:
+        if len(expiration_iso) == 10:
+            expiration_iso += "T00:00:00+00:00"
+        exp = datetime.fromisoformat(expiration_iso.replace("Z", "+00:00"))
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return (exp - now).days
+    except Exception:
+        return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL IMPLEMENTATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_azure_applications() -> dict:
+    url  = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,appId,passwordCredentials"
+    apps: list[dict] = []
+    while url:
+        b = _get(url, _auth_hdrs(), timeout=30)
+        apps.extend(b.get("value", []))
+        url = b.get("@odata.nextLink")
+    return {"applications": apps, "total_apps": len(apps)}
+
+def get_sharepoint_state() -> dict:
+    status_filter = " or ".join([
+        f"fields/AlertStatus eq '{s}'"
+        for s in [
+            "Discovered", "RotatedPendingDeployment",
+            "JiraRaised", "TeamsAlerted", "Escalated",
+            "Expired", "ExpiredManualReview",
+        ]
+    ])
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_LIST_ID}/items"
+        f"?$expand=fields"
+        f"&$filter={urllib.parse.quote(status_filter)}"
+    )
+    items: list[dict] = []
+    while url:
+        b = _get(url, _auth_hdrs(), timeout=30)
+        items.extend(b.get("value", []))
+        url = b.get("@odata.nextLink")
+    return {"items": items, "count": len(items)}
+
+_DATE_COLS = {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate"}
+
+def write_sharepoint_row(item_id: str | None, fields: dict) -> dict:
+    for col in _DATE_COLS:
+        if col in fields and fields[col]:
+            fields[col] = str(fields[col])[:10]
+    fields["TenantID"]   = GRAPH_TENANT_ID
+    fields["TenantName"] = GRAPH_TENANT_NAME
+    base = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+            f"/lists/{SHAREPOINT_LIST_ID}/items")
+    if item_id is None:
+        r = _post(base, _auth_hdrs(), {"fields": fields}, timeout=20)
+        return {"action": "created", "item_id": r.get("id")}
+    else:
+        _patch(f"{base}/{item_id}", _auth_hdrs(), {"fields": fields}, timeout=20)
+        return {"action": "updated", "item_id": item_id}
+
+def create_azure_secret(application_object_id: str, display_name: str,
+                        months_valid: int = 12) -> dict:
+    end_date = datetime.now(timezone.utc) + timedelta(days=30 * months_valid)
+    payload  = {"passwordCredential": {
+        "displayName": display_name,
+        "endDateTime": end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    }}
+    url = f"https://graph.microsoft.com/v1.0/applications/{application_object_id}/addPassword"
+    for attempt in range(1, 6):
+        try:
+            b = _post(url, _auth_hdrs(), payload, timeout=30)
+            return {"success": True, "keyId": b.get("keyId"),
+                    "secretText": b.get("secretText"), "endDateTime": b.get("endDateTime")}
+        except RuntimeError as e:
+            if ("409" in str(e) or "412" in str(e)) and attempt < 5:
+                time.sleep(attempt * 5)
+                continue
+            return {"success": False, "error": str(e)}
+    return {"success": False, "error": "Max retries exceeded"}
+
+def store_rotated_secret(secret_name: str, secret_value: str) -> dict:
+    try:
+        clean_name = _sanitize_kv_name(secret_name)
+        result = _rotation_kv.set_secret(clean_name, secret_value,
+                                         content_type="azure-app-registration-secret")
+        return {"success": True, "vault_name": clean_name, "vault_url": result.id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_jira_issue(issue_key: str) -> dict:
+    try:
+        b = _get(f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}?fields=status,summary",
+                 _jira_hdrs(), timeout=15)
+        return {"issue_key": issue_key,
+                "status": b.get("fields", {}).get("status", {}).get("name", "Unknown"),
+                "summary": b.get("fields", {}).get("summary", "")}
+    except RuntimeError as e:
+        if "404" in str(e):
+            return {"issue_key": issue_key, "status": "NotFound", "summary": ""}
+        raise
+
+def add_jira_comment(issue_key: str, comment_text: str) -> dict:
+    payload = {"body": {"type": "doc", "version": 1,
+                        "content": [{"type": "paragraph",
+                                     "content": [{"type": "text", "text": comment_text}]}]}}
+    b = _post(f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/comment",
+              _jira_hdrs(), payload, timeout=15)
+    return {"issue_key": issue_key, "comment_id": b.get("id", "")}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROTATION ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOLD) -> dict:
+    now   = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+
+    summary: dict[str, Any] = {
+        "runDate": today, "rotationThresholdDays": rotation_threshold_days,
+        "rowsScanned": 0, "rowsSkippedNoOwner": 0, "rowsSkippedRotated": 0,
+        "rotationsCompleted": 0, "newSecretsGenerated": 0,
+        "jiraComments": 0, "flaggedForManualReview": 0, "sharepointUpdated": 0,
+        "errors": [],
+    }
+
+    sp_data    = get_sharepoint_state()
+    azure_data = fetch_azure_applications()
+
+    app_object_id_by_client_id: dict[str, str] = {
+        app["appId"]: app["id"]
+        for app in azure_data.get("applications", [])
+        if app.get("appId") and app.get("id")
+    }
+
+    items = sp_data.get("items", [])
+    summary["rowsScanned"] = len(items)
+
+    # ── PHASE A: Closure check ────────────────────────────────────────────────
+    pending = [i for i in items
+               if i.get("fields", {}).get("AlertStatus") == "RotatedPendingDeployment"]
+
+    for item in pending:
+        f        = item.get("fields", {})
+        item_id  = item.get("id")
+        jira_key = f.get("JiraTicketKey", "")
+        try:
+            if not jira_key:
+                write_sharepoint_row(item_id, {"AlertStatus": "JiraClosed-Unverified",
+                                               "LastChecked": today})
+                summary["flaggedForManualReview"] += 1
+                summary["sharepointUpdated"] += 1
+                continue
+            issue       = get_jira_issue(jira_key)
+            status_name = (issue.get("status") or "").strip().lower()
+            if status_name in CLOSED_NAMES:
+                write_sharepoint_row(item_id, {
+                    "AlertStatus": "Rotated",
+                    "RotationDetectedDate": today,
+                    "ExpiryNotice": "Rotated — Completed",
+                    "LastChecked": today,
+                })
+                summary["rotationsCompleted"] += 1
+                summary["sharepointUpdated"]  += 1
+            else:
+                write_sharepoint_row(item_id, {"LastChecked": today})
+                summary["sharepointUpdated"] += 1
+        except Exception as e:
+            summary["errors"].append(f"Phase A error SecretID={f.get('SecretID')}: {e}")
+
+    # ── PHASE B: Proactive rotation ───────────────────────────────────────────
+    all_candidates = [
+        item for item in items
+        if (item.get("fields", {}).get("AlertStatus") in ACTIONABLE_STATUSES
+            and not item.get("fields", {}).get("NewSecretVaultName"))
+    ]
+
+    candidates = []
+    for item in all_candidates:
+        f          = item.get("fields", {})
+        app_owners = (f.get("AppOwners") or "").lower()
+        if not app_owners:
+            summary["rowsSkippedNoOwner"] += 1
+            continue
+        if OWNER_EMAILS and not any(email in app_owners for email in OWNER_EMAILS):
+            summary["rowsSkippedNoOwner"] += 1
+            continue
+        candidates.append(item)
+
+    for item in candidates:
+        f      = item.get("fields", {})
+        days   = _days_remaining(f.get("ExpirationDate", ""), now)
+        if days is None:
+            continue
+        bucket = _classify_bucket(days)
+        if bucket not in ROTATION_ELIGIBLE_BUCKETS:
+            continue
+        if days > rotation_threshold_days:
+            continue
+
+        item_id  = item.get("id")
+        app_id   = f.get("Title")
+        app_name = f.get("AppName", "Unknown")
+        jira_key = f.get("JiraTicketKey", "")
+
+        if not jira_key:
+            summary["errors"].append(f"AppID={app_id}: no JiraTicketKey, cannot rotate")
+            continue
+
+        if f.get("NewSecretVaultName"):
+            summary["rowsSkippedRotated"] += 1
+            continue
+
+        try:
+            issue       = get_jira_issue(jira_key)
+            status_name = (issue.get("status") or "").strip().lower()
+            if status_name in CLOSED_NAMES:
+                write_sharepoint_row(item_id, {"AlertStatus": "JiraClosed-Unverified",
+                                               "LastChecked": today})
+                summary["flaggedForManualReview"] += 1
+                summary["sharepointUpdated"] += 1
+                continue
+
+            object_id = app_object_id_by_client_id.get(app_id)
+            if not object_id:
+                summary["errors"].append(f"AppID={app_id}: not found in Azure snapshot")
+                continue
+
+            new_secret = create_azure_secret(
+                application_object_id=object_id,
+                display_name=f"AutoRotated-{jira_key}-{today}")
+            if not new_secret.get("success"):
+                summary["errors"].append(f"AppID={app_id}: create_azure_secret failed: {new_secret}")
+                continue
+            summary["newSecretsGenerated"] += 1
+
+            vault_result = store_rotated_secret(
+                secret_name=f"{app_name}-{jira_key}",
+                secret_value=new_secret["secretText"])
+            if not vault_result.get("success"):
+                summary["errors"].append(f"AppID={app_id}: store_rotated_secret failed: {vault_result}")
+                continue
+
+            vault_name = vault_result["vault_name"]
+
+            try:
+                comment = (
+                    f"AUTO-ROTATION — {today}\n"
+                    f"A new client secret has been generated for {app_name} (App ID: {app_id}).\n"
+                    f"New credential keyId: {new_secret['keyId']}\n"
+                    f"New credential expiry: {new_secret['endDateTime']}\n"
+                    f"Stored in Key Vault under: {vault_name}\n\n"
+                    f"Next steps:\n"
+                    f"1. Retrieve the value from Key Vault ({vault_name})\n"
+                    f"2. Deploy to all dependent services\n"
+                    f"3. Confirm authentication works\n"
+                    f"4. Close this ticket to mark as Rotated in SharePoint."
+                )
+                add_jira_comment(jira_key, comment)
+                summary["jiraComments"] += 1
+            except Exception as e:
+                summary["errors"].append(f"Jira comment failed for {jira_key}: {e}")
+
+            write_sharepoint_row(item_id, {
+                "AlertStatus":        "RotatedPendingDeployment",
+                "NewSecretKeyId":     new_secret["keyId"],
+                "NewSecretVaultName": vault_name,
+                "ExpiryNotice":       f"New secret ready — pending deployment ({jira_key})",
+                "LastChecked":        today,
+            })
+            summary["sharepointUpdated"] += 1
+
+            time.sleep(5)
+
+        except Exception as e:
+            summary["errors"].append(f"Phase B error AppID={f.get('Title')}: {e}")
+
+    return summary
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    log.info("Rotation Runbook started")
+    summary = run_secret_rotation(rotation_threshold_days=60)
+
+    print("=" * 60)
+    print("ROTATION RUNBOOK — SUMMARY")
+    print("=" * 60)
+    print(f"  Run Date                : {summary.get('runDate')}")
+    print(f"  Owner Filter            : {OWNER_EMAILS}")
+    print(f"  SharePoint Rows Scanned : {summary.get('rowsScanned')}")
+    print(f"  Skipped (not owned)     : {summary.get('rowsSkippedNoOwner')}")
+    print(f"  Skipped (already rotated): {summary.get('rowsSkippedRotated')}")
+    print(f"  New Secrets Generated   : {summary.get('newSecretsGenerated')}")
+    print(f"  Rotations Completed     : {summary.get('rotationsCompleted')}")
+    print(f"  Jira Comments Added     : {summary.get('jiraComments')}")
+    print(f"  Flagged for Manual Rev. : {summary.get('flaggedForManualReview')}")
+    print(f"  SharePoint Updated      : {summary.get('sharepointUpdated')}")
+    errors = summary.get("errors", [])
+    if errors:
+        print(f"\n  ERRORS ({len(errors)}):")
+        for err in errors:
+            print(f"    - {err}")
+        sys.exit(1)
+    else:
+        print("\n  No errors.")
+
+main()
+```
