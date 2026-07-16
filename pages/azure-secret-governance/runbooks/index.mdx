@@ -35,13 +35,13 @@ classifies every secret by severity level, and batch-writes rows to SharePoint.
 
 ### What it does
 
-1. Fetches all App Registrations via `GET /v1.0/applications` — all 255+ apps, all secrets
-2. Fetches owners for every app in parallel using `ThreadPoolExecutor` (20 workers)
-3. Classifies each secret into P1 / P2 / P3 / P4 / ExpiredManualReview / Ignore
-4. Batch-writes to SharePoint using Graph `$batch` — up to 20 writes per HTTP call
-5. New secrets → creates row with `AlertStatus = Discovered`
-6. Existing rows → updates `AppOwners`, `SeverityLevel`, `ExpirationDate` only
-   (never overwrites `AlertStatus` — monitoring manages that)
+- Fetches all App Registrations via `GET /v1.0/applications` — all 255+ apps, all secrets
+- Fetches owners for every app in parallel using `ThreadPoolExecutor` (20 workers)
+- Classifies each secret into P1 / P2 / P3 / P4 / ExpiredManualReview / Ignore
+- Batch-writes to SharePoint using Graph `$batch` — up to 20 writes per HTTP call
+- New secrets → creates row with `AlertStatus = Discovered`
+- Existing rows → updates `AppOwners`, `SeverityLevel`, `ExpirationDate` only
+  (never overwrites `AlertStatus` — monitoring manages that)
 
 ### Key behaviours
 
@@ -52,7 +52,7 @@ classifies every secret by severity level, and batch-writes rows to SharePoint.
 | **AlertStatus never overwritten** | Updates to existing rows never touch `AlertStatus` — only monitoring changes it |
 | **404 retry** | If a PATCH returns 404 (stale item ID), automatically retries as a POST |
 | **Transient error retry** | Each SharePoint write retries up to 3 times with exponential backoff |
-| **Parallel owner fetching** | 255 apps × ~50ms per owner call = sequential would take 13s. Parallel drops it to <1s |
+| **Parallel owner fetching** | 255 apps × ~50ms per owner call = sequential would take 13s. Parallel drops it to under 1s |
 
 ### Automation Variables required
 
@@ -117,12 +117,12 @@ If closed → updates SharePoint to `Rotated`. If still open → updates `LastCh
 
 For each actionable row (P1/P2/P3) owned by the configured owner:
 
-1. Checks the Jira ticket is still open (skips if closed — someone already handled it)
-2. Calls `POST /applications/{id}/addPassword` to create a new secret in Entra
-3. Stores the new secret value in the rotation Key Vault
-4. Adds a comment to the Jira ticket with the new keyId, expiry, and Key Vault name
-5. Updates SharePoint to `RotatedPendingDeployment`
-6. Waits 5 seconds before the next rotation (prevents Azure AD concurrency conflicts)
+- Checks the Jira ticket is still open (skips if closed — someone already handled it)
+- Calls `POST /applications/{id}/addPassword` to create a new secret in Entra
+- Stores the new secret value in the rotation Key Vault
+- Adds a comment to the Jira ticket with the new keyId, expiry, and Key Vault name
+- Updates SharePoint to `RotatedPendingDeployment`
+- Waits 5 seconds before the next rotation (prevents Azure AD concurrency conflicts)
 
 ### Ownership filter
 
@@ -175,13 +175,13 @@ unowned. The sync runbook then pushes that owner to Entra.
 
 ### What it does
 
-1. Reads all active SharePoint rows (skips `Rotated`, `Ignored`, `Resolved`)
-2. Groups rows by `ObjectID` — one Entra API call per app, not per secret row
-3. For each app — fetches current Entra owners
-4. If SP has an owner NOT in Entra → adds them via `POST /applications/{id}/owners/$ref`
-5. **Propagates owners across sibling rows** — if an admin fills `AppOwners` on just
-   the P1 row for an app, the sync runbook copies it to all other rows for the same app
-6. Never removes owners — only adds (removal direction: do nothing)
+- Reads all active SharePoint rows (skips `Rotated`, `Ignored`, `Resolved`)
+- Groups rows by `ObjectID` — one Entra API call per app, not per secret row
+- For each app — fetches current Entra owners
+- If SP has an owner NOT in Entra → adds them via `POST /applications/{id}/owners/$ref`
+- **Propagates owners across sibling rows** — if an admin fills `AppOwners` on just
+  the P1 row for an app, the sync runbook copies it to all other rows for the same app
+- Never removes owners — only adds (removal direction: do nothing)
 
 <Callout type="info">
   The sync runbook resolves owner identifiers automatically.
@@ -254,3 +254,11 @@ SharePoint Updated     : 9      ← rows moved to RotatedPendingDeployment
 Rotations Completed    : 0      ← Jira tickets already closed (Phase A)
 Errors                 : 0      ← clean run
 ```
+
+---
+
+## Source code
+
+The runbook source files are stored in the `secret-governance-infra/runbooks/` folder
+of your infrastructure repository. Deploy them by uploading to your Automation Account
+under **Runbooks → Import a runbook** or via `az automation runbook replace-content`.
