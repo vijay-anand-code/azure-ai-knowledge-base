@@ -3,6 +3,6 @@
   "discovery-runbook": "Discovery Runbook",
   "monitoring-runbook": "Monitoring Runbook",
   "rotation-runbook": "Rotation Runbook",
-  "container-1-langchain-agent": "Container 1 — LangChain Agent",
-  "container-2-monitor-api": "Container 2 — Monitor API"
+  "container-1-langchain-agent": "Container 1 - LangChain Agent",
+  "container-2-monitor-api": "Container 2 - Monitor API"
 }
