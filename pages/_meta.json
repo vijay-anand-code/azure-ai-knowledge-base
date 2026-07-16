@@ -4,6 +4,5 @@
   "langchain": "LangChain",
   "container-apps": "Container Apps",
   "github-actions": "GitHub Actions",
-  "azure-secret-governance": "Azure Secret Governance",
-  "source-code": "Source Code"
+  "azure-secret-governance": "Azure Secret Governance"
 }

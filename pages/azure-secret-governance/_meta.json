@@ -6,5 +6,6 @@
   "github-actions": "GitHub Actions CI/CD",
   "jira": "Jira Automation",
   "teams-bot": "Teams Bot",
-  "dashboard": "Dashboard"
+  "dashboard": "Dashboard",
+  "source-code": "Source Code"
 }
