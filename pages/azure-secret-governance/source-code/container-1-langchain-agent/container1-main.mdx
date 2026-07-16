@@ -1,0 +1,382 @@
+---
+title: main.py (Container 1)
+description: LangChain Agent — FastAPI app with GPT-4o, all tool definitions, and governance cycle orchestration
+---
+
+import { Callout } from 'nextra/components'
+
+# main.py — Container 1 (LangChain Agent)
+
+**Location:** `secret-governance-app/container-1/main.py`
+
+**Runtime:** Python 3.11 — Azure Container App (public port 8000)
+
+**What it does:** Hosts the LangChain agent (GPT-4o) that orchestrates the full governance cycle. Defines all tools that call Container 2, manages per-session chat memory, and exposes FastAPI endpoints for the runbook trigger, Jira webhook, and Teams bot.
+
+---
+
+## Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/health` | GET | Liveness probe |
+| `/run` | POST | Trigger governance cycle as background task — returns immediately |
+| `/chat` | POST | Conversational endpoint with per-session memory |
+| `/jira-webhook` | POST | Receives Jira ticket transitions — updates SharePoint directly, no AI |
+| `/teams-webhook` | POST | Receives Teams Bot messages — routes through LangChain agent |
+
+---
+
+## Key design decisions
+
+| Decision | Reason |
+|----------|--------|
+| `/run` returns immediately | Prevents 504 timeout on the Azure Automation runbook side — agent runs in background via `asyncio.create_task` |
+| Jira webhook bypasses LangChain | No GPT-4o reasoning needed to update a SharePoint field — direct Container 2 call is 2s vs 60s |
+| Per-session `InMemoryChatMessageHistory` | Teams bot conversations maintain context across messages in the same session |
+| UAMI for Key Vault auth | No client secrets in environment variables — identity-based authentication only |
+| `max_iterations=30` on AgentExecutor | Prevents infinite loops on complex monitoring cycles with many tool calls |
+
+<Callout type="info">
+  The Teams bot is enabled by 6 lines in this file. Comment them all out to
+  disable it without removing any code — the `/teams-webhook` endpoint simply
+  won't exist in the next deployment.
+</Callout>
+
+---
+
+## LangChain tools defined
+
+All tools POST to Container 2 `/tools/*` endpoints:
+
+| Tool | Container 2 endpoint |
+|------|---------------------|
+| `run_secret_monitoring` | `/tools/run_secret_monitoring` |
+| `fetch_azure_secrets` | `/tools/fetch_azure_secrets` |
+| `get_sharepoint_state` | `/tools/get_sharepoint_state` |
+| `get_jira_issue` | `/tools/get_jira_issue` |
+| `add_jira_comment` | `/tools/add_jira_comment` |
+| `send_teams_alert` | `/tools/send_teams_alert` |
+| `write_sharepoint_row` | `/tools/write_sharepoint_row` |
+| `create_jira_ticket` | `/tools/create_jira_ticket` |
+
+---
+
+## Required environment variables
+
+| Variable | Value |
+|----------|-------|
+| `KEY_VAULT_URL` | Config Key Vault URL |
+| `UAMI_CLIENT_ID` | User-Assigned Managed Identity client ID |
+| `MONITOR_API_URL` | Container 2 internal URL (e.g. `http://localhost:8001`) |
+
+## Required Key Vault secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `AZURE-OPENAI-ENDPOINT` | Azure OpenAI endpoint URL |
+| `AZURE-OPENAI-API-KEY` | Azure OpenAI API key |
+| `AZURE-OPENAI-DEPLOYMENT-NAME` | GPT-4o deployment name |
+| `BOT-APP-ID` | Teams Bot App Registration client ID |
+| `BOT-APP-SECRET` | Teams Bot client secret |
+| `BOT-TENANT-ID` | Azure tenant ID for Bot Framework token |
+
+---
+
+## Source
+
+```python
+"""
+Azure Secret Governance — LangChain Agent  (Container 1)
+=========================================================
+Endpoints:
+  GET  /health          — liveness probe
+  POST /run             — trigger a governance cycle (background task — returns immediately)
+  POST /chat            — conversational endpoint with per-session memory
+  POST /jira-webhook    — Jira automation trigger when ticket is resolved
+  POST /teams-webhook   — Microsoft Teams Bot Service messages
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
+
+import httpx
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+
+from langchain_openai import AzureChatOpenAI
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.tools import tool
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("secret-agent")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+KV_URL          = os.environ["KEY_VAULT_URL"]
+UAMI_CLIENT_ID  = os.environ["UAMI_CLIENT_ID"]
+MONITOR_API_URL = os.environ.get("MONITOR_API_URL", "http://localhost:8001")
+
+_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+_kv         = SecretClient(vault_url=KV_URL, credential=_credential)
+
+def _kv_get(name: str) -> str:
+    try:
+        return _kv.get_secret(name).value
+    except Exception as exc:
+        raise RuntimeError(f"Required Key Vault secret '{name}' could not be loaded: {exc}") from exc
+
+log.info("Loading Azure OpenAI config from Key Vault...")
+AOAI_ENDPOINT   = _kv_get("AZURE-OPENAI-ENDPOINT")
+AOAI_API_KEY    = _kv_get("AZURE-OPENAI-API-KEY")
+AOAI_DEPLOYMENT = _kv_get("AZURE-OPENAI-DEPLOYMENT-NAME")
+log.info("Azure OpenAI config loaded. Deployment: %s", AOAI_DEPLOYMENT)
+
+# ── HTTP Client — talks to Container 2 ───────────────────────────────────────
+
+async def _call_monitor(endpoint: str, payload: dict | None = None) -> dict:
+    url = f"{MONITOR_API_URL}/tools/{endpoint}"
+    async with httpx.AsyncClient(timeout=1800) as c:
+        r = await c.post(url, json=payload or {})
+        r.raise_for_status()
+        return r.json()
+
+# ── LangChain Tools ───────────────────────────────────────────────────────────
+
+@tool
+async def run_secret_monitoring() -> dict:
+    """Runs the complete Azure secret expiry monitoring cycle: scans all App Registrations,
+    classifies expiry buckets, raises Jira tickets, sends Teams alerts, and updates SharePoint."""
+    return await _call_monitor("run_secret_monitoring")
+
+@tool
+async def fetch_azure_secrets() -> dict:
+    """Fetches all Azure App Registrations and their client secrets from Entra ID."""
+    return await _call_monitor("fetch_azure_secrets")
+
+@tool
+async def get_sharepoint_state() -> dict:
+    """Reads all items from the SecretAlertRegistry SharePoint list."""
+    return await _call_monitor("get_sharepoint_state")
+
+@tool
+async def get_jira_issue(issue_key: str) -> dict:
+    """Returns the current status and summary of a Jira issue by its key (e.g. KAN-96)."""
+    return await _call_monitor("get_jira_issue", {"issue_key": issue_key})
+
+@tool
+async def add_jira_comment(issue_key: str, comment_text: str) -> dict:
+    """Adds a comment to an existing Jira issue."""
+    return await _call_monitor("add_jira_comment", {"issue_key": issue_key, "comment_text": comment_text})
+
+@tool
+async def send_teams_alert(alert_text: str) -> dict:
+    """Posts an Adaptive Card alert message to the Teams webhook channel."""
+    return await _call_monitor("send_teams_alert", {"alert_text": alert_text})
+
+@tool
+async def write_sharepoint_row(item_id: Optional[str], fields: dict) -> dict:
+    """Creates or updates a row in the SecretAlertRegistry SharePoint list."""
+    return await _call_monitor("write_sharepoint_row", {"item_id": item_id, "fields": fields})
+
+@tool
+async def create_jira_ticket(
+    app_name: str, app_id: str, secret_id: str, secret_description: str,
+    expiration_date: str, days_remaining: int,
+    severity: str = "WARNING", priority: str = "High", extra_note: str = ""
+) -> dict:
+    """Creates a Jira incident ticket for a secret expiry event."""
+    return await _call_monitor("create_jira_ticket", {
+        "app_name": app_name, "app_id": app_id, "secret_id": secret_id,
+        "secret_description": secret_description, "expiration_date": expiration_date,
+        "days_remaining": days_remaining, "severity": severity,
+        "priority": priority, "extra_note": extra_note,
+    })
+
+TOOLS = [
+    run_secret_monitoring, fetch_azure_secrets, get_sharepoint_state,
+    get_jira_issue, add_jira_comment, send_teams_alert,
+    write_sharepoint_row, create_jira_ticket,
+]
+
+# ── Memory ────────────────────────────────────────────────────────────────────
+
+_chat_histories: dict[str, BaseChatMessageHistory] = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in _chat_histories:
+        _chat_histories[session_id] = InMemoryChatMessageHistory()
+    return _chat_histories[session_id]
+
+# ── System Prompt ─────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """You are the Azure Secret Governance Agent.
+
+You have access to tools that interact with Azure Entra ID, SharePoint, Jira, and Teams:
+- run_secret_monitoring    — runs the full weekly monitoring cycle
+- fetch_azure_secrets      — fetch all App Registrations and their secrets
+- get_sharepoint_state     — read all rows from SecretAlertRegistry SharePoint list
+- get_jira_issue           — get the current status of a specific Jira ticket
+- add_jira_comment         — add a comment to a Jira ticket
+- send_teams_alert         — post an alert to the Teams channel
+- write_sharepoint_row     — create or update a SharePoint row
+- create_jira_ticket       — raise a new Jira incident ticket
+
+Bucket classifications:
+- P1: 0-7 days remaining (CRITICAL)
+- P2: 8-30 days remaining (WARNING)
+- P3: 31-60 days remaining (INFORMATION)
+- P4: 61+ days remaining (SAFE)
+- ExpiredManualReview: expired 1-7 days ago (MANUAL REVIEW)
+- Ignore: expired 8+ days ago (SKIPPED)
+"""
+
+DEFAULT_INSTRUCTION = (
+    "Run the weekly secret monitoring check. "
+    "Summarise everything: secrets scanned, new Jira tickets raised, "
+    "Teams alerts sent, SharePoint rows created or updated, and any errors."
+)
+
+# ── Agent Factory ─────────────────────────────────────────────────────────────
+
+_agent_with_history: RunnableWithMessageHistory | None = None
+
+def build_agent() -> RunnableWithMessageHistory:
+    log.info("Building LangChain agent with %d tools", len(TOOLS))
+    llm = AzureChatOpenAI(
+        azure_endpoint=AOAI_ENDPOINT,
+        api_key=AOAI_API_KEY,
+        azure_deployment=AOAI_DEPLOYMENT,
+        api_version="2024-10-21",
+        temperature=0,
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+    agent    = create_tool_calling_agent(llm, TOOLS, prompt)
+    executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True, max_iterations=30)
+    return RunnableWithMessageHistory(
+        executor, get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+    )
+
+async def _get_agent() -> RunnableWithMessageHistory:
+    global _agent_with_history
+    if _agent_with_history is None:
+        _agent_with_history = build_agent()
+    return _agent_with_history
+
+# ── Governance Cycle ──────────────────────────────────────────────────────────
+
+async def run_governance_cycle(instruction: str = DEFAULT_INSTRUCTION) -> dict:
+    agent   = await _get_agent()
+    started = datetime.now(timezone.utc)
+    try:
+        result = await agent.ainvoke(
+            {"input": instruction},
+            config={"configurable": {"session_id": "runbook_trigger"}},
+        )
+        return {"success": True, "startedAt": started.isoformat(), "summary": result.get("output", "")}
+    except Exception as e:
+        log.exception("Governance cycle failed")
+        return {"success": False, "startedAt": started.isoformat(), "error": str(e)}
+
+# ── FastAPI App ───────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _agent_with_history
+    _agent_with_history = build_agent()
+    log.info("Agent ready. Monitor API: %s", MONITOR_API_URL)
+    yield
+
+app = FastAPI(title="Azure Secret Governance Agent", lifespan=lifespan)
+
+# ── Teams Bot — comment out to disable ───────────────────────────────────────
+from teams_bot import router as teams_router
+import teams_bot
+teams_bot.configure(
+    bot_app_id     = _kv_get("BOT-APP-ID"),
+    bot_app_secret = _kv_get("BOT-APP-SECRET"),
+    bot_tenant_id  = _kv_get("BOT-TENANT-ID"),
+    get_agent_fn   = _get_agent,
+)
+app.include_router(teams_router)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RunRequest(BaseModel):
+    instruction: str | None = None
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str = "default_user_session"
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "server": "AzureSecretGovernanceAgent", "deployment": AOAI_DEPLOYMENT}
+
+@app.post("/run")
+async def run(req: RunRequest):
+    instruction = req.instruction or DEFAULT_INSTRUCTION
+    asyncio.create_task(run_governance_cycle(instruction))
+    return {"success": True, "message": "Monitoring cycle started in background",
+            "startedAt": datetime.now(timezone.utc).isoformat()}
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    agent = await _get_agent()
+    try:
+        result = await agent.ainvoke(
+            {"input": req.message},
+            config={"configurable": {"session_id": req.session_id}},
+        )
+        return {"session_id": req.session_id, "response": result["output"]}
+    except Exception as e:
+        log.exception("Chat request failed for session %s", req.session_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def _update_sharepoint_on_close(jira_key: str):
+    try:
+        today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        result = await _call_monitor("update_on_jira_close", {"jira_key": jira_key, "today": today})
+        log.info("SharePoint updated for %s: %s rows marked Rotated", jira_key, result.get("updated", 0))
+    except Exception as e:
+        log.exception("Failed to update SharePoint for %s: %s", jira_key, e)
+
+@app.post("/jira-webhook")
+async def jira_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    issue  = payload.get("issue", {})
+    key    = issue.get("key") or payload.get("issueKey", "Unknown")
+    status = (issue.get("fields", {}).get("status", {}).get("name") or
+              payload.get("transition", {}).get("to", {}).get("name", "")).lower()
+
+    log.info("Jira webhook received: %s → '%s'", key, status)
+
+    if status in {"done", "closed", "resolved"}:
+        log.info("Ticket %s closed — updating SharePoint directly (no AI)", key)
+        asyncio.create_task(_update_sharepoint_on_close(key))
+        return {"status": "accepted", "issue": key, "action": "sharepoint_update_triggered"}
+
+    return {"status": "received", "issue": key, "action": "none"}
+```

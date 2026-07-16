@@ -1,0 +1,241 @@
+---
+title: teams_bot.py
+description: Microsoft Teams Bot — standalone module for receiving and replying to Teams channel messages
+---
+
+import { Callout } from 'nextra/components'
+
+# teams_bot.py — Container 1
+
+**Location:** `secret-governance-app/container-1/teams_bot.py`
+
+**Runtime:** Python 3.11 — imported by `main.py` in Container 1
+
+**What it does:** Standalone Teams Bot module. Receives messages from Microsoft Teams via Azure Bot Service, maps quick commands to agent instructions, routes them through the LangChain agent, and sends replies back to the Teams channel via Bot Framework API.
+
+---
+
+## How it fits in
+
+```
+Teams channel (admin types "@SecretBot critical")
+      ↓
+Azure Bot Service
+      ↓
+POST /teams-webhook  (this module)
+      ↓
+Maps "critical" → full instruction string
+      ↓
+LangChain agent processes via _get_agent_fn()
+      ↓
+_send_reply() posts answer back to Teams
+```
+
+---
+
+## Quick commands
+
+| Command | What it asks the agent |
+|---------|----------------------|
+| `status` | Summary of all secret expiry statuses — P1, P2, P3 counts |
+| `critical` | All P1 secrets expiring within 7 days |
+| `expiring` | All secrets expiring within 30 days |
+| `pending` | All secrets with `RotatedPendingDeployment` status |
+| `help` | Lists all available commands |
+
+Natural language also works — the raw message is passed directly to the agent.
+
+---
+
+## Key design decisions
+
+| Decision | Reason |
+|----------|--------|
+| Standalone module | Disable Teams bot by commenting 6 lines in `main.py` — no code deletion needed |
+| `asyncio.create_task` for reply | Returns HTTP 200 to Teams immediately — prevents the 15s timeout that causes Teams to retry |
+| Credentials injected via `configure()` | Module has no direct Key Vault access — credentials passed in from `main.py` after KV load |
+| `conversationUpdate` handler | Sends a welcome message when the bot is first added to a channel |
+| Bot mention stripped | `<at>SecretBot</at>` removed from message text before processing |
+
+<Callout type="info">
+  To disable the Teams bot entirely, comment out these 6 lines in `main.py`:
+
+  ```python
+  # from teams_bot import router as teams_router
+  # import teams_bot
+  # teams_bot.configure(
+  #     bot_app_id     = _kv_get("BOT-APP-ID"),
+  #     bot_app_secret = _kv_get("BOT-APP-SECRET"),
+  #     bot_tenant_id  = _kv_get("BOT-TENANT-ID"),
+  #     get_agent_fn   = _get_agent,
+  # )
+  # app.include_router(teams_router)
+  ```
+</Callout>
+
+---
+
+## Required Key Vault secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `BOT-APP-ID` | Teams Bot App Registration client ID |
+| `BOT-APP-SECRET` | Bot client secret — used to get Bot Framework token |
+| `BOT-TENANT-ID` | Azure tenant ID for Bot Framework OAuth token endpoint |
+
+---
+
+## Source
+
+```python
+"""
+teams_bot.py — Microsoft Teams Bot for Azure Secret Governance
+==============================================================
+Standalone module — import into main.py to enable Teams bot.
+To disable: comment out the import in main.py.
+
+How it works:
+  1. Azure Bot Service receives message from Teams channel
+  2. Posts to /teams-webhook on this container
+  3. LangChain agent processes the question
+  4. Reply sent back to Teams via Bot Framework API
+
+Setup:
+  - Azure Bot Service created and Teams channel enabled
+  - BOT-APP-ID, BOT-APP-SECRET, BOT-TENANT-ID stored in Key Vault
+  - Bot manifest uploaded to Teams org app catalog
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+
+import httpx
+from fastapi import APIRouter, Request, Response
+
+log = logging.getLogger("teams-bot")
+
+router = APIRouter(tags=["Teams Bot"])
+
+_bot_app_id     = ""
+_bot_app_secret = ""
+_bot_tenant_id  = ""
+_get_agent_fn   = None
+
+def configure(bot_app_id: str, bot_app_secret: str,
+              bot_tenant_id: str, get_agent_fn) -> None:
+    global _bot_app_id, _bot_app_secret, _bot_tenant_id, _get_agent_fn
+    _bot_app_id     = bot_app_id
+    _bot_app_secret = bot_app_secret
+    _bot_tenant_id  = bot_tenant_id
+    _get_agent_fn   = get_agent_fn
+    log.info("Teams bot configured. App ID: %s", bot_app_id[:8] + "...")
+
+async def _get_bot_token() -> str:
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"https://login.microsoftonline.com/{_bot_tenant_id}/oauth2/v2.0/token",
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     _bot_app_id,
+                "client_secret": _bot_app_secret,
+                "scope":         "https://api.botframework.com/.default",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()["access_token"]
+
+async def _send_reply(service_url: str, conversation_id: str,
+                      activity_id: str, text: str) -> None:
+    try:
+        token = await _get_bot_token()
+        url   = f"{service_url}v3/conversations/{conversation_id}/activities/{activity_id}"
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(url,
+                json={"type": "message", "text": text, "textFormat": "markdown"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            r.raise_for_status()
+            log.info("Reply sent to Teams conversation %s", conversation_id[:20])
+    except Exception as e:
+        log.exception("Failed to send Teams reply: %s", e)
+
+QUICK_COMMANDS = {
+    "status":   "Give me a brief summary of current secret expiry status — how many P1, P2, P3, and how many rotated.",
+    "critical": "Show me all P1 critical secrets expiring within 7 days from the SecretAlertRegistry SharePoint list.",
+    "expiring": "Show me all secrets expiring within the next 30 days.",
+    "pending":  "Show me all secrets with AlertStatus = RotatedPendingDeployment.",
+    "help": (
+        "List all available commands:\n"
+        "- **status** — summary of all secret statuses\n"
+        "- **critical** — P1 secrets expiring within 7 days\n"
+        "- **expiring** — secrets expiring this month\n"
+        "- **pending** — secrets pending deployment"
+    ),
+}
+
+async def _process_and_reply(text: str, from_id: str, conversation_id: str,
+                              service_url: str, activity_id: str) -> None:
+    instruction = QUICK_COMMANDS.get(text.lower().strip(), text)
+    try:
+        agent  = await _get_agent_fn()
+        result = await agent.ainvoke(
+            {"input": instruction},
+            config={"configurable": {
+                "session_id": f"teams_{from_id}_{conversation_id[:20]}"
+            }},
+        )
+        reply = result.get("output", "Sorry, I could not process your request.")
+    except Exception as e:
+        log.exception("Teams agent error: %s", e)
+        reply = f"Sorry, I encountered an error: `{str(e)[:200]}`"
+    await _send_reply(service_url, conversation_id, activity_id, reply)
+
+@router.post("/teams-webhook")
+async def teams_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(status_code=200)
+
+    activity_type   = body.get("type", "")
+    text            = (body.get("text") or "").strip()
+    service_url     = body.get("serviceUrl", "")
+    conversation_id = body.get("conversation", {}).get("id", "")
+    activity_id     = body.get("id", "")
+    from_name       = body.get("from", {}).get("name", "User")
+    from_id         = body.get("from", {}).get("id", "unknown")
+
+    log.info("Teams activity from %s: type=%s", from_name, activity_type)
+
+    if activity_type == "conversationUpdate":
+        members_added = body.get("membersAdded", [])
+        for member in members_added:
+            if member.get("id", "").startswith(_bot_app_id):
+                welcome = (
+                    "Hello! I'm the **Azure Secret Governance Bot**.\n\n"
+                    "Quick commands: `status`, `critical`, `expiring`, `pending`, `help`\n\n"
+                    "You can also ask me anything in natural language."
+                )
+                asyncio.create_task(
+                    _send_reply(service_url, conversation_id, activity_id, welcome)
+                )
+        return Response(status_code=200)
+
+    if activity_type != "message" or not text:
+        return Response(status_code=200)
+
+    clean_text = re.sub(r"<at>.*?</at>", "", text).strip()
+    if not clean_text:
+        return Response(status_code=200)
+
+    log.info("Teams message from %s: %s", from_name, clean_text[:100])
+
+    asyncio.create_task(
+        _process_and_reply(clean_text, from_id, conversation_id, service_url, activity_id)
+    )
+    return Response(status_code=200)
+```

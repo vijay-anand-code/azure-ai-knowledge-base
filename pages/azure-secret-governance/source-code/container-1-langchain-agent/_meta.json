@@ -1,0 +1,4 @@
+{
+  "container1-main": "main.py",
+  "container1-teams-bot": "teams_bot.py"
+}
