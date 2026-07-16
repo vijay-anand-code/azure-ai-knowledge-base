@@ -1,9 +1,10 @@
 {
-  "index": "Home",
-  "azure-multi-agent": "Azure Multi-Agent Foundry",
-  "langchain": "LangChain",
-  "container-apps": "Container Apps",
-  "github-actions": "GitHub Actions",
-  "azure-secret-governance": "Azure Secret Governance",
-  "source-code": "Source Code"
+  "index": "Azure Secret Governance",
+  "infrastructure": "Infrastructure",
+  "sharepoint": "SharePoint",
+  "runbooks": "Runbooks",
+  "github-actions": "GitHub Actions CI/CD",
+  "jira": "Jira Automation",
+  "teams-bot": "Teams Bot",
+  "dashboard": "Dashboard"
 }
