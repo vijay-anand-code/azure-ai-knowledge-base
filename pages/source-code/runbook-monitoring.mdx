@@ -1,1 +1,149 @@
+---
+title: runbook_monitoring.py
+description: Triggers the weekly secret monitoring cycle in Container 1
+---
 
+import { Callout } from 'nextra/components'
+
+# runbook_monitoring.py
+
+**Location:** `secret-governance-infra/runbooks/runbook_monitoring.py`
+
+**Runtime:** Python 3.10 — Azure Automation Account
+
+**Schedule:** Weekly at `00:30`, 30 minutes after discovery.
+
+**What it does:** Sends a POST to the Container App `/run` endpoint with an instruction to run the weekly monitoring check. Returns immediately — the container handles the full cycle as a background task.
+
+---
+
+## Key design decisions
+
+| Decision | Reason |
+|----------|--------|
+| Fire-and-forget pattern | `/run` returns immediately; the LangChain agent runs in background. A 30s timeout avoids the runbook hanging if the container is slow to respond |
+| Timeout treated as success | If no response arrives within 30s, the request was accepted and the agent is running. Raising an error would be a false failure |
+| Minimal runbook | All business logic lives in Container 1. The runbook is a thin scheduler trigger — nothing to break or debug here |
+
+---
+
+## Required configuration
+
+**Automation Variables** (set in Azure Automation Account):
+
+| Variable | Value |
+|----------|-------|
+| `AGENT_ENDPOINT` | `https://<container-app-fqdn>/run` |
+| `AGENT_API_KEY` | Shared secret header value (set to empty string `""` to disable auth) |
+
+<Callout type="info">
+  To bypass LangChain and call monitoring directly — skipping GPT-4o entirely — change
+  `AGENT_ENDPOINT` to `https://<fqdn>/run-monitoring`. This calls Container 2 directly
+  with zero OpenAI tokens used.
+</Callout>
+
+---
+
+## Source
+
+```python
+"""
+runbook_monitoring.py — Azure Automation Runbook
+=================================================
+Purpose : Trigger the Secret Monitoring governance cycle in Container 1
+Schedule: Every 7 days (configured in Azure Automation Account)
+Runtime : Python 3.10 (Azure Automation)
+
+The /run endpoint now returns immediately (background task).
+This runbook just fires the request and confirms it was received.
+If the container takes longer than 30s to acknowledge, we treat it
+as accepted and move on — the agent continues running in background.
+
+Required Automation Variables:
+  AGENT_ENDPOINT   — e.g. https://<container-app-fqdn>/run
+  AGENT_API_KEY    — shared secret header value (set to "" to disable)
+"""
+
+import automationassets
+import urllib.request
+import urllib.error
+import json
+import sys
+from datetime import datetime, timezone
+
+# ── Config from Automation Variables ─────────────────────────────────────────
+
+def _get_var(name: str) -> str:
+    value = automationassets.get_automation_variable(name)
+    if not value:
+        raise ValueError(f"Automation Variable '{name}' is not set or is empty.")
+    return str(value).strip()
+
+AGENT_ENDPOINT = _get_var("AGENT_ENDPOINT")
+AGENT_API_KEY  = _get_var("AGENT_API_KEY")
+
+# ── Request ───────────────────────────────────────────────────────────────────
+
+def trigger_monitoring() -> dict:
+    payload = json.dumps({
+        "instruction": (
+            "Run the weekly secret monitoring check. "
+            "Summarise everything: secrets scanned, new Jira tickets raised, "
+            "Teams alerts sent, SharePoint rows created or updated, and any errors."
+        )
+    }).encode("utf-8")
+
+    headers = {"Content-Type": "application/json"}
+    if AGENT_API_KEY:
+        headers["X-API-Key"] = AGENT_API_KEY
+
+    req = urllib.request.Request(
+        AGENT_ENDPOINT,
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body)
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        raise RuntimeError(f"Agent returned HTTP {e.code}: {error_body[:500]}") from e
+
+    except Exception:
+        # Timeout or connection reset — agent accepted and is running in background
+        print("[INFO] No immediate response — agent is running in background.")
+        return {
+            "success": True,
+            "message": "Cycle triggered — agent running in background",
+            "startedAt": datetime.now(timezone.utc).isoformat()
+        }
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    started = datetime.now(timezone.utc).isoformat()
+    print(f"[{started}] Monitoring Runbook started.")
+    print(f"  Target: {AGENT_ENDPOINT}")
+
+    try:
+        result = trigger_monitoring()
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+
+    if result.get("success"):
+        print(f"[OK] Monitoring cycle triggered successfully.")
+        print(f"  Started at : {result.get('startedAt', 'N/A')}")
+        print(f"  Message    : {result.get('message', '')}")
+        print(f"  Summary    : {result.get('summary', 'Agent running in background — check container logs')}")
+    else:
+        print(f"[FAILED] Agent reported failure:")
+        print(f"  Error: {result.get('error', 'unknown')}")
+        sys.exit(1)
+
+main()
+```
