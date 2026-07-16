@@ -7,5 +7,8 @@
   "jira": "Jira Automation",
   "teams-bot": "Teams Bot",
   "dashboard": "Dashboard",
-  "source-code": "Source Code"
+  "source-code": {
+    "title": "Source Code",
+    "defaultOpen": true
+  }
 }
