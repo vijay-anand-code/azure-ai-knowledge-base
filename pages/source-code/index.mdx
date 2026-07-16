@@ -1,1 +1,26 @@
+---
+title: Source Code
+description: Full annotated source code for all runbooks and container files
+---
 
+# Source Code
+
+Complete source for every file in the secret governance system — runbooks that run in
+Azure Automation and the two container files that power the monitoring API.
+
+---
+
+## Runbooks
+
+| File | Schedule | What it does |
+|------|----------|-------------|
+| [runbook_discovery.py](/source-code/runbook-discovery) | Mon 00:00 | Scans all App Registrations, fetches owners in parallel, batch-writes to SharePoint |
+| [runbook_monitoring.py](/source-code/runbook-monitoring) | Mon 00:30 | Triggers the monitoring container — fire and forget |
+| [runbook_rotation.py](/source-code/runbook-rotation) | Mon 01:00 | Rotates P1/P2/P3 secrets, stores in Key Vault, updates Jira and SharePoint |
+
+## Container 2 — Monitor REST API
+
+| File | What it does |
+|------|-------------|
+| [main.py](/source-code/container2-main) | FastAPI app — all tool implementations and HTTP endpoints |
+| [decision_engine.py](/source-code/container2-decision-engine) | Async orchestrator — classifies secrets, raises tickets, sends alerts |
