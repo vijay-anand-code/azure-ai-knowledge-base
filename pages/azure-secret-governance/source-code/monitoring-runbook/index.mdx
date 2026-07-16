@@ -1,0 +1,16 @@
+---
+title: Monitoring Runbook
+description: Azure Automation Runbook that triggers the weekly monitoring cycle in Container 1
+---
+
+# Monitoring Runbook
+
+**File:** `runbook_monitoring.py`
+**Runtime:** Python 3.10 — Azure Automation Account
+**Schedule:** Weekly Monday 00:30
+
+Triggers the secret monitoring cycle in Container 1 via a POST to the `/run`
+endpoint. Returns immediately — the container processes the full cycle as a
+background task.
+
+- [View source → runbook_monitoring.py](/azure-secret-governance/source-code/monitoring-runbook/runbook-monitoring)
