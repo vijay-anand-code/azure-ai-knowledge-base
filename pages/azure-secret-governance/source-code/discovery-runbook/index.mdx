@@ -1,0 +1,16 @@
+---
+title: Discovery Runbook
+description: Azure Automation Runbook that scans all App Registrations and writes to SharePoint
+---
+
+# Discovery Runbook
+
+**File:** `runbook_discovery.py`
+**Runtime:** Python 3.10 — Azure Automation Account
+**Schedule:** Weekly Monday 00:00
+
+Scans ALL App Registrations from Entra ID, fetches their owners in parallel,
+classifies every secret by severity bucket, and batch-writes rows to the
+SecretAlertRegistry SharePoint list.
+
+- [View source](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery)

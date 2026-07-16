@@ -1,0 +1,13 @@
+---
+title: Container 2 - Monitor REST API
+description: Internal container hosting the FastAPI REST API and decision engine
+---
+
+# Container 2 - Monitor REST API
+
+**Runtime:** Python 3.11 — Azure Container App (port 8001, internal only)
+
+| File | Purpose |
+|------|---------|
+| [main.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-main) | FastAPI app — all tool implementations and HTTP endpoints |
+| [decision_engine.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-decision-engine) | Async orchestrator — classifies secrets, raises tickets, sends alerts |
