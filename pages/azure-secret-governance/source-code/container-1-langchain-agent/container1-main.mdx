@@ -36,6 +36,7 @@ import { Callout } from 'nextra/components'
 | Per-session `InMemoryChatMessageHistory` | Teams bot conversations maintain context across messages in the same session |
 | UAMI for Key Vault auth | No client secrets in environment variables — identity-based authentication only |
 | `max_iterations=30` on AgentExecutor | Prevents infinite loops on complex monitoring cycles with many tool calls |
+| Container 1 does NOT call Graph API | All Graph, SharePoint, Jira, and Teams calls go through Container 2 — Container 1 only orchestrates |
 
 <Callout type="info">
   The Teams bot is enabled by 6 lines in this file. Comment them all out to
@@ -47,18 +48,18 @@ import { Callout } from 'nextra/components'
 
 ## LangChain tools defined
 
-All tools POST to Container 2 `/tools/*` endpoints:
+All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls Graph API directly:
 
-| Tool | Container 2 endpoint |
-|------|---------------------|
-| `run_secret_monitoring` | `/tools/run_secret_monitoring` |
-| `fetch_azure_secrets` | `/tools/fetch_azure_secrets` |
-| `get_sharepoint_state` | `/tools/get_sharepoint_state` |
-| `get_jira_issue` | `/tools/get_jira_issue` |
-| `add_jira_comment` | `/tools/add_jira_comment` |
-| `send_teams_alert` | `/tools/send_teams_alert` |
-| `write_sharepoint_row` | `/tools/write_sharepoint_row` |
-| `create_jira_ticket` | `/tools/create_jira_ticket` |
+| Tool | Container 2 endpoint | Purpose |
+|------|---------------------|---------|
+| `run_secret_monitoring` | `/tools/run_secret_monitoring` | Full monitoring cycle |
+| `fetch_azure_secrets` | `/tools/fetch_azure_secrets` | List all App Registrations |
+| `get_sharepoint_state` | `/tools/get_sharepoint_state` | Read SecretAlertRegistry |
+| `get_jira_issue` | `/tools/get_jira_issue` | Get Jira ticket status |
+| `add_jira_comment` | `/tools/add_jira_comment` | Post comment to Jira |
+| `send_teams_alert` | `/tools/send_teams_alert` | Send Teams Adaptive Card |
+| `write_sharepoint_row` | `/tools/write_sharepoint_row` | Create or update SP row |
+| `create_jira_ticket` | `/tools/create_jira_ticket` | Raise new Jira incident |
 
 ---
 
@@ -81,6 +82,12 @@ All tools POST to Container 2 `/tools/*` endpoints:
 | `BOT-APP-SECRET` | Teams Bot client secret |
 | `BOT-TENANT-ID` | Azure tenant ID for Bot Framework token |
 
+<Callout type="info">
+  Container 1 only needs Key Vault access for OpenAI and Teams Bot credentials.
+  All Graph API, SharePoint, and Jira credentials are loaded by Container 2.
+  The UAMI only needs `Key Vault Secrets User` role — no Graph permissions needed here.
+</Callout>
+
 ---
 
 ## Source
@@ -95,6 +102,9 @@ Endpoints:
   POST /chat            — conversational endpoint with per-session memory
   POST /jira-webhook    — Jira automation trigger when ticket is resolved
   POST /teams-webhook   — Microsoft Teams Bot Service messages
+
+Note: Container 1 does NOT call Graph API directly.
+      All Azure/SharePoint/Jira calls go through Container 2 tools.
 """
 
 from __future__ import annotations
@@ -147,6 +157,7 @@ log.info("Azure OpenAI config loaded. Deployment: %s", AOAI_DEPLOYMENT)
 # ── HTTP Client — talks to Container 2 ───────────────────────────────────────
 
 async def _call_monitor(endpoint: str, payload: dict | None = None) -> dict:
+    """POST to a Container 2 /tools/* endpoint and return the JSON response."""
     url = f"{MONITOR_API_URL}/tools/{endpoint}"
     async with httpx.AsyncClient(timeout=1800) as c:
         r = await c.post(url, json=payload or {})
@@ -287,11 +298,13 @@ async def _get_agent() -> RunnableWithMessageHistory:
 async def run_governance_cycle(instruction: str = DEFAULT_INSTRUCTION) -> dict:
     agent   = await _get_agent()
     started = datetime.now(timezone.utc)
+    log.info("Governance cycle started at %s", started.isoformat())
     try:
         result = await agent.ainvoke(
             {"input": instruction},
             config={"configurable": {"session_id": "runbook_trigger"}},
         )
+        log.info("Governance cycle completed successfully")
         return {"success": True, "startedAt": started.isoformat(), "summary": result.get("output", "")}
     except Exception as e:
         log.exception("Governance cycle failed")
@@ -308,7 +321,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Azure Secret Governance Agent", lifespan=lifespan)
 
-# ── Teams Bot — comment out to disable ───────────────────────────────────────
+# ── Teams Bot — comment out all 6 lines below to disable ─────────────────────
 from teams_bot import router as teams_router
 import teams_bot
 teams_bot.configure(
@@ -333,6 +346,10 @@ async def health():
 
 @app.post("/run")
 async def run(req: RunRequest):
+    """
+    Fires the monitoring cycle as a background task and returns immediately.
+    Prevents 504/timeout errors on the runbook side.
+    """
     instruction = req.instruction or DEFAULT_INSTRUCTION
     asyncio.create_task(run_governance_cycle(instruction))
     return {"success": True, "message": "Monitoring cycle started in background",
@@ -340,6 +357,7 @@ async def run(req: RunRequest):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    """Conversational endpoint with per-session memory."""
     agent = await _get_agent()
     try:
         result = await agent.ainvoke(
@@ -352,15 +370,28 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 async def _update_sharepoint_on_close(jira_key: str):
+    """
+    Directly updates SharePoint when a Jira ticket closes.
+    No AI/LangChain needed — direct Container 2 API call.
+    Fast, reliable, zero rate limit risk.
+    """
     try:
         today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        result = await _call_monitor("update_on_jira_close", {"jira_key": jira_key, "today": today})
-        log.info("SharePoint updated for %s: %s rows marked Rotated", jira_key, result.get("updated", 0))
+        result = await _call_monitor("update_on_jira_close", {
+            "jira_key": jira_key,
+            "today":    today,
+        })
+        log.info("SharePoint updated for %s: %s rows marked Rotated",
+                 jira_key, result.get("updated", 0))
     except Exception as e:
         log.exception("Failed to update SharePoint for %s: %s", jira_key, e)
 
 @app.post("/jira-webhook")
 async def jira_webhook(request: Request):
+    """
+    Receives Jira automation webhooks when a ticket is resolved/closed.
+    Directly updates SharePoint — NO AI/LangChain — fast and reliable.
+    """
     try:
         payload = await request.json()
     except Exception:
