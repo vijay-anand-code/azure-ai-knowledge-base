@@ -1,6 +1,6 @@
 ---
 title: Infrastructure Setup
-description: Provision all Azure resources and configure UAMI permissions for secret governance
+description: Provision all Azure resources and configure permissions for secret governance
 ---
 
 import { Callout, Steps, FileTree, Tabs, Tab } from 'nextra/components'
@@ -23,7 +23,7 @@ Container Registry, Container App Environment, and Automation Account.
 | Resource | What it does |
 |----------|-------------|
 | **Resource Group** | Container for all project resources |
-| **User-Assigned Managed Identity (UAMI)** | The system's identity — authenticates to Graph API, Key Vault, and ACR with no passwords |
+| **User-Assigned Managed Identity (UAMI)** | The system's identity — authenticates to Key Vault and ACR with no passwords |
 | **Key Vault — config** | Stores Jira, Teams, SharePoint, and OpenAI credentials |
 | **Key Vault — rotation** | Stores newly generated secret values after rotation |
 | **Azure Container Registry** | Stores the Docker images for Container 1 and Container 2 |
@@ -76,7 +76,6 @@ az login
       <FileTree.File name="runbook_discovery.py" />
       <FileTree.File name="runbook_monitoring.py" />
       <FileTree.File name="runbook_rotation.py" />
-      <FileTree.File name="runbook_owner_sync.py" />
       <FileTree.File name="runbook_cleanup_sharepoint.py" />
     </FileTree.Folder>
   </FileTree.Folder>
@@ -133,81 +132,120 @@ az deployment sub create \
   --parameters '@foundation.parameters.json'
 ```
 
-### Grant UAMI Microsoft Graph permissions
+### Create App Registration for cross-tenant access
 
-The UAMI needs exactly two Graph API permissions. No more — these two cover everything
-the system needs to discover, monitor, and rotate secrets.
+The system uses a federated credential App Registration instead of granting permissions
+directly to the UAMI. This enables cross-tenant access without storing any client secrets.
+
+```bash
+# Create the App Registration
+az ad app create --display-name "azure-secretgovernance-cross-tenant"
+# Copy the "appId" from the output — this is your CROSS_TENANT_APP_ID
+```
+
+### Add federated credential to App Registration
+
+This tells Azure: "Trust the UAMI to assert its identity to this App Registration."
+
+```bash
+APP_ID="<APP_ID_FROM_PREVIOUS_STEP>"
+UAMI_OBJECT_ID="<UAMI_OBJECT_ID>"
+
+cat > /tmp/fed.json << 'EOF'
+{
+  "name": "ForCrossTenant",
+  "issuer": "https://login.microsoftonline.com/<YOUR_TENANT_ID>/v2.0",
+  "subject": "<UAMI_OBJECT_ID>",
+  "audiences": ["api://AzureADTokenExchange"]
+}
+EOF
+
+az ad app federated-credential create \
+  --id $APP_ID \
+  --parameters "@/tmp/fed.json"
+```
+
+<Callout type="info">
+  The `subject` field must be the **object ID** of the UAMI — not the client ID.
+  Get it from: Azure Portal → Managed Identities → your UAMI → Overview → Object (principal) ID
+</Callout>
+
+### Grant App Registration Microsoft Graph permissions
 
 ```powershell
 Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
 
-$uamiSpId   = "<UAMI_SERVICE_PRINCIPAL_OBJECT_ID>"
-$graphAppId  = "00000003-0000-0000-c000-000000000000"
-$graphSp     = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
+$appId      = "<CROSS_TENANT_APP_ID>"
+$appSp      = Get-MgServicePrincipal -Filter "appId eq '$appId'"
+$appSpId    = $appSp.Id
+$graphAppId = "00000003-0000-0000-c000-000000000000"
+$graphSp    = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
 
 # Grant Application.ReadWrite.OwnedBy
 $role1 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.ReadWrite.OwnedBy" }
 New-MgServicePrincipalAppRoleAssignment `
-    -ServicePrincipalId $uamiSpId `
-    -PrincipalId        $uamiSpId `
+    -ServicePrincipalId $appSpId `
+    -PrincipalId        $appSpId `
     -ResourceId         $graphSp.Id `
     -AppRoleId          $role1.Id
 
 # Grant Sites.Selected
-$role2 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.ReadWrite.All" }
+$role2 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.Selected" }
 New-MgServicePrincipalAppRoleAssignment `
-    -ServicePrincipalId $uamiSpId `
-    -PrincipalId        $uamiSpId `
+    -ServicePrincipalId $appSpId `
+    -PrincipalId        $appSpId `
     -ResourceId         $graphSp.Id `
     -AppRoleId          $role2.Id
 
-Write-Host "✓ Permissions granted"
+Write-Host "Permissions granted"
 ```
 
 <Callout type="warning">
-  Grant admin consent after adding permissions — go to **Azure Portal → App Registrations
-  → your UAMI app → API Permissions → Grant admin consent**.
+  Grant admin consent after adding permissions:
+  **Azure Portal → Enterprise Applications → azure-secretgovernance-cross-tenant → Permissions → Grant admin consent**
 </Callout>
 
-### Add UAMI as owner on App Registrations
+### Add App Registration as owner on App Registrations
 
-The UAMI must be listed as an owner on each App Registration it should manage.
-This is a one-time setup per app — do it via PowerShell since the Azure Portal
-owner picker only shows users, not managed identities.
+The App Registration must be listed as an owner on each App Registration it should manage.
+This is required for `addPassword` to work during rotation.
 
 ```powershell
-# Resolve UAMI service principal object ID
-$uamiClientId = "<UAMI_CLIENT_ID>"
-$uamiSp = Get-MgServicePrincipal -Filter "appId eq '$uamiClientId'"
-$uamiObjectId = $uamiSp.Id
+Connect-MgGraph -Scopes "Application.ReadWrite.All"
 
-# Add UAMI as owner on a specific app
-$appObjectId = "<APP_REGISTRATION_OBJECT_ID>"
-New-MgApplicationOwnerByRef -ApplicationId $appObjectId -BodyParameter @{
-    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$uamiObjectId"
+# Get App Registration service principal object ID
+$appRegClientId = "<CROSS_TENANT_APP_ID>"
+$appRegSp       = Get-MgServicePrincipal -Filter "appId eq '$appRegClientId'"
+$appRegSpId     = $appRegSp.Id
+
+# Add as owner on a specific App Registration
+$targetAppObjectId = "<TARGET_APP_REGISTRATION_OBJECT_ID>"
+New-MgApplicationOwnerByRef -ApplicationId $targetAppObjectId -BodyParameter @{
+    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$appRegSpId"
 }
 ```
 
-For initial bulk setup across all existing App Registrations, use the
-`runbook_bulk_add_uami_owner.py` runbook — it handles all apps in parallel
-and skips apps where UAMI is already an owner.
-
 <Callout type="info">
   **Why OwnedBy instead of ReadWrite.All?**
-  `Application.ReadWrite.OwnedBy` allows the UAMI to read ALL app registrations
-  (reads are unrestricted) but write operations — creating new secrets during rotation —
-  are limited to apps where UAMI is listed as an owner. This is least-privilege:
-  the system cannot accidentally modify apps it doesn't manage.
+  `Application.ReadWrite.OwnedBy` allows reading ALL App Registrations but write
+  operations — creating new secrets during rotation — are limited to apps where the
+  App Registration is listed as an owner. This is least-privilege by design.
 </Callout>
 
-### Grant UAMI SharePoint site access
+### Grant App Registration SharePoint site access
 
-`Sites.Selected` restricts the UAMI to only your specific SharePoint site.
-Grant it via Graph Explorer since there is no Azure CLI command for it.
+`Sites.Selected` restricts access to only your specific SharePoint site.
+Grant it via Graph Explorer — there is no Azure CLI command for this.
 
-1. Go to [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
-2. Sign in with your admin account
-3. Run this POST:
+- Go to [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
+- Sign in with your admin account
+- Get your site ID first:
+
+```
+GET https://graph.microsoft.com/v1.0/sites/<tenant>.sharepoint.com:/sites/<site-name>
+```
+
+Copy the `id` field from the response (3-part format), then run:
 
 ```
 POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
@@ -218,8 +256,8 @@ POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
   "roles": ["write"],
   "grantedToIdentities": [{
     "application": {
-      "id": "<UAMI_CLIENT_ID>",
-      "displayName": "uami-secret-monitor"
+      "id": "<CROSS_TENANT_APP_ID>",
+      "displayName": "azure-secretgovernance-cross-tenant"
     }
   }]
 }
@@ -232,6 +270,30 @@ az deployment group create \
   --resource-group <YOUR_RG> \
   --template-file keyvault-secrets.bicep \
   --parameters '@keyvault-secrets.parameters.json'
+```
+
+Or set secrets manually via CLI:
+
+```bash
+KV="<YOUR_KV_NAME>"
+
+az keyvault secret set --vault-name $KV --name "GRAPH-TENANT-ID"       --value "<tenant-id>"
+az keyvault secret set --vault-name $KV --name "GRAPH-TENANT-NAME"     --value "<tenant.onmicrosoft.com>"
+az keyvault secret set --vault-name $KV --name "SHAREPOINT-SITE-ID"    --value "<site-composite-id>"
+az keyvault secret set --vault-name $KV --name "SHAREPOINT-LIST-ID"    --value "<list-id>"
+az keyvault secret set --vault-name $KV --name "CROSS-TENANT-APP-ID"   --value "<app-registration-client-id>"
+az keyvault secret set --vault-name $KV --name "CROSS-TENANT-TENANT-ID" --value "<tenant-id>"
+az keyvault secret set --vault-name $KV --name "JIRA-BASE-URL"         --value "https://yourcompany.atlassian.net"
+az keyvault secret set --vault-name $KV --name "JIRA-API-TOKEN"        --value "<token>"
+az keyvault secret set --vault-name $KV --name "JIRA-USER-EMAIL"       --value "<email>"
+az keyvault secret set --vault-name $KV --name "JIRA-PROJECT-KEY"      --value "KAN"
+az keyvault secret set --vault-name $KV --name "JIRA-EPIC-KEY"         --value "KAN-161"
+az keyvault secret set --vault-name $KV --name "JIRA-ISSUE-TYPE"       --value "Incident"
+az keyvault secret set --vault-name $KV --name "TEAMS-WEBHOOK-URL"     --value "<webhook-url>"
+az keyvault secret set --vault-name $KV --name "OWNER-EMAIL"           --value "azure-secretgovernance-cross-tenant"
+az keyvault secret set --vault-name $KV --name "AZURE-OPENAI-ENDPOINT" --value "<endpoint>"
+az keyvault secret set --vault-name $KV --name "AZURE-OPENAI-API-KEY"  --value "<key>"
+az keyvault secret set --vault-name $KV --name "AZURE-OPENAI-DEPLOYMENT-NAME" --value "<deployment>"
 ```
 
 ### Build and deploy the Container App
@@ -256,34 +318,32 @@ az deployment group create \
 
 ---
 
-## UAMI permissions reference
+## Permission model
 
-The system uses exactly two Microsoft Graph permissions. This is intentional — no broader
-permissions are needed.
+The system uses a federated credential App Registration for all Graph API access.
+The UAMI is only used to assert identity — no direct Graph permissions on UAMI.
 
-| Permission | Type | Purpose |
-|-----------|------|---------|
-| `Application.ReadWrite.OwnedBy` | Application | Read all App Registrations (reads are unrestricted). Write — create new secrets — only on apps where UAMI is listed as owner |
-| `Sites.Selected` | Application | Read/write the SecretAlertRegistry SharePoint list only — not all sites in the tenant |
-| `Key Vault Secrets User` | RBAC role | Read config secrets from Key Vault |
-| `Key Vault Secrets Officer` | RBAC role | Write new secret values to rotation Key Vault |
-| `AcrPull` | RBAC role | Pull container images from Azure Container Registry |
+| Permission | Granted to | Purpose |
+|-----------|------------|---------|
+| `Application.ReadWrite.OwnedBy` | App Registration | Read all App Registrations. Write secrets only on owned apps |
+| `Sites.Selected` | App Registration | Read/write SecretAlertRegistry SharePoint list only |
+| `Key Vault Secrets User` | UAMI | Read config secrets from Key Vault |
+| `Key Vault Secrets Officer` | UAMI | Write new secret values to rotation Key Vault |
+| `AcrPull` | UAMI | Pull container images from Azure Container Registry |
 
 <Callout type="warning">
-  **Do not grant `Application.Read.All`, `Application.ReadWrite.All`, or `Sites.ReadWrite.All`.**
-  These are broader than needed. `Application.ReadWrite.OwnedBy` covers everything the system
-  requires — read all apps, write only owned apps.
+  **Do not grant `Application.ReadWrite.All` or `Sites.ReadWrite.All`.**
+  These are broader than needed. `Application.ReadWrite.OwnedBy` covers everything —
+  read all apps, write only owned apps.
 </Callout>
 
 ---
 
 ## Runbook schedule
 
-All three runbooks run on a weekly schedule in this exact order:
-
 | Time | Runbook | What it does |
 |------|---------|-------------|
-| `00:00` | `runbook_discovery.py` | Scans all 255 apps, stamps `AppOwners` to SharePoint |
+| `00:00` | `runbook_discovery.py` | Scans all apps, stamps `AppOwners` to SharePoint |
 | `00:30` | `runbook_monitoring.py` | Triggers monitoring container — raises Jira tickets and Teams alerts |
 | `01:00` | `runbook_rotation.py` | Rotates P1/P2/P3 secrets, stores new values in Key Vault |
 
@@ -302,6 +362,8 @@ All three runbooks run on a weekly schedule in this exact order:
 | `GRAPH-TENANT-NAME` | `contoso.onmicrosoft.com` | Monitoring container |
 | `SHAREPOINT-SITE-ID` | `contoso.sharepoint.com,abc...,def...` | All runbooks |
 | `SHAREPOINT-LIST-ID` | `25b457eb-cf85-4c11-b712-cfa882898c6b` | All runbooks |
+| `CROSS-TENANT-APP-ID` | `acc82978-f200-496f-9fe1-fd818dd9fd7d` | All runbooks |
+| `CROSS-TENANT-TENANT-ID` | `70afdd80-5f5b-4a09-a90d-383f126e8c33` | All runbooks |
 | `JIRA-BASE-URL` | `https://contoso.atlassian.net` | Monitoring + rotation |
 | `JIRA-API-TOKEN` | `ATATT3x...` | Monitoring + rotation |
 | `JIRA-USER-EMAIL` | `admin@contoso.com` | Monitoring + rotation |
@@ -309,10 +371,14 @@ All three runbooks run on a weekly schedule in this exact order:
 | `JIRA-EPIC-KEY` | `KAN-161` | Monitoring |
 | `JIRA-ISSUE-TYPE` | `Incident` | Monitoring |
 | `TEAMS-WEBHOOK-URL` | `https://...webhook.office.com/...` | Monitoring |
-| `OWNER-EMAIL` | `uami-secret-monitor` | Monitoring + rotation |
+| `OWNER-EMAIL` | `azure-secretgovernance-cross-tenant` | Monitoring + rotation |
+| `AZURE-OPENAI-ENDPOINT` | `https://...openai.azure.com` | Container 1 |
+| `AZURE-OPENAI-API-KEY` | `sk-...` | Container 1 |
+| `AZURE-OPENAI-DEPLOYMENT-NAME` | `gpt-4o` | Container 1 |
 
 <Callout type="warning">
-  `OWNER-EMAIL` should be set to the **display name** of your UAMI (e.g. `uami-secret-monitor`).
-  The monitoring and rotation runbooks use this to filter SharePoint rows — only rows where
-  `AppOwners` contains this value are actioned.
+  `OWNER-EMAIL` must be set to the **display name** of your App Registration
+  (e.g. `azure-secretgovernance-cross-tenant`). The monitoring and rotation runbooks
+  use this to filter SharePoint rows — only rows where `AppOwners` contains this value
+  are actioned.
 </Callout>
