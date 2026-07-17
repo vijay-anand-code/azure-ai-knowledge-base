@@ -1,18 +1,8 @@
 {
   "index": "Overview",
-  "discovery-runbook": {
-    "title": "Discovery Runbook"
-  },
-  "monitoring-runbook": {
-    "title": "Monitoring Runbook"
-  },
-  "rotation-runbook": {
-    "title": "Rotation Runbook"
-  },
-  "container-1-langchain-agent": {
-    "title": "Container 1 - LangChain Agent"
-  },
-  "container-2-monitor-api": {
-    "title": "Container 2 - Monitor API"
-  }
+  "discovery-runbook": "Discovery Runbook",
+  "monitoring-runbook": "Monitoring Runbook",
+  "rotation-runbook": "Rotation Runbook",
+  "container-1-langchain-agent": "Container 1 - LangChain Agent",
+  "container-2-monitor-api": "Container 2 - Monitor API"
 }
