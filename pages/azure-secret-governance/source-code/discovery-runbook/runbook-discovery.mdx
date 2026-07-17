@@ -53,6 +53,7 @@ import { Callout } from 'nextra/components'
 
 ```python
 """
+"""
 runbook_discovery.py — Azure Automation Runbook (v3 — All Secrets + Owners)
 ========================================================================
 Changes vs v2:
@@ -88,6 +89,16 @@ Purpose : Scans ALL App Registrations from Entra ID, fetches owners in
 Schedule: Weekly — 30 minutes before monitoring runbook.
           Also run manually when new App Registrations are added.
 
+What it does:
+  1. Fetches ALL App Registrations + secrets from Entra ID
+  2. For each app — fetches owners in parallel (ThreadPoolExecutor)
+  3. Classifies each secret into P1/P2/P3/P4/EMR/Ignore bucket
+  4. Batch-writes ALL rows to SecretAlertRegistry (up to 20 per $batch call):
+       - New secret  → creates row with AlertStatus = Discovered
+       - Existing row → updates AppOwners + SeverityLevel + ExpirationDate
+       - Ignore bucket (expired 8+ days) → skipped, no row written
+  5. Apps with no Entra owner → AppOwners left blank (admin fills manually)
+
 Required Automation Variables:
   ROTATOR_KV_URL  — Key Vault URL
   UAMI_CLIENT_ID  — User-assigned Managed Identity client ID
@@ -112,7 +123,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import automationassets
-from azure.identity import ManagedIdentityCredential
+from azure.identity import ManagedIdentityCredential, ClientAssertionCredential
 from azure.keyvault.secrets import SecretClient
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -141,6 +152,9 @@ def _get_var(name: str) -> str:
 ROTATOR_KV_URL = _get_var("ROTATOR_KV_URL")
 UAMI_CLIENT_ID = _get_var("UAMI_CLIENT_ID")
 
+print(f"[DEBUG] ROTATOR_KV_URL : {ROTATOR_KV_URL}")
+print(f"[DEBUG] UAMI_CLIENT_ID : {UAMI_CLIENT_ID[:8]}...")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AZURE CLIENTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,6 +180,7 @@ log.info("Config secrets loaded.")
 
 def _http(method: str, url: str, headers: dict,
           body: dict | None = None, timeout: int = 30) -> dict:
+    """Single HTTP call — no retry. Use _http_with_retry for SP writes."""
     data = json.dumps(body).encode("utf-8") if body else None
     req  = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -178,6 +193,7 @@ def _http(method: str, url: str, headers: dict,
 
 def _http_with_retry(method: str, url: str, headers: dict,
                      body: dict | None = None, timeout: int = 30) -> dict:
+    """HTTP call with exponential-backoff retry for transient failures."""
     last_exc: Exception | None = None
     for attempt in range(1, RETRY_MAX + 1):
         try:
@@ -201,10 +217,23 @@ def _patch_retry(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
     return _http_with_retry("PATCH", url, {**hdrs, "Content-Type": "application/json"}, body, timeout)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAPH TOKEN — UAMI (no client secret needed)
+# GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
+CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+
+_uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _get_uami_assertion() -> str:
+    token = _uami_credential.get_token("api://AzureADTokenExchange")
+    return token.token
+
+_graph_credential = ClientAssertionCredential(
+    tenant_id = CROSS_TENANT_TENANT_ID,
+    client_id = CROSS_TENANT_APP_ID,
+    func      = _get_uami_assertion,
+)
 
 def _graph_token() -> str:
     token = _graph_credential.get_token("https://graph.microsoft.com/.default")
@@ -214,18 +243,23 @@ def _auth_hdrs() -> dict:
     return {"Authorization": f"Bearer {_graph_token()}"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BUCKET CLASSIFICATION
+# BUCKET CLASSIFICATION — mirrors decision_engine.py exactly
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _classify_bucket(days: int) -> str:
-    if days > 60:    return "P4"
-    if days >= 31:   return "P3"
-    if days >= 8:    return "P2"
-    if days >= 0:    return "P1"
-    if days >= -7:   return "ExpiredManualReview"
-    return "Ignore"
+    """
+    Classify a secret into an expiry bucket based on days remaining.
+    All buckets including P4 are now written to SharePoint.
+    """
+    if days > 60:    return "P4"                  # safe — 61+ days
+    if days >= 31:   return "P3"                  # info — 31-60 days
+    if days >= 8:    return "P2"                  # warning — 8-30 days
+    if days >= 0:    return "P1"                  # critical — 0-7 days
+    if days >= -7:   return "ExpiredManualReview" # expired 1-7 days ago
+    return "Ignore"                               # expired 8+ days ago — skip
 
 def _expiry_notice(days: int, bucket: str) -> str:
+    """Human-readable expiry notice for SharePoint ExpiryNotice column."""
     if bucket == "Ignore":
         return f"Expired {abs(days)} days ago — ignored"
     if bucket == "ExpiredManualReview":
@@ -237,59 +271,107 @@ def _expiry_notice(days: int, bucket: str) -> str:
     return f"Secret Expiring in {days} days"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Fetch ALL App Registrations
+# STEP 1 — Fetch ALL App Registrations from Entra ID
+#          All secrets included — no P4 filtering at any level.
+#          Discovery writes everything; monitoring/rotation decide what to act on.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_all_applications() -> list[dict]:
+    """
+    Fetches ALL App Registrations from Entra ID including all secrets.
+    No filtering — discovery writes every secret to SharePoint so
+    monitoring and rotation have the full picture with owners stamped.
+    """
     url = (
         "https://graph.microsoft.com/v1.0/applications"
         "?$select=id,appId,displayName,passwordCredentials"
         "&$top=999"
     )
+
     apps: list[dict] = []
     while url:
         b = _get(url, _auth_hdrs(), timeout=30)
         apps.extend(b.get("value", []))
         url = b.get("@odata.nextLink")
+
     log.info("Fetched %d App Registrations from Entra ID", len(apps))
     return apps
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Fetch owners (parallel)
+# STEP 2 — Fetch owners for one App Registration (called in parallel)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_app_owners(object_id: str) -> str:
+    """
+    Fetches owners of an App Registration using its object ID.
+    Returns a comma-separated string of owner emails/names.
+
+    Owner types handled:
+      User              → stored as UPN (email): vijay@contoso.com
+      Service Principal → stored as displayName: automation-pipeline
+      Managed Identity  → stored as displayName: my-uami-name
+                          (@odata.type = #microsoft.graph.servicePrincipal
+                           with servicePrincipalType = ManagedIdentity)
+      No owners         → returns empty string (admin fills manually)
+
+    Fixes:
+      - servicePrincipal check is now case-insensitive (.lower())
+      - Fallback: if @odata.type is missing, uses displayName directly
+        (Graph sometimes omits @odata.type for Managed Identity owners)
+    """
     url = f"https://graph.microsoft.com/v1.0/applications/{object_id}/owners"
     try:
         b      = _get(url, _auth_hdrs(), timeout=15)
         owners = b.get("value", [])
+
         owner_list = []
         for owner in owners:
             odata_type = owner.get("@odata.type", "").lower()
+
             if "user" in odata_type:
+                # User owner — store UPN (email)
                 upn = (owner.get("userPrincipalName")
                        or owner.get("mail")
                        or owner.get("displayName", ""))
                 if upn:
                     owner_list.append(upn)
+
             elif "serviceprincipal" in odata_type:
+                # Service Principal or Managed Identity — store displayName
                 name = owner.get("displayName", "")
                 if name:
                     owner_list.append(name)
+
             else:
-                # Fallback — @odata.type missing (Graph omits it for Managed Identity owners)
+                # Fallback — @odata.type missing or unrecognised
+                # Graph sometimes omits @odata.type for Managed Identity owners
+                # Use displayName if available — better than silently skipping
                 name = owner.get("displayName", "")
                 upn  = owner.get("userPrincipalName", "")
                 if upn:
                     owner_list.append(upn)
                 elif name:
                     owner_list.append(name)
+
         return ", ".join(owner_list)
+
     except Exception as e:
         log.warning("fetch_app_owners failed for object_id %s: %s", object_id, e)
         return ""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 (parallel) — Fetch owners for ALL apps concurrently
+# ─────────────────────────────────────────────────────────────────────────────
+
 def fetch_all_owners_parallel(applications: list[dict]) -> dict[str, str]:
+    """
+    Fetches owners for all apps in parallel using a thread pool.
+    Returns a dict mapping object_id → owners_string.
+
+    Uses ThreadPoolExecutor because Azure Automation runbooks are
+    synchronous Python — asyncio is not available here.
+    OWNER_FETCH_WORKERS controls concurrency (default: 20 threads).
+    """
     results: dict[str, str] = {}
 
     def _fetch(app: dict) -> tuple[str, str]:
@@ -311,7 +393,8 @@ def fetch_all_owners_parallel(applications: list[dict]) -> dict[str, str]:
                 results[object_id] = owners
             except Exception as e:
                 app = futures[future]
-                log.warning("Owner fetch failed for %s: %s", app.get("displayName", "?"), e)
+                log.warning("Owner fetch failed for %s: %s",
+                            app.get("displayName", "?"), e)
                 results[app.get("id", "")] = ""
 
     elapsed = time.time() - t0
@@ -319,10 +402,15 @@ def fetch_all_owners_parallel(applications: list[dict]) -> dict[str, str]:
     return results
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Read existing SharePoint rows
+# STEP 3 — Read existing SecretAlertRegistry rows
+#          Build a lookup: (appId, secretId) → SharePoint item ID
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_existing_sp_rows() -> dict[tuple[str, str], str]:
+    """
+    Returns a dict mapping (appId, secretId) → SharePoint item ID.
+    Used to avoid creating duplicate rows on subsequent discovery runs.
+    """
     url = (
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
         f"/lists/{SHAREPOINT_LIST_ID}/items"
@@ -339,16 +427,27 @@ def get_existing_sp_rows() -> dict[tuple[str, str], str]:
             if app_id and secret_id and item_id:
                 existing[(app_id, secret_id)] = item_id
         url = b.get("@odata.nextLink")
+
     log.info("Found %d existing rows in SecretAlertRegistry", len(existing))
     return existing
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — Graph $batch writer
+#          Bundles up to SP_BATCH_SIZE (20) SharePoint writes per HTTP call.
+#          Graph $batch spec: https://learn.microsoft.com/graph/json-batching
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _execute_sp_batch(requests: list[dict]) -> list[dict]:
+    """
+    Sends a single Graph $batch request containing up to 20 SP operations.
+    Each request dict has: id, method, url, body (optional).
+    Returns list of response dicts from Graph batch response.
+    """
     batch_body = {"requests": requests}
-    hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
+    hdrs = {
+        **_auth_hdrs(),
+        "Content-Type": "application/json",
+    }
     resp = _post_retry(
         "https://graph.microsoft.com/v1.0/$batch",
         hdrs,
@@ -359,13 +458,27 @@ def _execute_sp_batch(requests: list[dict]) -> list[dict]:
 
 
 def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
+    """
+    Executes all SharePoint write operations (create/update) using Graph $batch.
+
+    write_ops: list of dicts with keys:
+      - item_id    : str | None  (None → POST new row, str → PATCH existing)
+      - fields     : dict        (SharePoint column values)
+      - label      : str         (for error messages — "AppName/SecretDesc")
+
+    Returns: (created_count, updated_count, errors)
+    """
+    # Graph $batch: individual URLs are relative paths WITHOUT /v1.0.
+    # The batch endpoint (POST /v1.0/$batch) adds the version prefix itself.
+    # Including /v1.0 here causes HTTP 400: "Resource not found for segment v1.0"
     base_url = (
         f"/sites/{SHAREPOINT_SITE_ID}"
         f"/lists/{SHAREPOINT_LIST_ID}/items"
     )
 
+    # Build batch request objects
     batch_requests: list[dict] = []
-    op_map: dict[str, dict] = {}
+    op_map: dict[str, dict] = {}   # request id → original write_op
 
     for i, op in enumerate(write_ops):
         req_id  = str(i)
@@ -373,6 +486,7 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
         fields  = op.get("fields", {})
 
         if item_id is None:
+            # POST — create new row
             batch_req = {
                 "id":      req_id,
                 "method":  "POST",
@@ -381,6 +495,7 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
                 "body":    {"fields": fields},
             }
         else:
+            # PATCH — update existing row
             batch_req = {
                 "id":      req_id,
                 "method":  "PATCH",
@@ -392,6 +507,7 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
         batch_requests.append(batch_req)
         op_map[req_id] = op
 
+    # Execute in chunks of SP_BATCH_SIZE (Graph limit = 20 per $batch)
     created = 0
     updated = 0
     errors: list[str] = []
@@ -402,6 +518,7 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
         try:
             responses = _execute_sp_batch(chunk)
         except Exception as e:
+            # Entire batch chunk failed — mark all ops in chunk as errors
             for req in chunk:
                 label = op_map[req["id"]].get("label", req["id"])
                 errors.append(f"Batch chunk failed for {label}: {e}")
@@ -409,6 +526,7 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
                 time.sleep(SP_BATCH_PAUSE)
             continue
 
+        # Collect 404 PATCHes to retry as POSTs — stale item_id in get_existing_sp_rows
         retry_as_post: list[dict] = []
 
         for resp in responses:
@@ -423,15 +541,21 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
                 else:
                     updated += 1
             elif status == 404 and op.get("item_id") is not None:
-                log.warning("404 on PATCH for %s — retrying as POST", label)
+                # PATCH hit a stale/ghost item_id — retry as POST to create fresh row
+                log.warning("404 on PATCH for %s — item_id %s not found, retrying as POST",
+                            label, op.get("item_id"))
                 retry_as_post.append(op)
             else:
                 body_preview = str(resp.get("body", ""))[:200]
-                errors.append(f"SP write failed [{status}] for {label}: {body_preview}")
+                errors.append(
+                    f"SP write failed [{status}] for {label}: {body_preview}"
+                )
 
+        # Retry 404 PATCHes as POSTs (individually to keep it simple)
         for op in retry_as_post:
             label  = op.get("label", "?")
             fields = op.get("fields", {})
+            # Ensure AlertStatus is set for new row creation
             if "AlertStatus" not in fields:
                 fields["AlertStatus"] = "Discovered"
             retry_req = [{
@@ -446,12 +570,14 @@ def batch_write_sp_rows(write_ops: list[dict]) -> tuple[int, int, list[str]]:
                 r_status = retry_responses[0].get("status", 0) if retry_responses else 0
                 if r_status in (200, 201, 204):
                     created += 1
+                    log.info("Retry POST succeeded for %s", label)
                 else:
                     body_preview = str(retry_responses[0].get("body", ""))[:200] if retry_responses else ""
                     errors.append(f"Retry POST failed [{r_status}] for {label}: {body_preview}")
             except Exception as e:
                 errors.append(f"Retry POST exception for {label}: {e}")
 
+        # Pause between chunks to stay within Graph throttle limits
         if chunk_start + SP_BATCH_SIZE < len(batch_requests):
             time.sleep(SP_BATCH_PAUSE)
 
@@ -471,11 +597,12 @@ def run_discovery() -> dict:
         "secretsFound": 0,
         "rowsCreated":  0,
         "rowsUpdated":  0,
-        "rowsIgnored":  0,
+        "rowsIgnored":  0,       # Ignore bucket — expired 8+ days ago
         "byBucket":     {b: 0 for b in ["P1","P2","P3","P4","ExpiredManualReview","Ignore"]},
         "errors":       [],
     }
 
+    # ── Step 1: Fetch ALL App Registrations (no filtering) ───────────────────
     try:
         applications = fetch_all_applications()
         summary["appsScanned"] = len(applications)
@@ -484,21 +611,24 @@ def run_discovery() -> dict:
         return summary
 
     if not applications:
-        log.info("No apps found — nothing to do.")
+        log.info("No apps with expiring secrets found — nothing to do.")
         return summary
 
+    # ── Step 2: Fetch owners in parallel ─────────────────────────────────────
     try:
         owners_by_object_id = fetch_all_owners_parallel(applications)
     except Exception as e:
         log.warning("fetch_all_owners_parallel failed: %s — proceeding with empty owners", e)
         owners_by_object_id = {}
 
+    # ── Step 3: Read existing SharePoint rows ─────────────────────────────────
     try:
         existing_rows = get_existing_sp_rows()
     except Exception as e:
         summary["errors"].append(f"get_existing_sp_rows failed: {e}")
         return summary
 
+    # ── Step 4: Build write operations for all secrets ────────────────────────
     write_ops: list[dict] = []
 
     for app in applications:
@@ -520,8 +650,11 @@ def run_discovery() -> dict:
             if not secret_id or not expiry_str:
                 continue
 
+            # Calculate days remaining
             try:
-                expiry_dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+                expiry_dt = datetime.fromisoformat(
+                    expiry_str.replace("Z", "+00:00")
+                )
                 days = (expiry_dt - now).days
             except Exception:
                 days = 9999
@@ -533,6 +666,7 @@ def run_discovery() -> dict:
 
             summary["byBucket"][bucket] += 1
 
+            # Skip Ignore bucket — expired 8+ days ago, no value in tracking
             if bucket == "Ignore":
                 summary["rowsIgnored"] += 1
                 continue
@@ -542,6 +676,7 @@ def run_discovery() -> dict:
             label       = f"{app_name}/{secret_desc}"
 
             if existing_id is None:
+                # New row — full fields + AlertStatus = Discovered
                 write_ops.append({
                     "item_id": None,
                     "label":   label,
@@ -551,7 +686,7 @@ def run_discovery() -> dict:
                         "SecretID":          secret_id,
                         "SecretDescription": secret_desc,
                         "ExpirationDate":    expiry_date,
-                        "SeverityLevel":     bucket,
+                        "ExpiryBucket":      bucket,
                         "ExpiryNotice":      notice,
                         "AppOwners":         app_owners,
                         "ObjectID":          object_id,
@@ -560,12 +695,14 @@ def run_discovery() -> dict:
                     },
                 })
             else:
+                # Existing row — only update dynamic fields
+                # Do NOT overwrite AlertStatus — monitoring manages that
                 write_ops.append({
                     "item_id": existing_id,
                     "label":   label,
                     "fields": {
                         "AppOwners":      app_owners,
-                        "SeverityLevel":  bucket,
+                        "ExpiryBucket":  bucket,
                         "ExpiryNotice":   notice,
                         "ExpirationDate": expiry_date,
                         "ObjectID":       object_id,
@@ -573,22 +710,25 @@ def run_discovery() -> dict:
                     },
                 })
 
-    log.info("Built %d write operations", len(write_ops))
+    log.info("Built %d write operations — sending to SharePoint via $batch", len(write_ops))
 
+    # ── Step 5: Batch-write all rows to SharePoint ────────────────────────────
     if write_ops:
         created, updated, batch_errors = batch_write_sp_rows(write_ops)
         summary["rowsCreated"] = created
         summary["rowsUpdated"] = updated
         summary["errors"].extend(batch_errors)
+    else:
+        log.info("No write operations to execute.")
 
     return summary
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Discovery Runbook v3 started")
+    log.info("Discovery Runbook v3 started (all secrets + parallel owners + batch writes)")
     t0      = time.time()
     summary = run_discovery()
     elapsed = time.time() - t0
@@ -599,21 +739,30 @@ def main():
     print(f"  Run Date         : {summary.get('runDate')}")
     print(f"  Total Runtime    : {elapsed:.1f}s")
     print(f"  Apps Scanned     : {summary.get('appsScanned')}")
-    print(f"  Secrets Found    : {summary.get('secretsFound')}")
-    print(f"  Rows Created     : {summary.get('rowsCreated')}")
-    print(f"  Rows Updated     : {summary.get('rowsUpdated')}")
-    print(f"  Rows Ignored     : {summary.get('rowsIgnored')}")
+    print(f"  Secrets Found    : {summary.get('secretsFound')} (all buckets including P4)")
+    print(f"  Rows Created     : {summary.get('rowsCreated')} (new secrets)")
+    print(f"  Rows Updated     : {summary.get('rowsUpdated')} (existing secrets)")
+    print(f"  Rows Ignored     : {summary.get('rowsIgnored')} (expired 8+ days ago)")
+    print(f"\n  Bucket breakdown:")
     for bucket, count in summary.get("byBucket", {}).items():
         if count > 0:
             print(f"    {bucket:<22} : {count}")
+
     errors = summary.get("errors", [])
     if errors:
         print(f"\n  ERRORS ({len(errors)}):")
         for err in errors[:10]:
             print(f"    - {err}")
+        if len(errors) > 10:
+            print(f"    ... and {len(errors) - 10} more errors")
         sys.exit(1)
     else:
-        print("\n  No errors.")
+        print(f"\n  No errors.")
+        print(f"\n  Next steps:")
+        print(f"  1. Go to SharePoint → SecretAlertRegistry")
+        print(f"  2. For apps with blank AppOwners — fill in the owner email manually")
+        print(f"  3. Monitoring container will run in 30 minutes")
+        print(f"     It reads AppOwners from each SP row — no OWNER-EMAIL filter needed")
 
 main()
 ```
