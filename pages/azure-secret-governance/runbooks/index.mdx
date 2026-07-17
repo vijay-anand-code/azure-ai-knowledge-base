@@ -7,15 +7,15 @@ import { Callout, Steps, FileTree } from 'nextra/components'
 
 # Runbooks
 
-Five Python runbooks run inside Azure Automation Account. Three run on a weekly schedule —
-the other two are utility runbooks used for setup and maintenance.
+Three Python runbooks run inside Azure Automation Account on a weekly schedule.
+Two additional utility runbooks are available for setup and maintenance.
 
 ---
 
 ## Weekly schedule
 
 ```
-Monday 00:00 — runbook_discovery    (scans all apps, stamps owners)
+Monday 00:00 — runbook_discovery    (scans all apps, stamps owners to SharePoint)
 Monday 00:30 — runbook_monitoring   (triggers monitoring container)
 Monday 01:00 — runbook_rotation     (rotates expiring secrets)
 ```
@@ -23,6 +23,61 @@ Monday 01:00 — runbook_rotation     (rotates expiring secrets)
 The 30-minute gaps are intentional — discovery must finish stamping `AppOwners` before
 monitoring reads them, and monitoring must finish creating Jira tickets before rotation
 needs to check them.
+
+---
+
+## Authentication — Federated Credential
+
+All three runbooks authenticate to Microsoft Graph using a **federated credential** flow —
+no client secrets or certificates needed anywhere.
+
+```
+UAMI (Managed Identity)
+  ↓ gets assertion token (api://AzureADTokenExchange)
+App Registration (azure-secretgovernance-cross-tenant)
+  ↓ exchanges assertion for Graph API token
+Microsoft Graph API
+  ↓ grants access based on App Registration permissions
+Entra ID / SharePoint / Jira / Teams
+```
+
+### Required App Registration permissions
+
+The App Registration must have these Graph permissions with admin consent granted:
+
+| Permission | Type | Purpose |
+|-----------|------|---------|
+| `Application.ReadWrite.OwnedBy` | Application | Read all App Registrations, write secrets only on owned apps |
+| `Sites.Selected` | Application | Read/write the SecretAlertRegistry SharePoint list only |
+
+### Required Key Vault secrets (all runbooks)
+
+| Secret | Purpose |
+|--------|---------|
+| `GRAPH-TENANT-ID` | Azure tenant ID |
+| `SHAREPOINT-SITE-ID` | SharePoint site composite ID (3-part format) |
+| `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
+| `CROSS-TENANT-APP-ID` | App Registration client ID |
+| `CROSS-TENANT-TENANT-ID` | Tenant ID where App Registration lives |
+
+### Required Automation Variables (all runbooks)
+
+| Variable | Value |
+|----------|-------|
+| `ROTATOR_KV_URL` | Config Key Vault URL |
+| `UAMI_CLIENT_ID` | User-Assigned Managed Identity client ID |
+
+<Callout type="info">
+  The `SHAREPOINT-SITE-ID` must be the full three-part composite ID returned by Graph API —
+  not the Web ID from SharePoint site settings. Get it by running:
+
+  ```
+  GET https://graph.microsoft.com/v1.0/sites/<tenant>.sharepoint.com:/sites/<site-name>
+  ```
+
+  Copy the `id` field from the response — it looks like:
+  `contoso.sharepoint.com,abc123...,def456...`
+</Callout>
 
 ---
 
@@ -35,12 +90,12 @@ classifies every secret by severity level, and batch-writes rows to SharePoint.
 
 ### What it does
 
-- Fetches all App Registrations via `GET /v1.0/applications` — all 255+ apps, all secrets
+- Fetches all App Registrations via `GET /v1.0/applications` — all apps, all secrets
 - Fetches owners for every app in parallel using `ThreadPoolExecutor` (20 workers)
 - Classifies each secret into P1 / P2 / P3 / P4 / ExpiredManualReview / Ignore
 - Batch-writes to SharePoint using Graph `$batch` — up to 20 writes per HTTP call
 - New secrets → creates row with `AlertStatus = Discovered`
-- Existing rows → updates `AppOwners`, `SeverityLevel`, `ExpirationDate` only
+- Existing rows → updates `AppOwners`, `ExpiryBucket` (SeverityLevel), `ExpirationDate` only
   (never overwrites `AlertStatus` — monitoring manages that)
 
 ### Key behaviours
@@ -52,22 +107,31 @@ classifies every secret by severity level, and batch-writes rows to SharePoint.
 | **AlertStatus never overwritten** | Updates to existing rows never touch `AlertStatus` — only monitoring changes it |
 | **404 retry** | If a PATCH returns 404 (stale item ID), automatically retries as a POST |
 | **Transient error retry** | Each SharePoint write retries up to 3 times with exponential backoff |
-| **Parallel owner fetching** | 255 apps × ~50ms per owner call = sequential would take 13s. Parallel drops it to under 1s |
+| **Parallel owner fetching** | 255 apps × ~50ms per owner call = sequential takes 13s. Parallel drops it to under 1s |
 
-### Automation Variables required
+### Expected output
 
-| Variable | Value |
-|----------|-------|
-| `ROTATOR_KV_URL` | URL of the config Key Vault |
-| `UAMI_CLIENT_ID` | Client ID of the UAMI |
+```
+DISCOVERY RUNBOOK v3 — SUMMARY
+============================================================
+  Run Date         : 2026-07-17
+  Total Runtime    : 82.8s
+  Apps Scanned     : 256
+  Secrets Found    : 1938
+  Rows Created     : 9
+  Rows Updated     : 1496
+  Rows Ignored     : 433
 
-### Key Vault secrets required
+  Bucket breakdown:
+    P1                     : 175   ← 0–7 days — CRITICAL
+    P2                     : 192   ← 8–30 days — WARNING
+    P3                     : 24    ← 31–60 days — INFO
+    P4                     : 1113  ← 61+ days — safe, written but not alerted
+    ExpiredManualReview    : 1     ← expired 1–7 days — manual review
+    Ignore                 : 433   ← expired 8+ days — not written
 
-| Secret | Purpose |
-|--------|---------|
-| `GRAPH-TENANT-ID` | Azure tenant ID |
-| `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
-| `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
+  No errors.
+```
 
 ---
 
@@ -89,13 +153,22 @@ and the runbook returns immediately — avoiding timeout issues.
 | Variable | Value |
 |----------|-------|
 | `AGENT_ENDPOINT` | `https://<fqdn>/run` |
-| `AGENT_API_KEY` | Shared secret header value (set to empty string to disable) |
+| `AGENT_API_KEY` | Shared secret header value (set to empty string `""` to disable) |
 
 <Callout type="info">
   To bypass LangChain and call monitoring directly — avoiding GPT-4o rate limits —
   change `AGENT_ENDPOINT` to `https://<fqdn>/run-monitoring`. This calls Container 2
-  directly with zero OpenAI tokens.
+  directly with zero OpenAI tokens used.
 </Callout>
+
+### Expected output
+
+```
+[OK] Monitoring cycle triggered successfully.
+  Started at : 2026-07-17T00:30:00Z
+  Message    : Cycle triggered — agent running in background
+  Summary    : Agent running in background — check container logs
+```
 
 ---
 
@@ -126,9 +199,9 @@ For each actionable row (P1/P2/P3) owned by the configured owner:
 
 ### Ownership filter
 
-Only secrets where `AppOwners` contains the `OWNER-EMAIL` Key Vault value are rotated.
-Apps where UAMI is not listed as an Entra owner will return 403 from Graph — providing
-a second layer of protection at the API level.
+Only secrets where `AppOwners` contains a value from the `OWNER-EMAILS` Key Vault secret
+are rotated. Apps where the App Registration is not listed as an Entra owner will return
+403 from Graph — providing a second layer of protection at the API level.
 
 ### Key behaviours
 
@@ -139,57 +212,42 @@ a second layer of protection at the API level.
 | **5s pause between rotations** | Prevents Azure AD concurrency conflicts on `addPassword` |
 | **OwnedBy enforced by API** | Non-owned apps return 403 — the system cannot accidentally rotate them |
 
-### Key Vault secrets required
-
-Same as discovery, plus:
+### Additional Key Vault secrets required
 
 | Secret | Purpose |
 |--------|---------|
 | `JIRA-BASE-URL` | Jira instance URL |
 | `JIRA-API-TOKEN` | Jira API token |
 | `JIRA-USER-EMAIL` | Jira account email |
-| `OWNER-EMAIL` | UAMI display name — e.g. `uami-secret-monitor` |
+| `OWNER-EMAILS` | Comma-separated App Registration display name — e.g. `azure-secretgovernance-cross-tenant` |
 
-### Automation Variables required
+### Additional Automation Variables required
 
 | Variable | Value |
 |----------|-------|
-| `ROTATOR_KV_URL` | Config Key Vault URL |
 | `ROTATION_KV_URL` | Rotation Key Vault URL (where new secrets are stored) |
-| `UAMI_CLIENT_ID` | UAMI client ID |
 
----
-
-## runbook_owner_sync.py
-
-**Purpose:** Utility runbook — reads `AppOwners` from SharePoint and adds any missing
-owners to the Entra App Registration. SharePoint is the source of truth.
-
-**Runs:** Manually, or on a weekly schedule at 00:15 (between discovery and monitoring).
-
-### When to run it
-
-Run this after an admin manually updates the `AppOwners` column in SharePoint to add
-a new owner — for example, adding the UAMI display name to an app that was previously
-unowned. The sync runbook then pushes that owner to Entra.
-
-### What it does
-
-- Reads all active SharePoint rows (skips `Rotated`, `Ignored`, `Resolved`)
-- Groups rows by `ObjectID` — one Entra API call per app, not per secret row
-- For each app — fetches current Entra owners
-- If SP has an owner NOT in Entra → adds them via `POST /applications/{id}/owners/$ref`
-- **Propagates owners across sibling rows** — if an admin fills `AppOwners` on just
-  the P1 row for an app, the sync runbook copies it to all other rows for the same app
-- Never removes owners — only adds (removal direction: do nothing)
-
-<Callout type="info">
-  The sync runbook resolves owner identifiers automatically.
-  Users are resolved by UPN (`vijayanand@contoso.com` → user object ID).
-  Managed identities and service principals are resolved by display name
-  (`uami-secret-monitor` → service principal object ID) using the
-  `ConsistencyLevel: eventual` header required for displayName filtering.
+<Callout type="warning">
+  `OWNER-EMAILS` must match the `AppOwners` value stamped in SharePoint by the discovery
+  runbook. If the App Registration is not listed as an Entra owner on the App Registration,
+  rotation will be skipped — this is enforced at the Graph API level (HTTP 403).
 </Callout>
+
+### Expected output
+
+```
+ROTATION RUNBOOK — SUMMARY
+============================================================
+  Run Date                : 2026-07-17
+  Owner Filter            : ['azure-secretgovernance-cross-tenant']
+  SharePoint Rows Scanned : 1499
+  Skipped (not owned)     : 1464
+  New Secrets Generated   : 9
+  Rotations Completed     : 0
+  Jira Comments Added     : 9
+  SharePoint Updated      : 9
+  Errors                  : 0
+```
 
 ---
 
@@ -223,42 +281,62 @@ Expected output:
 
 ---
 
-## Reading the runbook summary output
+## How to upload runbooks to Azure Automation
 
-Every runbook prints a summary at the end. Here is how to interpret each field:
+<Steps>
 
-### Discovery summary
-
-```
-Apps Scanned     : 255      ← all App Registrations in tenant
-Secrets Found    : 1929     ← all secrets across all apps (all buckets)
-Rows Created     : 1499     ← new rows written to SharePoint
-Rows Updated     : 0        ← existing rows updated (0 on first run)
-Rows Ignored     : 430      ← expired 8+ days — not written
-Bucket breakdown:
-  P1  : 175    ← 0–7 days — CRITICAL
-  P2  : 20     ← 8–30 days — WARNING
-  P3  : 197    ← 31–60 days — INFO
-  P4  : 1104   ← 61+ days — safe, written but not alerted
-  EMR : 3      ← expired 1–7 days — manual review required
-```
-
-### Rotation summary
+### Go to your Automation Account
 
 ```
-Rows Scanned           : 1499   ← all active SP rows fetched
-Skipped (not owned)    : 1464   ← OWNER-EMAIL filter excluded these
-New Secrets Generated  : 9      ← secrets rotated in Entra
-Jira Comments Added    : 9      ← rotation comments posted to Jira
-SharePoint Updated     : 9      ← rows moved to RotatedPendingDeployment
-Rotations Completed    : 0      ← Jira tickets already closed (Phase A)
-Errors                 : 0      ← clean run
+Azure Portal → Automation Accounts → <your-account> → Runbooks
 ```
+
+### Import each runbook
+
+Click **Import a runbook** for each file:
+
+| File | Runtime |
+|------|---------|
+| `runbook_discovery.py` | Python 3.10 |
+| `runbook_monitoring.py` | Python 3.10 |
+| `runbook_rotation.py` | Python 3.10 |
+| `runbook_cleanup_sharepoint.py` | Python 3.10 |
+
+### Publish after import
+
+After importing each runbook, click **Publish** — runbooks stay in Draft state until published.
+
+### Set Automation Variables
+
+```
+Automation Account → Variables → + Add a variable
+```
+
+Add all variables listed in the sections above.
+
+### Schedule the runbooks
+
+```
+Automation Account → Schedules → + Add a schedule
+```
+
+| Runbook | Schedule | Time |
+|---------|----------|------|
+| `runbook_discovery` | Weekly | Monday 00:00 UTC |
+| `runbook_monitoring` | Weekly | Monday 00:30 UTC |
+| `runbook_rotation` | Weekly | Monday 01:00 UTC |
+
+</Steps>
 
 ---
 
-## Source code
+## Troubleshooting
 
-The runbook source files are stored in the `secret-governance-infra/runbooks/` folder
-of your infrastructure repository. Deploy them by uploading to your Automation Account
-under **Runbooks → Import a runbook** or via `az automation runbook replace-content`.
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `HTTP 403` on Graph API | App Registration not owner on App Registration | Add as owner via PowerShell or portal |
+| `HTTP 403` on SharePoint | Sites.Selected not granted for site | Run Graph Explorer POST to grant site permission |
+| `HTTP 400` on SharePoint | Wrong `SHAREPOINT-SITE-ID` format | Use full 3-part composite ID from Graph API |
+| `Secrets Found: 0` | Federated credential not working | Check `CROSS-TENANT-APP-ID` and `CROSS-TENANT-TENANT-ID` in Key Vault |
+| `Rows Scanned: 0` on rotation | Wrong `OWNER-EMAILS` value | Must match `AppOwners` column value in SharePoint |
+| `api://AzureADTokenExchange` error | Federated credential not configured | Check UAMI object ID matches subject in federated credential |
