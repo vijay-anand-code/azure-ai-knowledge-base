@@ -1,1 +1,4 @@
-{ "index": "Overview", "runbook-rotation": "runbook_rotation.py" }
+{
+  "index": "Overview",
+  "runbook-rotation": "runbook_rotation.py"
+}
