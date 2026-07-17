@@ -1,1 +1,4 @@
-{ "index": "Overview", "runbook-monitoring": "runbook_monitoring.py" }
+{
+  "index": "Overview",
+  "runbook-monitoring": "runbook_monitoring.py"
+}
