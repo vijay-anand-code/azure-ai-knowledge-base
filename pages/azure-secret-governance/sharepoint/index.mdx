@@ -17,10 +17,10 @@ move through their lifecycle from discovery → monitoring → rotation → reso
 
 | AppName | SeverityLevel | AlertStatus | AppOwners | JiraTicketKey | ExpirationDate |
 |---------|-------------|-------------|-----------|---------------|----------------|
-| PaymentService-Prod | P1 | Escalated | vijayanand@contoso.com, uami-secret-monitor | KAN-2127 | 2026-07-17 |
-| AuthService-API | P2 | TeamsAlerted | uami-secret-monitor | KAN-2128 | 2026-07-30 |
+| PaymentService-Prod | P1 | Escalated | vijayanand@contoso.com, azure-secretgovernance-cross-tenant | KAN-2127 | 2026-07-17 |
+| AuthService-API | P2 | TeamsAlerted | azure-secretgovernance-cross-tenant | KAN-2128 | 2026-07-30 |
 | ReportingApp | P3 | JiraRaised | dinesh@contoso.com | KAN-2129 | 2026-08-10 |
-| DataPipeline | P4 | Discovered | uami-secret-monitor | — | 2026-10-15 |
+| DataPipeline | P4 | Discovered | azure-secretgovernance-cross-tenant | — | 2026-10-15 |
 
 ---
 
@@ -30,11 +30,13 @@ move through their lifecycle from discovery → monitoring → rotation → reso
 
 ### Create a team site
 
-1. Go to [sharepoint.com](https://sharepoint.com) → **+ Create site → Team site**
-2. Site name: `Contoso IT` *(or your preferred name)*
-3. Click **Next → Finish**
+- Go to [sharepoint.com](https://sharepoint.com) → **+ Create site → Team site**
+- Site name: `Contoso IT` *(or your preferred name)*
+- Click **Next → Finish**
 
 ### Get the Site ID and List ID
+
+Run this in Graph Explorer or Azure CLI logged in as your admin:
 
 ```bash
 # Replace <hostname> with e.g. contoso.sharepoint.com
@@ -42,11 +44,18 @@ move through their lifecycle from discovery → monitoring → rotation → reso
 az rest --method get \
   --url 'https://graph.microsoft.com/v1.0/sites/<hostname>:/sites/<sitename>' \
   --query id -o tsv
-
-# Output format:
-# contoso.sharepoint.com,eb7d38df-4022-4b6a-91ac-10f177c65098,d35b6bd8-064b-49c1-8f15-b1ad9aaf23c1
-# Use the FULL string including both GUIDs and commas as your SHAREPOINT-SITE-ID
 ```
+
+Output format — copy the **full string** including both GUIDs and commas:
+```
+contoso.sharepoint.com,eb7d38df-4022-4b6a-91ac-10f177c65098,d35b6bd8-064b-49c1-8f15-b1ad9aaf23c1
+```
+
+<Callout type="warning">
+  Use the full 3-part composite ID as your `SHAREPOINT-SITE-ID` in Key Vault.
+  Do not use the Web ID from SharePoint site settings — that is a single GUID and will
+  cause HTTP 400 errors when the runbook tries to access the list.
+</Callout>
 
 ```bash
 # After creating the list, get its ID
@@ -54,6 +63,45 @@ az rest --method get \
   --url 'https://graph.microsoft.com/v1.0/sites/<SITE_ID>/lists' \
   --query "value[?displayName=='SecretAlertRegistry'].id" -o tsv
 ```
+
+### Grant App Registration access to the site
+
+The App Registration needs explicit write access to this specific SharePoint site.
+Run this in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
+signed in as your admin:
+
+```
+POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
+```
+
+```json
+{
+  "roles": ["write"],
+  "grantedToIdentities": [{
+    "application": {
+      "id": "<CROSS_TENANT_APP_ID>",
+      "displayName": "azure-secretgovernance-cross-tenant"
+    }
+  }]
+}
+```
+
+A successful response returns HTTP 201 with the permission ID. Save the permission ID
+in case you need to delete and recreate it later.
+
+<Callout type="info">
+  To check existing site permissions at any time:
+
+  ```
+  GET https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
+  ```
+
+  To delete a permission (e.g. to update roles):
+
+  ```
+  DELETE https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions/<permission-id>
+  ```
+</Callout>
 
 ### Create the SecretAlertRegistry list
 
@@ -65,6 +113,11 @@ Inside the team site → **New → List → Blank list**
 
 The `Title` column is already there — rename it to `AppID` first, then add the rest.
 
+<Callout type="warning">
+  Column names are case-sensitive. Create them exactly as shown — the system uses these
+  names to read and write data via the Graph API.
+</Callout>
+
 | Column name | Type | Notes |
 |-------------|------|-------|
 | **AppID** *(rename Title)* | Single line of text | The App Registration client ID (GUID) |
@@ -74,20 +127,35 @@ The `Title` column is already there — rename it to `AppID` first, then add the
 | **ExpirationDate** | Date and time | Date only format |
 | **AlertStatus** | Choice | See choices below |
 | **AppOwners** | Single line of text | Comma-separated owners stamped by discovery runbook |
-| **ObjectID** | Single line of text | App Registration object ID (used by owner sync runbook) |
+| **ObjectID** | Single line of text | App Registration object ID |
 | **SeverityLevel** | Single line of text | Auto-set — P1, P2, P3, P4, ExpiredManualReview |
 | **ExpiryNotice** | Single line of text | Human-readable e.g. "Secret Expiring in 4 days" |
 | **JiraTicketKey** | Single line of text | e.g. KAN-2127 |
 | **JiraTicketCreatedDate** | Date and time | Date only format |
 | **AlertSentDate** | Date and time | Date only format |
 | **LastChecked** | Date and time | Date only format |
-| **RotationDetectedDate** | Date and time | Date only format |
+| **SecretRotationDetectedDate** | Date and time | Date only format |
 | **NewSecretKeyId** | Single line of text | GUID of the newly created secret |
 | **NewSecretVaultName** | Single line of text | Key Vault secret name for the new value |
 | **TenantID** | Single line of text | Auto-stamped by the system |
 | **TenantName** | Single line of text | Auto-stamped by the system |
 | **AlertHistory** | Multiple lines of text | Escalation history audit trail |
 | **Counter** | Number | Default value: 1 — used for SharePoint Quick Charts |
+
+<Callout type="info">
+  **Internal vs Display names:** SharePoint column display names can differ from their
+  internal API names. The system always uses the internal name when writing via Graph API.
+  Key mappings to be aware of:
+
+  | Display name | Internal name (API) |
+  |-------------|-------------------|
+  | `SeverityLevel` | `ExpiryBucket` |
+  | `SecretRotationDetectedDate` | `RotationDetectedDate` |
+  | `AppID` | `LinkTitle` |
+
+  If you rename a column after creating it, the internal name does not change.
+  The system uses the internal names — do not worry about renaming display names after setup.
+</Callout>
 
 ### Configure AlertStatus choices
 
@@ -122,6 +190,17 @@ SharePoint rejects filter queries with HTTP 400.
 - Primary column: `AlertStatus`
 - Click **Create**
 
+### Enable versioning for audit trail
+
+Versioning keeps a history of every change made to each row — useful for debugging
+and compliance.
+
+**SharePoint → SecretAlertRegistry → Settings (gear) → List settings → Versioning settings**
+
+- Create a version each time you edit: **Yes**
+- Keep the following number of versions: **50**
+- Click **OK**
+
 </Steps>
 
 ---
@@ -133,10 +212,10 @@ every App Registration's owners from Entra ID and stamps them here as a comma-se
 
 ```
 App Registration: payments-service
-Entra owners: vijayanand@contoso.com, uami-secret-monitor
+Entra owners: vijayanand@contoso.com, azure-secretgovernance-cross-tenant
 
 Discovery stamps to SharePoint:
-  AppOwners = "vijayanand@contoso.com, uami-secret-monitor"
+  AppOwners = "vijayanand@contoso.com, azure-secretgovernance-cross-tenant"
 ```
 
 The monitoring and rotation runbooks then filter SharePoint rows by this column —
@@ -178,7 +257,7 @@ Resolves Jira ticket
 Jira webhook fires → /jira-webhook
       ↓
 AlertStatus = Rotated
-RotationDetectedDate = today
+SecretRotationDetectedDate = today
 ```
 
 ---
@@ -197,38 +276,22 @@ Create these filtered views to make the list easier to work with:
 
 ---
 
-## How smart filtering works in the rotation runbook
+## Get all column internal names
 
-The rotation runbook only fetches rows where action is needed — it skips `Rotated`,
-`Discovered`, `P4`, and `Ignored` rows entirely:
+To verify internal names of all columns in your list, run this in Graph Explorer:
 
-```python
-status_filter = " or ".join([
-    f"fields/AlertStatus eq '{s}'"
-    for s in [
-        "Discovered",
-        "RotatedPendingDeployment",
-        "JiraRaised",
-        "TeamsAlerted",
-        "Escalated",
-        "Expired",
-        "ExpiredManualReview",
-    ]
-])
+```
+GET https://graph.microsoft.com/v1.0/sites/<SITE_ID>/lists/<LIST_ID>/columns?$select=name,displayName
 ```
 
-| Scenario | Without smart filter | With smart filter |
-|----------|---------------------|-------------------|
-| 1,499 rows, 9 actionable | Fetches all 1,499 | Fetches only 9 |
-| Runtime impact | Slow, scales badly | Fast, scales to any size |
+This returns every column's `name` (internal API name) and `displayName` (what you see in SharePoint).
 
 ---
 
 ## Clean up all rows (reset)
 
 To fully reset the SharePoint list — for example before a fresh test run — use the
-`runbook_cleanup_sharepoint.py` runbook. It deletes all rows in bulk via Graph API
-with a small pause between deletions to avoid throttling.
+`runbook_cleanup_sharepoint.py` runbook:
 
 ```
 Azure Portal → Automation Account → Runbooks
@@ -241,3 +304,16 @@ After cleanup, run `runbook_discovery` immediately to repopulate the list.
   This permanently deletes all rows. Only run it on a test environment or when
   you intentionally want to start fresh.
 </Callout>
+
+---
+
+## Troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `HTTP 403` on SharePoint | App Registration not granted site access | Run the Graph Explorer POST to grant site permissions |
+| `HTTP 400` on SharePoint | Wrong `SHAREPOINT-SITE-ID` format | Use full 3-part composite ID — not the Web ID |
+| `Field not recognized` error | Column internal name mismatch | Run the GET columns query to verify internal names |
+| `AlertStatus` filter failing | Column not indexed | Index the AlertStatus column in List settings |
+| `AppOwners` blank after discovery | App Registration not listed as Entra owner | Add App Registration as owner on the App Registration in Entra |
+| Rows not actioned by monitoring | `OWNER-EMAIL` doesn't match `AppOwners` | Ensure `OWNER-EMAIL` in Key Vault matches the App Registration display name exactly |
