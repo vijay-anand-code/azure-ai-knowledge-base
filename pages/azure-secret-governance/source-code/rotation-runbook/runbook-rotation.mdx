@@ -25,7 +25,8 @@ import { Callout } from 'nextra/components'
 | `NewSecretVaultName` guard | If this field is already set on a row, the secret is skipped — idempotent even if the runbook runs twice |
 | Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
 | 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
-| `OWNER-EMAILS` (comma-separated) | Supports multi-owner environments. Falls back to legacy `OWNER-EMAIL` single-value secret for backwards compatibility |
+| Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
+| `OWNER-EMAIL` fallback | Reads `OWNER-EMAILS` first, falls back to legacy `OWNER-EMAIL` for backwards compatibility |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
 
 ---
@@ -48,15 +49,17 @@ import { Callout } from 'nextra/components'
 | `GRAPH-TENANT-NAME` | Tenant display name |
 | `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
 | `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
+| `CROSS-TENANT-APP-ID` | App Registration client ID for federated credential |
+| `CROSS-TENANT-TENANT-ID` | Tenant ID where App Registration lives |
 | `JIRA-BASE-URL` | Jira instance URL |
 | `JIRA-API-TOKEN` | Jira API token |
 | `JIRA-USER-EMAIL` | Jira account email |
-| `OWNER-EMAILS` | Comma-separated owner filter (e.g. `uami-secret-monitor, admin@contoso.com`) |
+| `OWNER-EMAIL` | App Registration display name — e.g. `azure-secretgovernance-cross-tenant` |
 
 <Callout type="warning">
   The runbook will only rotate secrets for apps where `AppOwners` in SharePoint contains
-  at least one value from `OWNER-EMAILS`. Apps where the UAMI is not an Entra owner
-  return HTTP 403 from the Graph `addPassword` endpoint — a second layer of enforcement.
+  the value from `OWNER-EMAIL`. Apps where the App Registration is not listed as an Entra
+  owner return HTTP 403 from the Graph `addPassword` endpoint — a second layer of enforcement.
 </Callout>
 
 ---
@@ -74,18 +77,26 @@ Runtime : Python 3.10 (Azure Automation)
 Uses only built-in Python libraries (urllib, json, base64) for HTTP calls.
 No httpx dependency — avoids asyncio/httpcore issues in Automation runtime.
 
-Changes vs previous version:
-  - Added "Discovered" to ACTIONABLE_STATUSES — rows stamped by discovery
-    runbook but not yet processed by monitoring are now eligible for rotation
-    if rotation is triggered manually before monitoring runs.
-  - OWNER-EMAIL → OWNER-EMAILS (comma-separated) for multi-owner support.
-    Phase B filters by any-of-list match against AppOwners column.
-    Falls back to legacy OWNER-EMAIL secret if OWNER-EMAILS not found.
+Authentication: Federated credential
+  UAMI asserts identity → App Registration → Graph API token
+  No client secrets or certificates needed anywhere.
 
 Required Automation Variables:
   ROTATOR_KV_URL   — Key Vault URL holding rotation config secrets
   ROTATION_KV_URL  — Key Vault URL where new secrets are stored
   UAMI_CLIENT_ID   — User-assigned Managed Identity client ID
+
+Required Key Vault secrets:
+  GRAPH-TENANT-ID        — Azure tenant ID
+  GRAPH-TENANT-NAME      — Tenant display name
+  SHAREPOINT-SITE-ID     — SharePoint site composite ID
+  SHAREPOINT-LIST-ID     — SecretAlertRegistry list ID
+  CROSS-TENANT-APP-ID    — App Registration client ID
+  CROSS-TENANT-TENANT-ID — Tenant ID for federated credential
+  JIRA-BASE-URL          — Jira instance URL
+  JIRA-API-TOKEN         — Jira API token
+  JIRA-USER-EMAIL        — Jira account email
+  OWNER-EMAIL            — App Registration display name filter
 """
 
 from __future__ import annotations
@@ -103,7 +114,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Callable
 
 import automationassets
-from azure.identity import ManagedIdentityCredential
+from azure.identity import ManagedIdentityCredential, ClientAssertionCredential
 from azure.keyvault.secrets import SecretClient
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -196,13 +207,28 @@ def _patch(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
     return _http("PATCH", url, {**hdrs, "Content-Type": "application/json"}, body, timeout)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAPH TOKEN
+# GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
+CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+
+_uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _get_uami_assertion() -> str:
+    """Returns a short-lived UAMI token used as assertion for federated auth."""
+    token = _uami_credential.get_token("api://AzureADTokenExchange")
+    return token.token
+
+_graph_credential = ClientAssertionCredential(
+    tenant_id = CROSS_TENANT_TENANT_ID,
+    client_id = CROSS_TENANT_APP_ID,
+    func      = _get_uami_assertion,
+)
 
 def _graph_token() -> str:
-    return _graph_credential.get_token("https://graph.microsoft.com/.default").token
+    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
 
 def _auth_hdrs() -> dict:
     return {"Authorization": f"Bearer {_graph_token()}"}
