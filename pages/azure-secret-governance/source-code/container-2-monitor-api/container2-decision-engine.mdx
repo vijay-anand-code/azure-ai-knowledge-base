@@ -88,7 +88,11 @@ Changes in this version:
   - Fully dynamic pagination — no hardcoded $top, works for any list size
   - Batch concurrent SharePoint writes (10 in parallel)
   - Batch concurrent Jira ticket creation (5 in parallel)
+  - Sequential Teams alerts (one per run, no batching needed)
+  - Zero changes needed as list grows — fully self-adapting
   - OWNER-EMAIL → OWNER-EMAILS (comma-separated) for multi-owner support
+    owner_email param renamed to owner_emails (list[str]) — KV value parsed
+    at call site in main.py; any-of-list match against AppOwners column.
 """
 
 from __future__ import annotations
@@ -98,12 +102,12 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Awaitable
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BATCH SETTINGS
+# BATCH SETTINGS — tune here if throttling occurs
 # ─────────────────────────────────────────────────────────────────────────────
 
 SP_WRITE_BATCH    = 10   # SharePoint writes in parallel
 JIRA_CREATE_BATCH = 5    # Jira ticket creations in parallel
-BATCH_PAUSE       = 0.5  # seconds between batches
+BATCH_PAUSE       = 0.5  # seconds between batches — avoids throttling
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUCKET CLASSIFICATION
@@ -121,9 +125,9 @@ def classify_bucket(days: int) -> str:
 # STATE MAPS
 # ─────────────────────────────────────────────────────────────────────────────
 
-TERMINAL_STATUSES     = {"Rotated", "Ignored", "Resolved"}
+TERMINAL_STATUSES    = {"Rotated", "Ignored", "Resolved"}
 MONITOR_SKIP_STATUSES = TERMINAL_STATUSES | {"RotatedPendingDeployment"}
-CLOSED_NAMES          = {"done", "closed", "resolved"}
+CLOSED_NAMES         = {"done", "closed", "resolved"}
 
 BUCKET_STAGE = {"P3": 1, "P2": 2, "P1": 3, "ExpiredManualReview": 4}
 STATUS_STAGE = {
@@ -159,9 +163,9 @@ def _expiry_notice(days: int) -> str:
     return f"Secret Expiring in {days} days"
 
 def _teams_text(severity: str, c: dict, jira_key: str) -> str:
-    days      = c["days"]
+    days = c["days"]
     days_line = f"Expired: {abs(days)} days ago" if days < 0 else f"Days Remaining: {days} days"
-    header    = TEAMS_HEADERS.get(severity, severity)
+    header = TEAMS_HEADERS.get(severity, severity)
     if severity == "EXPIRED":
         action_req = "Password has ALREADY EXPIRED. A ticket has been raised for manual review."
     elif c.get("bucket") in ("P1", "P2", "P3"):
@@ -177,7 +181,7 @@ def _teams_text(severity: str, c: dict, jira_key: str) -> str:
     )
 
 def _escalation_comment(severity: str, c: dict) -> str:
-    days      = c["days"]
+    days = c["days"]
     days_text = f"expired {abs(days)} days ago" if days < 0 else f"now has {days} days remaining"
     if severity == "EXPIRED":
         action_req = "MANUAL REVIEW REQUIRED. This secret will NOT be auto-rotated."
@@ -224,13 +228,14 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
     return candidates, errors
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BATCH HELPER
+# BATCH HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _run_batched(tasks: list, batch_size: int, pause: float = BATCH_PAUSE) -> list:
+    """Run a list of coroutines in batches of batch_size with a pause between batches."""
     results = []
     for i in range(0, len(tasks), batch_size):
-        batch         = tasks[i:i + batch_size]
+        batch   = tasks[i:i + batch_size]
         batch_results = await asyncio.gather(*batch, return_exceptions=True)
         results.extend(batch_results)
         if i + batch_size < len(tasks):
@@ -249,10 +254,10 @@ async def run_secret_monitoring(
     get_jira_issue:         Callable[[str], Awaitable[dict]],
     add_jira_comment:       Callable[[str, str], Awaitable[dict]],
     send_teams_alert:       Callable[[str], Awaitable[dict]],
-    owner_emails:           list[str] | None = None,
-    owner_email:            str = "",               # legacy single-email param
-    fetch_app_owners:       Callable | None = None,  # legacy — not used
-    get_owned_app_ids:      Callable | None = None,  # legacy — not used
+    owner_emails:           list[str] | None = None,   # filter — process rows owned by any of these
+    owner_email:            str = "",                  # legacy single-email param — still supported
+    fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy — not used
+    get_owned_app_ids:      Callable[[], Awaitable[set]] | None = None,     # legacy — not used
 ) -> dict:
     now   = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
@@ -261,8 +266,8 @@ async def run_secret_monitoring(
         "runDate": today,
         "secretsScanned": 0,
         "totalsByBucket":  {b: 0 for b in ["P4", "P1", "P2", "P3", "ExpiredManualReview", "Ignore"]},
-        "p4LoggedOnly":    0,
-        "skippedNotOwned": 0,
+        "p4LoggedOnly":    0,   # B0 secrets — logged only, no SharePoint entry
+        "skippedNotOwned": 0,   # secrets skipped — app not owned by owner_email
         "newJiraTickets":  0,
         "newTeamsAlerts":  0,
         "jiraComments":    0,
@@ -271,6 +276,7 @@ async def run_secret_monitoring(
         "errors": [],
     }
 
+    # ── Fetch all data ────────────────────────────────────────────────────────
     try:
         azure_data = await fetch_azure_secrets()
     except Exception as e:
@@ -283,28 +289,36 @@ async def run_secret_monitoring(
         summary["errors"].append(f"get_sharepoint_state failed: {e}")
         return summary
 
-    # Resolve effective owner list
+    # ── Build SharePoint index ────────────────────────────────────────────────
+    # Resolve effective owner list — supports both single (legacy) and multi-owner.
+    # owner_emails takes priority; falls back to owner_email for backwards compat.
+    # Rows with blank AppOwners are skipped until an admin fills them in SP.
     if owner_emails:
         effective_owners = [e.strip().lower() for e in owner_emails if e.strip()]
     elif owner_email:
         effective_owners = [owner_email.strip().lower()]
     else:
-        effective_owners = []
+        effective_owners = []   # no filter — process all rows
 
-    # Build SP index — filtered by ownership
     sp_index: dict[tuple[str, str], dict] = {}
     skipped_not_owned = 0
     for item in sp_data.get("items", []):
         f          = item.get("fields", {})
         app_owners = (f.get("AppOwners") or "").lower()
+
         if effective_owners:
+            # Row passes if ANY of the owner emails appears in AppOwners
             if not any(email in app_owners for email in effective_owners):
                 skipped_not_owned += 1
                 continue
+
         sp_index[(f.get("Title"), f.get("SecretID"))] = item
 
     summary["skippedNotOwned"] = skipped_not_owned
+    if skipped_not_owned:
+        print(f"[INFO] Skipped {skipped_not_owned} rows — not owned by any of: {effective_owners}")
 
+    # ── Build candidates ──────────────────────────────────────────────────────
     candidates, build_errors = _build_candidates(azure_data.get("applications", []), now)
     summary["errors"].extend(build_errors)
     summary["secretsScanned"] = len(candidates)
@@ -312,6 +326,11 @@ async def run_secret_monitoring(
     for c in candidates:
         summary["totalsByBucket"][c["bucket"]] += 1
 
+    # ── Build app owners map from SP for ownership check on new secrets ─────────
+    # New secrets are not in sp_index yet — we need to check Entra AppOwners
+    # from existing SP rows for the same app to determine ownership.
+    # If no SP row exists for the app at all — check effective_owners against
+    # the app's own AppOwners from the SP rows we already have.
     sp_app_owners: dict[str, str] = {}
     for item in sp_data.get("items", []):
         f      = item.get("fields", {})
@@ -320,8 +339,12 @@ async def run_secret_monitoring(
         if app_id and owners and app_id not in sp_app_owners:
             sp_app_owners[app_id] = owners.lower()
 
+    # ── Split into new vs existing ────────────────────────────────────────────
+    # new_secrets: in Entra but NOT in sp_index (either genuinely new, or not owned)
+    # existing_secrets: in Entra AND in sp_index (owned + already tracked)
     new_secrets      = []
     existing_secrets = []
+
     for c in candidates:
         existing = sp_index.get((c["app_id"], c["secret_id"]))
         if existing is None:
@@ -329,23 +352,30 @@ async def run_secret_monitoring(
         else:
             existing_secrets.append((c, existing))
 
-    # ── PHASE 1: Jira tickets for new secrets ────────────────────────────────
+    # ── PHASE 1: Create Jira tickets for new secrets (batched) ───────────────
+    # Filter to only actionable new secrets (not B0 or Ignore)
+    # ALSO filter by owner — new secrets must belong to an owned app
+    # Check sp_app_owners (from SP) — if app has no SP row yet, skip it
+    # (discovery must run first to stamp AppOwners before monitoring acts)
     def _is_owned_new(c: dict) -> bool:
         if not effective_owners:
-            return True
+            return True  # no filter — process all
         app_owners = sp_app_owners.get(c["app_id"], "")
         if not app_owners:
-            return False
+            return False  # app not in SP yet — skip until discovery runs
         return any(email in app_owners for email in effective_owners)
 
     actionable_new = [
         c for c in new_secrets
         if c["bucket"] not in ("P4", "Ignore") and _is_owned_new(c)
     ]
-    summary["skippedNotOwned"] += len([
+    skipped_new_not_owned = len([
         c for c in new_secrets
         if c["bucket"] not in ("P4", "Ignore") and not _is_owned_new(c)
     ])
+    if skipped_new_not_owned:
+        summary["skippedNotOwned"] += skipped_new_not_owned
+        print(f"[INFO] Skipped {skipped_new_not_owned} new secrets — app not owned by {effective_owners}")
 
     async def _create_ticket_for_new(c: dict):
         sev   = SEVERITY_MAP[c["bucket"]]
@@ -357,13 +387,13 @@ async def run_secret_monitoring(
                 "the SharePoint AlertStatus to 'Rotated' and close this ticket."
             )
         try:
-            issue    = await create_jira_ticket(
+            issue     = await create_jira_ticket(
                 app_name=c["app_name"], app_id=c["app_id"],
                 secret_id=c["secret_id"], secret_description=c["secret_desc"],
                 expiration_date=c["expiration"], days_remaining=c["days"],
                 severity=sev["severity"], priority=sev["priority"], extra_note=extra,
             )
-            jira_key = issue.get("issue_key", "")
+            jira_key  = issue.get("issue_key", "")
             return {"c": c, "jira_key": jira_key, "sev": sev, "error": None}
         except Exception as e:
             return {"c": c, "jira_key": "", "sev": sev, "error": str(e)}
@@ -380,7 +410,7 @@ async def run_secret_monitoring(
         elif res["jira_key"]:
             summary["newJiraTickets"] += 1
 
-    # ── PHASE 2: SharePoint + Teams for new secrets ───────────────────────────
+    # ── PHASE 2: Send Teams alerts + write SharePoint rows for new (batched) ──
     async def _write_new_secret(res: dict):
         c        = res["c"]
         jira_key = res["jira_key"]
@@ -388,16 +418,17 @@ async def run_secret_monitoring(
         bucket   = c["bucket"]
 
         fields = {
-            "Title":             c["app_id"],
-            "AppName":           c["app_name"],
-            "SecretID":          c["secret_id"],
-            "SecretDescription": c["secret_desc"],
-            "ExpirationDate":    c["expiration"],
-            "JiraTicketKey":     jira_key,
-            "ExpiryNotice":      _expiry_notice(c["days"]),
-            "LastChecked":       today,
-            "SeverityLevel":     bucket,
-            "AlertHistory":      f"[{today}] Alert generated at severity {bucket}.",
+            "Title":              c["app_id"],
+            "AppName":            c["app_name"],
+            "SecretID":           c["secret_id"],
+            "SecretDescription":  c["secret_desc"],
+            "ExpirationDate":     c["expiration"],
+            "JiraTicketKey":      jira_key,
+            "ExpiryNotice":       _expiry_notice(c["days"]),
+            "LastChecked":        today,
+            "ExpiryBucket":       bucket,
+            "AlertHistory":       f"[{today}] Alert generated at severity {bucket}.",
+            "AppOwners":          c.get("app_owners", ""),  # owners fetched from Entra ID
         }
         if jira_key:
             fields["JiraTicketCreatedDate"] = today
@@ -415,8 +446,7 @@ async def run_secret_monitoring(
                     fields["AlertStatus"] = "JiraRaised"
             except Exception as e:
                 fields["AlertStatus"] = "JiraRaised"
-                return {"action": "sp_created", "teams": False,
-                        "error": f"Teams alert failed: {e}"}
+                return {"action": "sp_created", "teams": False, "error": f"Teams alert failed: {e}"}
         else:
             fields["AlertStatus"] = "JiraRaised"
 
@@ -424,34 +454,39 @@ async def run_secret_monitoring(
             await write_sharepoint_row(None, fields)
             return {"action": "sp_created", "teams": teams_sent, "error": None}
         except Exception as e:
-            return {"action": "sp_created", "teams": teams_sent,
-                    "error": f"SP write failed: {e}"}
+            return {"action": "sp_created", "teams": teams_sent, "error": f"SP write failed: {e}"}
 
-    sp_new_tasks   = [_write_new_secret(res) for res in jira_results if not isinstance(res, Exception)]
-    sp_new_results = await _run_batched(sp_new_tasks, SP_WRITE_BATCH)
+    sp_new_tasks    = [_write_new_secret(res) for res in jira_results if not isinstance(res, Exception)]
+    sp_new_results  = await _run_batched(sp_new_tasks, SP_WRITE_BATCH)
 
     for res in sp_new_results:
         if isinstance(res, Exception):
             summary["errors"].append(f"SP write batch error: {res}")
-        elif res.get("error"):
+            continue
+        if res.get("error"):
             summary["errors"].append(res["error"])
         else:
             summary["sharepointCreated"] += 1
             if res.get("teams"):
                 summary["newTeamsAlerts"] += 1
 
-    # ── PHASE 3: P4 — log only ────────────────────────────────────────────────
+    # ── PHASE 3: Handle B0 new secrets — log only, NO SharePoint entry ─────────
     b0_new = [c for c in new_secrets if c["bucket"] == "P4"]
-    summary["p4LoggedOnly"] += len(b0_new)
+    if b0_new:
+        summary["p4LoggedOnly"] += len(b0_new)
+        print(f"[INFO] B0 secrets (61+ days safe): {len(b0_new)} found — logged only, no SharePoint entry")
+        for c in b0_new[:5]:  # log first 5 for visibility
+            print(f"  B0: {c['app_name']} ({c['app_id']}) — expires in {c['days']} days")
 
-    # ── PHASE 4: Existing secrets ─────────────────────────────────────────────
+    # ── PHASE 4: Handle existing secrets (batched) ────────────────────────────
     async def _process_existing(c: dict, existing: dict):
         try:
-            return await _handle_existing_secret(
+            result = await _handle_existing_secret(
                 c, c["bucket"], existing, today, summary,
                 write_sharepoint_row, create_jira_ticket,
                 get_jira_issue, add_jira_comment, send_teams_alert,
             )
+            return result
         except Exception as e:
             return {"error": f"AppID={c['app_id']} SecretID={c['secret_id']}: {e}"}
 
@@ -471,6 +506,10 @@ async def run_secret_monitoring(
 
     return summary
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXISTING SECRET LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def _handle_existing_secret(
     c: dict, bucket: str, existing: dict, today: str, summary: dict,
@@ -534,10 +573,10 @@ async def _handle_existing_secret(
         updated_history  = f"{existing_history}\n{new_event}".strip()
 
         update_fields: dict[str, str] = {
-            "LastChecked":   today,
-            "ExpiryNotice":  notice,
-            "AlertHistory":  updated_history,
-            "SeverityLevel": bucket,
+            "LastChecked":  today,
+            "ExpiryNotice": notice,
+            "AlertHistory": updated_history,
+            "ExpiryBucket": bucket,
         }
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
@@ -545,8 +584,8 @@ async def _handle_existing_secret(
                 update_fields["JiraTicketCreatedDate"] = today
 
         if bucket != "P3":
-            text  = _teams_text(sev["severity"], c, jira_key)
-            res_t = await send_teams_alert(text)
+            text   = _teams_text(sev["severity"], c, jira_key)
+            res_t  = await send_teams_alert(text)
             if res_t.get("success"):
                 update_fields["AlertStatus"]   = ALERT_STATUS_FOR_BUCKET[bucket]
                 update_fields["AlertSentDate"] = today
@@ -561,9 +600,9 @@ async def _handle_existing_secret(
 
     else:
         update_fields = {
-            "LastChecked":   today,
-            "ExpiryNotice":  notice,
-            "SeverityLevel": bucket,
+            "LastChecked":  today,
+            "ExpiryNotice": notice,
+            "ExpiryBucket": bucket,
         }
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
