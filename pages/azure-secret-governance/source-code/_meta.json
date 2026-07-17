@@ -1,23 +1,18 @@
 {
   "index": "Overview",
   "discovery-runbook": {
-    "title": "Discovery Runbook",
-    "defaultOpen": true
+    "title": "Discovery Runbook"
   },
   "monitoring-runbook": {
-    "title": "Monitoring Runbook",
-    "defaultOpen": true
+    "title": "Monitoring Runbook"
   },
   "rotation-runbook": {
-    "title": "Rotation Runbook",
-    "defaultOpen": true
+    "title": "Rotation Runbook"
   },
   "container-1-langchain-agent": {
-    "title": "Container 1 - LangChain Agent",
-    "defaultOpen": true
+    "title": "Container 1 - LangChain Agent"
   },
   "container-2-monitor-api": {
-    "title": "Container 2 - Monitor API",
-    "defaultOpen": true
+    "title": "Container 2 - Monitor API"
   }
 }
