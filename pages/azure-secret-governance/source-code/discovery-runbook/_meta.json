@@ -1,1 +1,4 @@
-{ "index": "Overview", "runbook-discovery": "runbook_discovery.py" }
+{
+  "index": "Overview",
+  "runbook-discovery": "runbook_discovery.py"
+}
