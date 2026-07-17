@@ -43,6 +43,26 @@ a SharePoint field.
 
 ---
 
+## Get your Container App FQDN
+
+Before setting up Jira automation, get the Container App public URL:
+
+```bash
+az containerapp show \
+  --name secret-governance-v2 \
+  --resource-group <YOUR_RG> \
+  --query "properties.configuration.ingress.fqdn" -o tsv
+```
+
+This returns something like:
+```
+secret-governance-v2.<region>.azurecontainerapps.io
+```
+
+Use this as `<YOUR_CONTAINER_APP_FQDN>` in the steps below.
+
+---
+
 ## Setup
 
 <Steps>
@@ -113,33 +133,38 @@ Jira resolves or reopens ticket
       ↓
 POST /jira-webhook  (Container 1 — LangChain agent)
       ↓
-Extract: jira_key, to_status from payload
+Extract: jira_key, status from payload
       ↓
-to_status = "resolved"?          to_status = "in progress" / "to do"?
-      ↓                                  ↓
-POST /tools/update_on_jira_close   POST /tools/jira-status-update
-(Container 2 — no GPT-4o)         (Container 2 — no GPT-4o)
-      ↓                                  ↓
-AlertStatus → Rotated              AlertStatus → JiraRaised
-RotationDetectedDate → today       Monitoring picks it up next run
+status = "resolved/done/closed"?     status = "in progress/to do/reopened"?
+      ↓                                        ↓
+POST /tools/update_on_jira_close      POST /tools/jira-status-update
+(Container 2 — no GPT-4o)            (Container 2 — no GPT-4o)
+      ↓                                        ↓
+AlertStatus → Rotated                 AlertStatus → JiraRaised
+SecretRotationDetectedDate → today    Monitoring picks it up next run
 ```
 
 ### Status mapping
 
-| Jira destination status | SharePoint AlertStatus |
-|------------------------|----------------------|
-| `resolved`, `done`, `closed` | `Rotated` |
-| `in progress`, `to do`, `reopened` | `JiraRaised` |
-| Anything else | No update — logged only |
+| Jira destination status | SharePoint AlertStatus | SharePoint field updated |
+|------------------------|----------------------|--------------------------|
+| `resolved`, `done`, `closed` | `Rotated` | `SecretRotationDetectedDate` = today |
+| `in progress`, `to do`, `reopened` | `JiraRaised` | `LastChecked` = today |
+| Anything else | No update | Logged only |
+
+<Callout type="info">
+  `SecretRotationDetectedDate` is the SharePoint display name. The internal API name
+  is `RotationDetectedDate` — the system uses the internal name automatically.
+</Callout>
 
 ---
 
 ## Verifying the automation works
 
-1. Find a Jira ticket with a corresponding SharePoint row in `RotatedPendingDeployment`
-2. Resolve the ticket in Jira
-3. Check **Project Settings → Automation → Audit log** — should show SUCCESS
-4. Check SharePoint — the row should show `AlertStatus: Rotated`
+- Find a Jira ticket with a corresponding SharePoint row in `RotatedPendingDeployment`
+- Resolve the ticket in Jira
+- Check **Project Settings → Automation → Audit log** — should show SUCCESS
+- Check SharePoint — the row should show `AlertStatus: Rotated`
 
 ### Check container logs if something goes wrong
 
@@ -152,6 +177,7 @@ az containerapp logs show \
 ```
 
 Look for these lines:
+
 ```
 INFO: Jira webhook received: KAN-2127 → 'resolved'
 INFO: Ticket KAN-2127 closed — updating SharePoint directly (no AI)
@@ -159,7 +185,7 @@ INFO: SharePoint updated for KAN-2127: 1 rows marked Rotated
 ```
 
 <Callout type="info">
-  If Jira shows the webhook fired successfully but SharePoint didn't update,
+  If Jira shows the webhook fired successfully but SharePoint did not update,
   the most common cause is the `JiraTicketKey` field in SharePoint not matching
   exactly. Check for extra spaces or different casing.
 </Callout>
@@ -183,7 +209,17 @@ Before automation can raise tickets, configure the following in Key Vault:
   **API tokens expire.** If Jira ticket creation starts failing with HTTP 400 or 403,
   generate a new API token at `id.atlassian.com/manage-profile/security/api-tokens`
   and update the `JIRA-API-TOKEN` Key Vault secret. Then restart Container 2 to pick
-  up the new value.
+  up the new value:
+
+  ```bash
+  az containerapp revision restart \
+    --name secret-governance-v2 \
+    --resource-group <YOUR_RG> \
+    --revision $(az containerapp revision list \
+      --name secret-governance-v2 \
+      --resource-group <YOUR_RG> \
+      --query "[0].name" -o tsv)
+  ```
 </Callout>
 
 ---
@@ -207,7 +243,7 @@ Severity: CRITICAL
 When the rotation runbook creates a new secret, it adds a comment:
 
 ```
-🔐 AUTO-ROTATION — 2026-07-15
+AUTO-ROTATION — 2026-07-15
 A new client secret has been generated for payments-service.
 New credential keyId: abc123...
 New credential expiry: 2027-07-15T00:00:00Z
@@ -219,3 +255,15 @@ Next steps:
 3. Confirm authentication works
 4. Close this ticket to mark as Rotated in SharePoint.
 ```
+
+---
+
+## Troubleshooting
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| Webhook fires but SharePoint not updated | `JiraTicketKey` mismatch in SharePoint | Check for extra spaces or different casing in the key |
+| HTTP 400 on ticket creation | Jira API token expired | Regenerate token and update Key Vault secret |
+| HTTP 403 on ticket creation | Wrong `JIRA-USER-EMAIL` | Must match the account that owns the API token |
+| Webhook returns 404 | Wrong Container App FQDN | Verify FQDN using `az containerapp show` command above |
+| SharePoint not updating on reopen | Wrong status name in Jira body | Use `{{issue.status.name}}` not `{{destinationStatus.name}}` |
