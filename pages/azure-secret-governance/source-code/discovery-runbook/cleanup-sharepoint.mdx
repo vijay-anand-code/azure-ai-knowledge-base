@@ -1,0 +1,138 @@
+"""
+runbook_cleanup_sharepoint.py — Azure Automation Runbook
+=========================================================
+Purpose : ONE-TIME cleanup — deletes ALL rows from SecretAlertRegistry.
+          Run this to reset the list before a fresh discovery + monitoring run.
+
+WARNING : This deletes ALL rows permanently. Run discovery immediately after.
+
+Required Automation Variables:
+  ROTATOR_KV_URL  — Key Vault URL
+  UAMI_CLIENT_ID  — User-assigned Managed Identity client ID
+
+Required Key Vault secrets:
+  GRAPH-TENANT-ID    — Azure tenant ID
+  SHAREPOINT-SITE-ID — SharePoint site composite ID
+  SHAREPOINT-LIST-ID — SecretAlertRegistry list ID
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+import automationassets
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+log = logging.getLogger("sp-cleanup")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTOMATION VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_var(name: str) -> str:
+    value = automationassets.get_automation_variable(name)
+    if not value:
+        raise ValueError(f"Automation Variable '{name}' is not set.")
+    return str(value).strip()
+
+ROTATOR_KV_URL = _get_var("ROTATOR_KV_URL")
+UAMI_CLIENT_ID = _get_var("UAMI_CLIENT_ID")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AZURE CLIENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+_config_kv  = SecretClient(vault_url=ROTATOR_KV_URL, credential=_credential)
+
+def _kv_get(name: str) -> str:
+    return _config_kv.get_secret(name).value
+
+GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
+SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
+SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-LIST-ID")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _graph_token() -> str:
+    return _graph_credential.get_token("https://graph.microsoft.com/.default").token
+
+def _auth_hdrs() -> dict:
+    return {"Authorization": f"Bearer {_graph_token()}"}
+
+def _get(url: str, timeout: int = 30) -> dict:
+    req = urllib.request.Request(url, headers=_auth_hdrs(), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _delete(url: str, timeout: int = 30) -> None:
+    req = urllib.request.Request(url, headers=_auth_hdrs(), method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code not in (204, 404):
+            raise
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    base = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_LIST_ID}/items"
+    )
+
+    # Step 1 — Fetch all item IDs
+    log.info("Fetching all SharePoint rows...")
+    url      = f"{base}?$select=id&$top=999"
+    item_ids = []
+    while url:
+        b = _get(url)
+        item_ids.extend([i["id"] for i in b.get("value", [])])
+        url = b.get("@odata.nextLink")
+
+    total = len(item_ids)
+    log.info("Found %d rows to delete", total)
+
+    if total == 0:
+        print("SharePoint list is already empty — nothing to delete.")
+        return
+
+    # Step 2 — Delete all rows
+    deleted = 0
+    failed  = 0
+
+    for item_id in item_ids:
+        try:
+            _delete(f"{base}/{item_id}")
+            deleted += 1
+            if deleted % 50 == 0:
+                print(f"  Deleted {deleted}/{total}...")
+            time.sleep(0.1)  # small pause to avoid throttling
+        except Exception as e:
+            failed += 1
+            log.warning("Failed to delete item %s: %s", item_id, e)
+
+    print("=" * 60)
+    print("SHAREPOINT CLEANUP — SUMMARY")
+    print("=" * 60)
+    print(f"  Total rows found : {total}")
+    print(f"  Deleted          : {deleted}")
+    print(f"  Failed           : {failed}")
+    print(f"\n  ✓ Done — run discovery runbook next to repopulate.")
+
+main()
