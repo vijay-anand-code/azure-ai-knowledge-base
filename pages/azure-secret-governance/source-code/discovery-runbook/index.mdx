@@ -13,4 +13,7 @@ Scans ALL App Registrations from Entra ID, fetches their owners in parallel,
 classifies every secret by severity bucket, and batch-writes rows to the
 SecretAlertRegistry SharePoint list.
 
-- [View source](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery)
+| File | Purpose |
+|------|---------|
+| [runbook_discovery.py](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery) | Main discovery runbook — scans all apps and writes to SharePoint |
+| [runbook_cleanup_sharepoint.py](/azure-secret-governance/source-code/discovery-runbook/cleanup-sharepoint) | Utility — deletes all SharePoint rows for a fresh test run |
