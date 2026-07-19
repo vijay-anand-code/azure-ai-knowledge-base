@@ -9,14 +9,20 @@ Purpose : ONE-TIME cleanup — deletes ALL rows from SecretAlertRegistry.
 
 WARNING : This deletes ALL rows permanently. Run discovery immediately after.
 
+Authentication: Federated credential
+  UAMI asserts identity → App Registration → Graph API token
+  No client secrets or certificates needed anywhere.
+
 Required Automation Variables:
   ROTATOR_KV_URL  — Key Vault URL
   UAMI_CLIENT_ID  — User-assigned Managed Identity client ID
 
 Required Key Vault secrets:
-  GRAPH-TENANT-ID    — Azure tenant ID
-  SHAREPOINT-SITE-ID — SharePoint site composite ID
-  SHAREPOINT-LIST-ID — SecretAlertRegistry list ID
+  GRAPH-TENANT-ID         — Azure tenant ID
+  SHAREPOINT-SITE-ID      — SharePoint site composite ID
+  SHAREPOINT-LIST-ID      — SecretAlertRegistry list ID
+  CROSS-TENANT-APP-ID     — App Registration client ID
+  CROSS-TENANT-TENANT-ID  — Tenant ID for federated credential
 """
 
 from __future__ import annotations
@@ -30,7 +36,7 @@ import urllib.error
 from datetime import datetime, timezone
 
 import automationassets
-from azure.identity import ManagedIdentityCredential
+from azure.identity import ManagedIdentityCredential, ClientAssertionCredential
 from azure.keyvault.secrets import SecretClient
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -50,30 +56,52 @@ ROTATOR_KV_URL = _get_var("ROTATOR_KV_URL")
 UAMI_CLIENT_ID = _get_var("UAMI_CLIENT_ID")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AZURE CLIENTS
+# AZURE CLIENTS — Key Vault (UAMI used only for KV access)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
 _config_kv  = SecretClient(vault_url=ROTATOR_KV_URL, credential=_credential)
 
 def _kv_get(name: str) -> str:
-    return _config_kv.get_secret(name).value
+    try:
+        return _config_kv.get_secret(name).value
+    except Exception as exc:
+        raise RuntimeError(f"Required KV secret '{name}' could not be loaded: {exc}") from exc
 
+log.info("Loading config secrets from Key Vault...")
 GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
 SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
 SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-LIST-ID")
+CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
+CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+log.info("Config secrets loaded.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _get_uami_assertion() -> str:
+    token = _uami_credential.get_token("api://AzureADTokenExchange")
+    return token.token
+
+_graph_credential = ClientAssertionCredential(
+    tenant_id = CROSS_TENANT_TENANT_ID,
+    client_id = CROSS_TENANT_APP_ID,
+    func      = _get_uami_assertion,
+)
+
+def _graph_token() -> str:
+    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
+
+def _auth_hdrs() -> dict:
+    return {"Authorization": f"Bearer {_graph_token()}"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
-
-def _graph_token() -> str:
-    return _graph_credential.get_token("https://graph.microsoft.com/.default").token
-
-def _auth_hdrs() -> dict:
-    return {"Authorization": f"Bearer {_graph_token()}"}
 
 def _get(url: str, timeout: int = 30) -> dict:
     req = urllib.request.Request(url, headers=_auth_hdrs(), method="GET")
@@ -136,7 +164,11 @@ def main():
     print(f"  Total rows found : {total}")
     print(f"  Deleted          : {deleted}")
     print(f"  Failed           : {failed}")
-    print(f"\n  ✓ Done — run discovery runbook next to repopulate.")
+    if failed == 0:
+        print(f"\n  Done — run discovery runbook next to repopulate.")
+    else:
+        print(f"\n  Completed with {failed} failures — check logs above.")
+        sys.exit(1)
 
 main()
 
