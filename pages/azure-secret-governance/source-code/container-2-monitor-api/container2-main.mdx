@@ -152,6 +152,145 @@ async def get_tenant_name() -> str:
 def _jira_auth() -> str:
     return "Basic " + _b64.b64encode(f"{JIRA_USER_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
 
+# ── Jira Payload Diagnostics ──────────────────────────────────────────────────
+# Fetches Jira's live createmeta for the exact project + issuetype being used,
+# compares it against the payload we're about to send, and logs a clear
+# expected-vs-actual diff with suggestions BEFORE the request goes out.
+# Non-blocking: if createmeta itself fails, we log a warning and still attempt
+# ticket creation — diagnostics should never be the reason a real ticket fails.
+
+async def _fetch_jira_createmeta(project_key: str, issue_type_name: str) -> dict | None:
+    """
+    Fetches required/allowed fields for a specific project + issue type from
+    Jira's createmeta API. Returns None if the lookup itself fails (network,
+    auth, or the project/issuetype combo doesn't resolve).
+    """
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/createmeta"
+    params = {
+        "projectKeys": project_key,
+        "expand": "projects.issuetypes.fields",
+    }
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                url, params=params,
+                headers={"Authorization": _jira_auth(), "Accept": "application/json"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            body = r.json()
+    except Exception as e:
+        log.warning("createmeta lookup failed for project=%s: %s — skipping payload diagnostics", project_key, e)
+        return None
+
+    projects = body.get("projects", [])
+    if not projects:
+        log.warning("createmeta returned no projects for key=%s — check JIRA_PROJECT_KEY", project_key)
+        return None
+
+    for issuetype in projects[0].get("issuetypes", []):
+        if issuetype.get("name", "").lower() == issue_type_name.lower():
+            return issuetype.get("fields", {})
+
+    available = [it.get("name") for it in projects[0].get("issuetypes", [])]
+    log.warning(
+        "createmeta: issue type '%s' not found for project '%s'. Available types: %s",
+        issue_type_name, project_key, available,
+    )
+    return None
+
+
+def _diff_payload_against_createmeta(payload_fields: dict, createmeta_fields: dict) -> dict:
+    """
+    Compares the payload we're about to send against Jira's createmeta fields.
+    Returns a dict with:
+      - missing_required : required fields Jira expects that we never set
+      - unknown_fields    : fields we're sending that createmeta doesn't recognise
+                             for this project/issuetype (often means wrong field
+                             key, e.g. custom field ID mismatch)
+      - suggestions       : plain-language notes to help a human fix it
+    """
+    missing_required: list[str] = []
+    unknown_fields:   list[str] = []
+    suggestions:      list[str] = []
+
+    for field_key, meta in createmeta_fields.items():
+        if meta.get("required") and field_key not in payload_fields:
+            field_name = meta.get("name", field_key)
+            missing_required.append(f"{field_key} ({field_name})")
+            suggestions.append(
+                f"Add required field '{field_key}' ({field_name}) to the payload — "
+                f"Jira will reject the request without it."
+            )
+
+    for field_key in payload_fields:
+        if field_key not in createmeta_fields:
+            unknown_fields.append(field_key)
+            suggestions.append(
+                f"Field '{field_key}' is not recognised by Jira for this project/issuetype — "
+                f"double-check the field key/id, it may need to be a customfield_XXXXX ID instead."
+            )
+
+    # Common, specific check: priority name validity
+    if "priority" in payload_fields and "priority" in createmeta_fields:
+        allowed = [a.get("name") for a in createmeta_fields["priority"].get("allowedValues", [])]
+        sent    = payload_fields["priority"].get("name")
+        if allowed and sent not in allowed:
+            suggestions.append(
+                f"priority '{sent}' is not valid for this project. Allowed values: {allowed}"
+            )
+
+    # Common, specific check: issuetype-level parent/epic support
+    if "parent" in payload_fields and "parent" not in createmeta_fields:
+        suggestions.append(
+            "'parent' (Epic link) is set in the payload but this issue type does not support "
+            "a parent field in this project — remove it or confirm the project's hierarchy config."
+        )
+
+    return {
+        "missing_required": missing_required,
+        "unknown_fields":   unknown_fields,
+        "suggestions":      suggestions,
+    }
+
+
+async def _log_jira_payload_diagnostics(payload: dict) -> None:
+    """
+    Fetches live createmeta and logs expected-vs-actual comparison for the
+    payload about to be sent. Purely diagnostic — never raises, never blocks
+    the actual ticket creation call.
+    """
+    fields = payload.get("fields", {})
+    issue_type_name = fields.get("issuetype", {}).get("name", JIRA_ISSUE_TYPE)
+    project_key     = fields.get("project", {}).get("key", JIRA_PROJECT_KEY)
+
+    createmeta_fields = await _fetch_jira_createmeta(project_key, issue_type_name)
+
+    log.info(
+        "Jira payload about to be sent (project=%s, issuetype=%s): %s",
+        project_key, issue_type_name, json.dumps(payload),
+    )
+
+    if createmeta_fields is None:
+        log.info("Jira payload diagnostics skipped — createmeta unavailable for this project/issuetype.")
+        return
+
+    diff = _diff_payload_against_createmeta(fields, createmeta_fields)
+
+    required_field_keys = [k for k, m in createmeta_fields.items() if m.get("required")]
+    log.info("Jira EXPECTED required fields for %s/%s: %s", project_key, issue_type_name, required_field_keys)
+    log.info("Jira ACTUAL fields being sent: %s", list(fields.keys()))
+
+    if diff["missing_required"] or diff["unknown_fields"]:
+        log.warning(
+            "Jira payload mismatch — missing_required=%s unknown_fields=%s",
+            diff["missing_required"], diff["unknown_fields"],
+        )
+        for suggestion in diff["suggestions"]:
+            log.warning("Jira payload suggestion: %s", suggestion)
+    else:
+        log.info("Jira payload matches createmeta expectations — no missing required fields detected.")
+
 # ── Tool Implementations ──────────────────────────────────────────────────────
 async def fetch_azure_secrets() -> dict:
     headers = {"Authorization": f"Bearer {await _graph_token()}"}
@@ -242,9 +381,23 @@ async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_
     if extra_note: text += f"\nNote: {extra_note}"
     payload = {"fields": {"project": {"key": JIRA_PROJECT_KEY}, "summary": summary_line, "description": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}, "issuetype": {"name": JIRA_ISSUE_TYPE}, "priority": {"name": priority}, "labels": ["azure-secret", "rotation-required"]}}
     if JIRA_EPIC_KEY and JIRA_EPIC_KEY != "KAN-123": payload["fields"]["parent"] = {"key": JIRA_EPIC_KEY}
+
+    # Diagnostics — logs expected (createmeta) vs actual payload + suggestions.
+    # Never raises; a diagnostics failure must not block real ticket creation.
+    try:
+        await _log_jira_payload_diagnostics(payload)
+    except Exception as e:
+        log.warning("Jira payload diagnostics threw unexpectedly (non-fatal): %s", e)
+
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{JIRA_BASE_URL}/rest/api/3/issue", headers={"Authorization": _jira_auth(), "Content-Type": "application/json"}, content=json.dumps(payload), timeout=20)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Surface Jira's actual rejection reason — this is what the createmeta
+            # diagnostics above predicts; this is what Jira ACTUALLY said.
+            log.error("Jira %d response body for %s/%s: %s", e.response.status_code, app_name, secret_id, e.response.text)
+            raise
         return {"issue_key": r.json()["key"]}
 
 async def get_jira_issue(issue_key: str) -> dict:
