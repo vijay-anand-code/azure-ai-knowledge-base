@@ -1,5 +1,6 @@
 {
   "index": "Overview",
-  "runbook-discovery": "runbook_discovery.py"
-  "cleanup-sharepoint": "cleanup_sharepoint.py"
+  "runbook-discovery": "runbook_discovery.py",
+  "cleanup-sharepoint": "cleanup_sharepoint.py",
+  "count": "Secret Count Check"
 }
