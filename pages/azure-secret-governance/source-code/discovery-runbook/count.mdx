@@ -1,0 +1,23 @@
+---
+TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+
+python3 << 'EOF'
+import urllib.request, json, os
+
+token = os.popen("az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv").read().strip()
+
+url = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,passwordCredentials&$top=999"
+apps = []
+
+while url:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req) as resp:
+        body = json.loads(resp.read().decode())
+    apps.extend(body.get("value", []))
+    url = body.get("@odata.nextLink")
+
+total_secrets = sum(len(a.get("passwordCredentials", [])) for a in apps)
+print(f"Apps: {len(apps)}")
+print(f"Total secrets: {total_secrets}")
+EOF
+---
