@@ -1,4 +1,4 @@
----
+```bash
 TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
 
 python3 << 'EOF'
@@ -20,4 +20,4 @@ total_secrets = sum(len(a.get("passwordCredentials", [])) for a in apps)
 print(f"Apps: {len(apps)}")
 print(f"Total secrets: {total_secrets}")
 EOF
----
+```
