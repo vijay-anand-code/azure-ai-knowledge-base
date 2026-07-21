@@ -78,6 +78,20 @@ Changes vs v3:
        (logged) — plus a full bucket breakdown that always sums correctly
        to Secrets Found.
 
+  3. FRACTIONAL-SECOND DATE PARSING FIX
+       Graph API returns arbitrary-precision fractional seconds on
+       endDateTime (5, 7+ digits observed in production). Python 3.10's
+       datetime.fromisoformat() only accepts 0, 3, or 6 digits and raises
+       on anything else. _parse_graph_datetime() normalizes any fractional
+       precision to 6 digits before parsing, fixing silent misclassification
+       of otherwise-valid expired secrets as safe/far-future.
+
+  4. RECONCILIATION COUNTERS
+       Tracks and logs every app/secret skipped for malformed data
+       (missing appId, keyId, or endDateTime) instead of silently dropping
+       them — final summary now reconciles Graph's raw count against what
+       was actually processed, with a warning if the numbers don't match.
+
   (v3 changes retained: parallel owner fetch, Graph $batch writes, retry
    on transient errors, all-secrets-included discovery.)
 
@@ -109,12 +123,26 @@ Required Key Vault secrets:
   SHAREPOINT-SITE-ID         — SharePoint site composite ID
   SHAREPOINT-LIST-ID         — SecretAlertRegistry list ID
   SHAREPOINT-IGNORED-LIST-ID — IgnoredSecretRegistry list ID (NEW in v4)
+
+Required Entra ID permissions (on the cross-tenant App Registration used
+for the federated Graph credential):
+  Application.Read.All (or similar)  — to read App Registrations + owners
+  User.ReadBasic.All                 — REQUIRED to see User owners' name/UPN.
+                                        Without this, Graph returns stripped
+                                        User owner objects (only @odata.type
+                                        + id, all other fields null) even
+                                        though the /owners call itself
+                                        succeeds — no error is thrown, so
+                                        this is easy to miss. Grant with
+                                        admin consent in the tenant where
+                                        the user owners actually live.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 import urllib.request
@@ -287,6 +315,32 @@ def _expiry_notice(days: int, bucket: str) -> str:
         return f"Secret EXPIRED {abs(days)} days ago"
     return f"Secret Expiring in {days} days"
 
+def _parse_graph_datetime(expiry_str: str) -> datetime:
+    """
+    Parses Graph API's endDateTime, normalizing fractional seconds first.
+
+    WHY THIS EXISTS: Python 3.10's datetime.fromisoformat() only accepts
+    fractional seconds with exactly 0, 3, or 6 digits. Graph API returns
+    arbitrary precision (we've observed both 5-digit and 7-digit fractional
+    seconds in production, e.g. "...11.74517Z" and "...37.8905613Z") —
+    Python 3.10 raises ValueError on these, which was silently caught
+    upstream and misclassified secrets as far-future (safe) instead of
+    their true expired state. This is fixed natively in Python 3.11+
+    (fromisoformat became far more lenient), but this runbook targets 3.10
+    in Azure Automation, so we normalize manually here instead of relying
+    on a runtime upgrade.
+
+    Truncates fractional seconds to 6 digits (microseconds) if longer,
+    pads with trailing zeros if shorter — either way produces a valid
+    6-digit fractional value that fromisoformat() accepts on 3.10.
+    Sub-microsecond precision is irrelevant for day-level expiry math.
+    """
+    match = re.search(r'\.(\d+)', expiry_str)
+    if match:
+        frac = match.group(1)[:6].ljust(6, '0')
+        expiry_str = expiry_str[:match.start()] + '.' + frac + expiry_str[match.end():]
+    return datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Fetch ALL App Registrations from Entra ID
 # ─────────────────────────────────────────────────────────────────────────────
@@ -319,7 +373,20 @@ def fetch_all_applications() -> list[dict]:
 def fetch_app_owners(object_id: str) -> str:
     """
     Fetches owners of an App Registration using its object ID.
-    Returns a comma-separated string of owner emails/names.
+    Returns a comma-separated string of owner identifiers.
+
+    FORMAT: User owners are stored as "DisplayName <email>" (e.g.
+    "Vijay Anand <vijayanand@vijayinfra.click>") — this keeps the
+    SharePoint column human-readable (so an admin glancing at it can
+    tell who "M" is) while still containing the raw email as a
+    substring, which decision_engine.py and runbook_rotation.py rely
+    on for ownership matching:
+        if not any(email in app_owners for email in effective_owners):
+    That match is a plain substring check against app_owners.lower(),
+    so as long as the email appears anywhere in the stored string —
+    regardless of what else surrounds it — matching still works
+    correctly. Do not remove the email or the ownership filter will
+    silently stop matching this app's rows.
     """
     url = f"https://graph.microsoft.com/v1.0/applications/{object_id}/owners"
     try:
@@ -331,22 +398,47 @@ def fetch_app_owners(object_id: str) -> str:
             odata_type = owner.get("@odata.type", "").lower()
 
             if "user" in odata_type:
-                upn = (owner.get("userPrincipalName")
-                       or owner.get("mail")
-                       or owner.get("displayName", ""))
-                if upn:
-                    owner_list.append(upn)
+                # User owner — need BOTH display name (for humans reading
+                # the SharePoint column) AND email (for ownership matching
+                # in decision_engine.py / runbook_rotation.py). Format:
+                # "Vijay Anand <vijayanand@vijayinfra.click>"
+                email = owner.get("userPrincipalName") or owner.get("mail")
+                name  = owner.get("displayName", "")
+                if email and name:
+                    owner_list.append(f"{name} <{email}>")
+                elif email:
+                    # No display name on record — email alone still works
+                    # for matching, just less readable.
+                    owner_list.append(email)
+                else:
+                    # Genuinely no email on this user record — flag it
+                    # explicitly rather than silently substituting a name
+                    # that would look fine but break ownership matching.
+                    fallback_name = name or owner.get("id", "unknown")
+                    log.warning(
+                        "User owner on app object_id=%s has no userPrincipalName/mail — "
+                        "displayName=%r. Flagging as NoEmail so it's visible, not silently dropped.",
+                        object_id, fallback_name,
+                    )
+                    owner_list.append(f"NoEmail:{fallback_name}")
 
             elif "serviceprincipal" in odata_type:
+                # Service Principal / Managed Identity — no email concept,
+                # displayName is the correct and only identifier.
                 name = owner.get("displayName", "")
                 if name:
                     owner_list.append(name)
 
             else:
-                name = owner.get("displayName", "")
-                upn  = owner.get("userPrincipalName", "")
-                if upn:
-                    owner_list.append(upn)
+                # @odata.type missing/unrecognised — try email+name first
+                # (in case it's actually a user Graph didn't tag), fall
+                # back to whichever single field is available.
+                email = owner.get("userPrincipalName") or owner.get("mail", "")
+                name  = owner.get("displayName", "")
+                if email and name:
+                    owner_list.append(f"{name} <{email}>")
+                elif email:
+                    owner_list.append(email)
                 elif name:
                     owner_list.append(name)
 
@@ -573,7 +665,11 @@ def run_discovery() -> dict:
     summary: dict[str, Any] = {
         "runDate":            today,
         "appsScanned":        0,
-        "secretsFound":       0,
+        "appsSkippedMalformed": 0,  # apps missing appId/object id — entirely skipped
+        "secretsSeenInGraph": 0,    # every secret Graph returned, before any skip
+        "secretsSkippedMalformed": 0,  # secrets missing keyId/endDateTime — skipped
+        "secretsFound":       0,    # secrets actually classified (should equal
+                                    # secretsSeenInGraph - secretsSkippedMalformed)
         "rowsCreated":        0,   # SecretAlertRegistry — new rows
         "rowsUpdated":        0,   # SecretAlertRegistry — updated rows
         "ignoredLogged":      0,   # IgnoredSecretRegistry — rows written
@@ -620,7 +716,16 @@ def run_discovery() -> dict:
         object_id = app.get("id", "")
         secrets   = app.get("passwordCredentials", [])
 
-        if not app_id or not object_id or not secrets:
+        if not app_id or not object_id:
+            summary["appsSkippedMalformed"] += 1
+            log.warning(
+                "Skipping app entirely — missing appId or object id: displayName=%s appId=%r id=%r (had %d secrets)",
+                app_name, app_id, object_id, len(secrets),
+            )
+            continue
+
+        if not secrets:
+            # Genuinely no secrets on this app — not an error, just nothing to do.
             continue
 
         app_owners = owners_by_object_id.get(object_id, "")
@@ -630,15 +735,21 @@ def run_discovery() -> dict:
             secret_desc = secret.get("displayName", "")
             expiry_str  = secret.get("endDateTime", "")
 
+            summary["secretsSeenInGraph"] += 1
+
             if not secret_id or not expiry_str:
+                summary["secretsSkippedMalformed"] += 1
+                log.warning(
+                    "Skipping secret — missing keyId or endDateTime: app=%s (%s) secret_id=%r "
+                    "endDateTime=%r displayName=%r",
+                    app_name, app_id, secret_id, expiry_str, secret_desc,
+                )
                 continue
 
             # Calculate days remaining
             parse_failed = False
             try:
-                expiry_dt = datetime.fromisoformat(
-                    expiry_str.replace("Z", "+00:00")
-                )
+                expiry_dt = _parse_graph_datetime(expiry_str)
                 days = (expiry_dt - now).days
             except Exception as e:
                 log.warning(
@@ -758,14 +869,17 @@ def main():
     summary = run_discovery()
     elapsed = time.time() - t0
 
-    apps_scanned    = summary.get("appsScanned", 0)
-    secrets_found   = summary.get("secretsFound", 0)
-    rows_created    = summary.get("rowsCreated", 0)
-    rows_updated    = summary.get("rowsUpdated", 0)
-    ignored_logged  = summary.get("ignoredLogged", 0)
-    ignored_skipped = summary.get("ignoredSkippedNoList", 0)
-    by_bucket       = summary.get("byBucket", {})
-    errors          = summary.get("errors", [])
+    apps_scanned      = summary.get("appsScanned", 0)
+    apps_skipped      = summary.get("appsSkippedMalformed", 0)
+    secrets_in_graph  = summary.get("secretsSeenInGraph", 0)
+    secrets_skipped   = summary.get("secretsSkippedMalformed", 0)
+    secrets_found     = summary.get("secretsFound", 0)
+    rows_created      = summary.get("rowsCreated", 0)
+    rows_updated      = summary.get("rowsUpdated", 0)
+    ignored_logged    = summary.get("ignoredLogged", 0)
+    ignored_skipped   = summary.get("ignoredSkippedNoList", 0)
+    by_bucket         = summary.get("byBucket", {})
+    errors            = summary.get("errors", [])
 
     # Sanity check — bucket totals should always equal secrets found.
     bucket_sum = sum(by_bucket.values())
@@ -776,7 +890,16 @@ def main():
     print(f"  Run Date              : {summary.get('runDate')}")
     print(f"  Total Runtime         : {elapsed:.1f}s")
     print(f"  Apps Scanned          : {apps_scanned}")
+    if apps_skipped:
+        print(f"  Apps Skipped (bad data): {apps_skipped} (missing appId/object id — see WARNING logs above)")
+    print(f"  Secrets Seen in Graph  : {secrets_in_graph} (raw count, before any skip)")
+    if secrets_skipped:
+        print(f"  Secrets Skipped (bad data): {secrets_skipped} (missing keyId/endDateTime — see WARNING logs above)")
     print(f"  Secrets Found         : {secrets_found} (all buckets including P4)")
+    if secrets_in_graph != secrets_found + secrets_skipped:
+        print(f"\n  ⚠ WARNING: {secrets_in_graph} seen in Graph, but only "
+              f"{secrets_found} classified + {secrets_skipped} skipped = "
+              f"{secrets_found + secrets_skipped}. Numbers don't reconcile — investigate.")
     print(f"  Rows Created          : {rows_created} (new secrets — SecretAlertRegistry)")
     print(f"  Rows Updated          : {rows_updated} (existing secrets — SecretAlertRegistry)")
     print(f"  Ignored Logged        : {ignored_logged} (expired 8+ days — IgnoredSecretRegistry)")
