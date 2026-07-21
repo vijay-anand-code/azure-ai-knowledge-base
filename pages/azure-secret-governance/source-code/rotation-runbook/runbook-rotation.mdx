@@ -28,6 +28,7 @@ import { Callout } from 'nextra/components'
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
 | `OWNER-EMAIL` fallback | Reads `OWNER-EMAILS` first, falls back to legacy `OWNER-EMAIL` for backwards compatibility |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
+| Fractional-seconds normalization | Graph's `endDateTime` can return 5 or 7-digit fractional seconds. Python 3.10's `fromisoformat()` only accepts 0, 3, or 6 digits and raises on anything else — normalized before parsing so valid expiry dates aren't silently skipped |
 
 ---
 
@@ -60,6 +61,105 @@ import { Callout } from 'nextra/components'
   The runbook will only rotate secrets for apps where `AppOwners` in SharePoint contains
   the value from `OWNER-EMAIL`. Apps where the App Registration is not listed as an Entra
   owner return HTTP 403 from the Graph `addPassword` endpoint — a second layer of enforcement.
+</Callout>
+
+<Callout type="info">
+  **Required Entra ID permission:** the cross-tenant App Registration used for the
+  federated Graph credential needs `User.ReadBasic.All` (or `User.Read.All`) granted
+  with admin consent, in addition to the Application-scoped permissions needed to read
+  App Registrations. Without it, User-type owners in `/owners` responses come back
+  with every field null except `@odata.type` and `id` — the call succeeds with no
+  error, so this is easy to miss.
+</Callout>
+
+---
+
+## Testing rotation — adding the cross-tenant app as an owner
+
+Rotation only acts on apps where `AppOwners` in SharePoint contains the configured
+`OWNER-EMAIL`/`OWNER-EMAILS` value. To test rotation end-to-end on a specific app,
+add the cross-tenant App Registration's Service Principal as an **owner** of that
+target app in Entra ID, then re-run discovery so the ownership is stamped into
+SharePoint before rotation reads it.
+
+### 1. Get a fresh Graph token
+
+```powershell
+$TOKEN = az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv
+```
+
+Confirm it's populated before continuing:
+
+```powershell
+$TOKEN.Length
+```
+
+### 2. Get the cross-tenant app's Service Principal object ID
+
+Owners must be referenced by their **directory object ID**, not the application's
+`appId`/client ID. Look up the Service Principal by its `appId` (the value of
+`CROSS-TENANT-APP-ID` in Key Vault):
+
+```powershell
+$headers = @{ Authorization = "Bearer $TOKEN" }
+$response = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '<CROSS_TENANT_APP_ID>'" -Headers $headers -Method Get
+$response.value | Select-Object displayName, id, appId
+```
+
+The `id` field (not `appId`) from this result is what you'll use as the owner
+reference in the next step.
+
+### 3. Get the object ID of the app you want to test rotation on
+
+```powershell
+$response = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=displayName eq '<TARGET_APP_DISPLAY_NAME>'" -Headers $headers -Method Get
+$response.value | Select-Object displayName, id, appId
+```
+
+### 4. Add the cross-tenant Service Principal as an owner
+
+```powershell
+$TARGET_APP_OBJECT_ID = "<object id from step 3>"
+$CROSS_TENANT_SP_OBJECT_ID = "<id from step 2>"
+
+$body = @{
+    "@odata.id" = "https://graph.microsoft.com/v1.0/directoryObjects/$CROSS_TENANT_SP_OBJECT_ID"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications/$TARGET_APP_OBJECT_ID/owners/`$ref" -Headers @{Authorization = "Bearer $TOKEN"; "Content-Type" = "application/json"} -Method Post -Body $body
+```
+
+A successful call returns an empty response with no error — that's expected.
+
+### 5. Verify the owner was added
+
+```powershell
+$check = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/applications/$TARGET_APP_OBJECT_ID/owners" -Headers @{Authorization = "Bearer $TOKEN"} -Method Get
+$check.value | Select-Object displayName, "@odata.type"
+```
+
+You should see the cross-tenant app's display name listed as a `servicePrincipal`
+owner alongside any existing owners.
+
+### 6. Re-run discovery to sync ownership into SharePoint
+
+Rotation reads `AppOwners` from **SharePoint**, not Entra ID directly. The ownership
+change made above won't be visible to rotation until `runbook_discovery.py` runs
+again and re-stamps `AppOwners` on the target app's row. Trigger it manually:
+**Azure Portal → Automation Account → Runbooks → `SecretDiscovery` → Start**.
+
+### 7. Confirm in SharePoint
+
+Open the `SecretAlertRegistry` row for the target app — `AppOwners` should now
+include the cross-tenant app's display name (or `Name <email>` for user owners).
+Once confirmed, rotation's `OWNER_EMAILS` filter will match this app on its next
+run, provided the app's secret is also in a `P1`/`P2`/`P3` bucket.
+
+<Callout type="warning">
+  Removing an owner works the same way with `-Method Delete` against
+  `.../owners/{ownerId}/$ref` instead of POSTing to `.../owners/$ref`. Useful for
+  cleaning up test ownership after you're done, so the cross-tenant app doesn't
+  stay listed as an owner on apps it shouldn't manage long-term.
 </Callout>
 
 ---
@@ -97,6 +197,18 @@ Required Key Vault secrets:
   JIRA-API-TOKEN         — Jira API token
   JIRA-USER-EMAIL        — Jira account email
   OWNER-EMAIL            — App Registration display name filter
+
+Changes in this version:
+  - FRACTIONAL-SECONDS DATETIME FIX
+    Graph API's endDateTime can return arbitrary-precision fractional
+    seconds (5, 7+ digits observed in production). Python 3.10's
+    datetime.fromisoformat() only accepts 0, 3, or 6 digits and raises
+    ValueError on anything else. _days_remaining() previously caught
+    this and returned None (fail-safe — row gets skipped), which was
+    SAFE but silent: a row with a genuinely valid, parseable expiry
+    date would be skipped from rotation for no visible reason. Now
+    normalizes fractional seconds before parsing, so valid dates with
+    unusual precision are handled correctly instead of being skipped.
 """
 
 from __future__ import annotations
@@ -252,15 +364,37 @@ def _classify_bucket(days: int) -> str:
     if -7 <= days <= -1: return "ExpiredManualReview"
     return "Ignore"
 
+def _parse_graph_datetime(expiry_str: str) -> datetime:
+    """
+    Parses Graph API's endDateTime, normalizing fractional seconds first.
+
+    Python 3.10's datetime.fromisoformat() only accepts fractional seconds
+    with exactly 0, 3, or 6 digits. Graph API returns arbitrary precision
+    (5-digit and 7-digit fractional seconds observed in production) —
+    Python 3.10 raises ValueError on these. Fixed natively in Python 3.11+,
+    but this runbook targets 3.10 in Azure Automation, so we normalize
+    manually here instead of relying on a runtime upgrade.
+
+    Truncates fractional seconds to 6 digits if longer, pads with trailing
+    zeros if shorter. Sub-microsecond precision is irrelevant for day-level
+    expiry math, so this loses no meaningful information.
+    """
+    match = re.search(r'\.(\d+)', expiry_str)
+    if match:
+        frac = match.group(1)[:6].ljust(6, '0')
+        expiry_str = expiry_str[:match.start()] + '.' + frac + expiry_str[match.end():]
+    return datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+
 def _days_remaining(expiration_iso: str, now: datetime) -> int | None:
     try:
         if len(expiration_iso) == 10:
             expiration_iso += "T00:00:00+00:00"
-        exp = datetime.fromisoformat(expiration_iso.replace("Z", "+00:00"))
+        exp = _parse_graph_datetime(expiration_iso)
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
         return (exp - now).days
-    except Exception:
+    except Exception as e:
+        log.warning("Failed to parse ExpirationDate=%r: %s — row will be skipped", expiration_iso, e)
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
