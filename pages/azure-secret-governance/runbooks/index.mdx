@@ -1,330 +1,313 @@
 ---
 title: Runbooks
-description: Azure Automation Runbooks that drive the weekly secret governance cycle
+description: The Azure Automation runbooks that drive discovery, monitoring, and rotation
 ---
 
-import { Callout, Steps, FileTree } from 'nextra/components'
+import { Callout, Steps, Tabs, Tab } from 'nextra/components'
 
 # Runbooks
 
-Three Python runbooks run inside Azure Automation Account on a weekly schedule.
-Two additional utility runbooks are available for setup and maintenance.
+Seven runbooks in total. Four run on a fixed weekly schedule through the Azure Automation
+Account. One runs manually, from a laptop, deliberately outside the Automation Account. Two are
+one-time cleanup tools, used when resetting the SharePoint lists back to empty.
+
+| Runbook | Where it runs | Schedule |
+|---------|--------------|----------|
+| `runbook_discovery.py` | Azure Automation | Weekly, `00:00` |
+| `owner_sync_local.py` | A laptop, under the operator's own signed in session | Manual, run whenever `ManualAppOwners` has changed |
+| `runbook_owner_sync.py` | Azure Automation | Not scheduled by default, ticket-based alternative to the local script |
+| `runbook_monitoring.py` | Azure Automation | Weekly, `00:30` |
+| `runbook_rotation.py` | Azure Automation | Weekly, `01:00` |
+| `runbook_cleanup_sharepoint.py` | Azure Automation, run manually | One time. Wipes `SecretAlertRegistry` and its backup |
+| `runbook_cleanup_sharepoint_ignored.py` | Azure Automation, run manually | One time. Wipes `IgnoredSecretRegistry` and its backup |
+| `runbook_cleanup_sharepoint_all.py` | Azure Automation, run manually | One time. Wipes all four lists in a single run |
 
 ---
 
-## Weekly schedule
+## Secret severity buckets
 
-```
-Monday 00:00 — runbook_discovery    (scans all apps, stamps owners to SharePoint)
-Monday 00:30 — runbook_monitoring   (triggers monitoring container)
-Monday 01:00 — runbook_rotation     (rotates expiring secrets)
-```
+Every runbook classifies secrets the same way, using days remaining until expiry:
 
-The 30-minute gaps are intentional — discovery must finish stamping `AppOwners` before
-monitoring reads them, and monitoring must finish creating Jira tickets before rotation
-needs to check them.
+| Bucket | Days remaining | What happens |
+|--------|----------------|-------------|
+| **P1** | 0 to 3 | Jira ticket, Teams alert tagging a specific person, eligible for rotation |
+| **P2** | 4 to 7 | Jira ticket, Teams alert with no tagging, eligible for rotation |
+| **P3** | 8 to 30 | Jira ticket, Teams alert, eligible for rotation |
+| **P4** | 31 to 60 | Jira ticket only, no Teams alert, eligible for rotation |
+| **P5** | 61+ | Written to `SecretAlertRegistry` with owners stamped. No alert, no ticket, not rotated |
+| **ExpiredManualReview** | expired 1 to 7 days ago | Jira ticket and Teams alert. Never auto rotated, a human has to check it manually |
+| **Ignore** | expired 8+ days ago | Subject to the abandonment check below, not simply skipped |
 
----
-
-## Authentication — Federated Credential
-
-All three runbooks authenticate to Microsoft Graph using a **federated credential** flow —
-no client secrets or certificates needed anywhere.
-
-```
-UAMI (Managed Identity)
-  ↓ gets assertion token (api://AzureADTokenExchange)
-App Registration (azure-secretgovernance-cross-tenant)
-  ↓ exchanges assertion for Graph API token
-Microsoft Graph API
-  ↓ grants access based on App Registration permissions
-Entra ID / SharePoint / Jira / Teams
-```
-
-### Required App Registration permissions
-
-The App Registration must have these Graph permissions with admin consent granted:
-
-| Permission | Type | Purpose |
-|-----------|------|---------|
-| `Application.ReadWrite.OwnedBy` | Application | Read all App Registrations, write secrets only on owned apps |
-| `Sites.Selected` | Application | Read/write the SecretAlertRegistry SharePoint list only |
-
-### Required Key Vault secrets (all runbooks)
-
-| Secret | Purpose |
-|--------|---------|
-| `GRAPH-TENANT-ID` | Azure tenant ID |
-| `SHAREPOINT-SITE-ID` | SharePoint site composite ID (3-part format) |
-| `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
-| `CROSS-TENANT-APP-ID` | App Registration client ID |
-| `CROSS-TENANT-TENANT-ID` | Tenant ID where App Registration lives |
-
-### Required Automation Variables (all runbooks)
-
-| Variable | Value |
-|----------|-------|
-| `ROTATOR_KV_URL` | Config Key Vault URL |
-| `UAMI_CLIENT_ID` | User-Assigned Managed Identity client ID |
-
-<Callout type="info">
-  The `SHAREPOINT-SITE-ID` must be the full three-part composite ID returned by Graph API —
-  not the Web ID from SharePoint site settings. Get it by running:
-
-  ```
-  GET https://graph.microsoft.com/v1.0/sites/<tenant>.sharepoint.com:/sites/<site-name>
-  ```
-
-  Copy the `id` field from the response — it looks like:
-  `contoso.sharepoint.com,abc123...,def456...`
+<Callout type="warning">
+  All four buckets, P1 through P4, raise a Jira ticket. An earlier version of this system left
+  P1 and P2 out of ticket creation, so a secret with only a few days remaining could send a
+  correctly worded critical Teams alert with no ticket behind it. That has been fixed. Every
+  bucket except P5 reliably gets a ticket now.
 </Callout>
 
 ---
 
 ## runbook_discovery.py
 
-**Purpose:** Scans ALL App Registrations from Entra ID, fetches their owners in parallel,
-classifies every secret by severity level, and batch-writes rows to SharePoint.
+Scans every configured Entra ID tenant, classifies every secret, and writes the results to
+SharePoint. This is the only runbook that ever creates a new row for a secret.
 
-**Runs:** Weekly at 00:00. Also run manually when new App Registrations are added.
+### What it does, step by step
 
-### What it does
+1. Fetches every App Registration and its secrets, across every tenant listed in
+   `CROSS-TENANT-TENANT-IDS`
+2. Fetches owners for each app in parallel, twenty at a time
+3. Reads the current state of both `SecretAlertRegistry` and `IgnoredSecretRegistry`
+4. Writes a fresh backup of both lists, then deletes the previous run's backup rows. The new
+   backup is always written before the old one is removed, so there is never a moment with zero
+   backup if the run fails partway through
+5. Classifies every secret into a bucket
+6. Writes P1 through P5 into `SecretAlertRegistry`, and expired-8-plus-days secrets into
+   `IgnoredSecretRegistry`
+7. If a secret sitting in `IgnoredSecretRegistry` has a later expiry date now, meaning it was
+   renewed in Entra, its row is moved back into `SecretAlertRegistry` automatically
+8. Prints a reconciliation summary: total apps, total secrets, and how many landed in each list,
+   meant to be checked against a manual count from the Entra command line
 
-- Fetches all App Registrations via `GET /v1.0/applications` — all apps, all secrets
-- Fetches owners for every app in parallel using `ThreadPoolExecutor` (20 workers)
-- Classifies each secret into P1 / P2 / P3 / P4 / ExpiredManualReview / Ignore
-- Batch-writes to SharePoint using Graph `$batch` — up to 20 writes per HTTP call
-- New secrets → creates row with `AlertStatus = Discovered`
-- Existing rows → updates `AppOwners`, `ExpiryBucket` (SeverityLevel), `ExpirationDate` only
-  (never overwrites `AlertStatus` — monitoring manages that)
+<Callout type="info">
+  `ManualAppOwners` is the one column this runbook never writes to, on either a new row or an
+  existing one. Whatever a person has typed into that column stays exactly as they left it.
+</Callout>
 
-### Key behaviours
+### Required Key Vault secrets
 
-| Behaviour | Detail |
-|-----------|--------|
-| **All secrets included** | P4 secrets (61+ days) are written to SharePoint so owners are stamped before they age into P3 |
-| **Ignore bucket skipped** | Secrets expired 8+ days ago are not written — no value in tracking them |
-| **AlertStatus never overwritten** | Updates to existing rows never touch `AlertStatus` — only monitoring changes it |
-| **404 retry** | If a PATCH returns 404 (stale item ID), automatically retries as a POST |
-| **Transient error retry** | Each SharePoint write retries up to 3 times with exponential backoff |
-| **Parallel owner fetching** | 255 apps × ~50ms per owner call = sequential takes 13s. Parallel drops it to under 1s |
+`GRAPH-TENANT-ID`, `HOME-TENANT-ID`, `SHAREPOINT-SITE-ID`, `SHAREPOINT-LIST-ID`,
+`SHAREPOINT-BACKUP-LIST-ID`, `SHAREPOINT-IGNORED-LIST-ID`, `SHAREPOINT-IGNORED-BACKUP-LIST-ID`,
+`CROSS-TENANT-APP-ID`, `CROSS-TENANT-TENANT-IDS`
 
-### Expected output
+---
+
+## owner_sync_local.py
+
+Reads `ManualAppOwners` and adds the named identity as an Entra owner on the matching App
+Registration. This runbook does not run on the Automation Account at all. It is a plain Python
+script, run from a laptop, under the operator's own signed in session.
+
+### Why this runs locally instead of on a schedule
+
+Adding a new owner to an App Registration needs a broader Graph permission than anything else
+in this system holds, and granting that permission to the shared automation identity would mean
+every runbook sharing it could add ownership to any app in either tenant, unattended, with no
+one specifically accountable for it. Running this step locally means the actual Entra write
+happens under a real person's own sign in, with whatever role and approval requirements already
+apply to that person, rather than under a shared identity with no single owner.
+
+### How to run it
+
+```bash
+az login
+```
+
+```powershell
+$env:ROTATOR_KV_URL = "<YOUR_KEY_VAULT_URL>"
+python owner_sync_local.py
+```
+
+The script checks which tenant the current session is signed into, and processes apps in that
+tenant first. If it finds an app belonging to a different configured tenant, it pauses and
+prints the exact command to switch:
 
 ```
-DISCOVERY RUNBOOK v3 — SUMMARY
-============================================================
-  Run Date         : 2026-07-17
-  Total Runtime    : 82.8s
-  Apps Scanned     : 256
-  Secrets Found    : 1938
-  Rows Created     : 9
-  Rows Updated     : 1496
-  Rows Ignored     : 433
-
-  Bucket breakdown:
-    P1                     : 175   ← 0–7 days — CRITICAL
-    P2                     : 192   ← 8–30 days — WARNING
-    P3                     : 24    ← 31–60 days — INFO
-    P4                     : 1113  ← 61+ days — safe, written but not alerted
-    ExpiredManualReview    : 1     ← expired 1–7 days — manual review
-    Ignore                 : 433   ← expired 8+ days — not written
-
-  No errors.
+az login --tenant <tenant-id>
 ```
+
+Run that in a second terminal, then return to the first and press Enter to continue.
+
+<Callout type="warning">
+  If a name typed into `ManualAppOwners` matches more than one object in a tenant, for example
+  two service principals with the same display name, the script adds all of them as owners and
+  logs it clearly as ambiguous. It does not file a ticket or otherwise gate this. Check the
+  summary output after every run for an ambiguous match, since this is the one place a typo or a
+  genuine name collision could grant ownership to something unintended.
+</Callout>
+
+---
+
+## runbook_owner_sync.py
+
+An alternative to the local script, meant for environments where running a script from a
+laptop is not workable. Instead of writing to Entra directly, it detects the gap between
+`ManualAppOwners` and Entra's actual owner list, and files a Jira ticket per gap containing the
+exact command a person with the right role needs to run. It holds no write permission to Entra
+at all, by design, so it cannot make the change itself under any circumstance.
+
+Not scheduled by default. Enable it only if the local script genuinely does not fit your
+environment.
 
 ---
 
 ## runbook_monitoring.py
 
-**Purpose:** Triggers the monitoring container (`/run` endpoint on Container 1).
-The container does the actual work — this runbook just fires the request and returns.
+Triggers the monitoring cycle. This runbook itself is a thin wrapper. It calls the container's
+`/run` endpoint and returns as soon as the request is accepted, since the actual work happens in
+the background and can take several minutes across a large tenant.
 
-**Runs:** Weekly at 00:30, 30 minutes after discovery.
+### What the monitoring cycle actually does
 
-### What it does
+1. Fetches every App Registration's secrets, across every configured tenant
+2. Reads `SecretAlertRegistry`
+3. For any app where `ManualAppOwners` is filled in on at least one row, copies that value onto
+   every other row belonging to the same app that does not have it yet
+4. Filters to only the secrets whose app has `ManualAppOwners` set. Everything else is skipped
+   entirely
+5. For P1 through P4 and ExpiredManualReview, raises a Jira ticket if one does not already exist
+6. For P1, P2, and P3, also sends a Teams alert. P1 alerts tag a specific person, read from
+   `TEAMS-TAG-EMAIL` in Key Vault
+7. For secrets that have crossed 8 days expired, checks whether there is still a live Jira
+   ticket before deciding what to do. See the abandonment check below
+8. Updates SharePoint with the current bucket, notice text, and last checked date for every
+   secret it processed
 
-Sends a POST to the Container App `/run` endpoint with an instruction to run the
-weekly monitoring check. The container runs the full monitoring cycle in the background
-and the runbook returns immediately — avoiding timeout issues.
+### The 8 day abandonment check
 
-### Automation Variables required
+A secret this old is not moved out of the active list purely because of the day count. That
+would risk hiding a secret someone is actively rotating right now. The actual decision:
 
-| Variable | Value |
-|----------|-------|
-| `AGENT_ENDPOINT` | `https://<fqdn>/run` |
-| `AGENT_API_KEY` | Shared secret header value (set to empty string `""` to disable) |
+- No Jira ticket at all, or the ticket is Canceled: genuinely abandoned, moved to
+  `IgnoredSecretRegistry`
+- Ticket is Done or Resolved, but the row was never marked Rotated: flagged as a possible sync
+  gap between Jira and SharePoint, left visible for a person to check
+- Ticket is In Progress, To Do, Blocked, or Awaiting Reporter: someone is actively engaged, so
+  the row stays visible in `SecretAlertRegistry`, marked clearly as overdue
 
-<Callout type="info">
-  To bypass LangChain and call monitoring directly — avoiding GPT-4o rate limits —
-  change `AGENT_ENDPOINT` to `https://<fqdn>/run-monitoring`. This calls Container 2
-  directly with zero OpenAI tokens used.
+### Required Key Vault secrets
+
+`GRAPH-TENANT-ID`, `HOME-TENANT-ID`, `SHAREPOINT-SITE-ID`, `SHAREPOINT-LIST-ID`,
+`SHAREPOINT-IGNORED-LIST-ID`, `CROSS-TENANT-APP-ID`, `CROSS-TENANT-TENANT-IDS`, `JIRA-BASE-URL`,
+`JIRA-API-TOKEN`, `JIRA-USER-EMAIL`, `JIRA-PROJECT-KEY`, `JIRA-ISSUE-TYPE`,
+`TEAMS-WEBHOOK-URL`, `TEAMS-TAG-EMAIL`
+
+<Callout type="warning">
+  `OWNER-EMAILS` and the older singular `OWNER-EMAIL` are not used to decide which secrets get
+  monitored anymore. If a secret is not getting alerts or tickets and you expect it to, check
+  `ManualAppOwners` on that app's row first. That is the actual gate now.
 </Callout>
-
-### Expected output
-
-```
-[OK] Monitoring cycle triggered successfully.
-  Started at : 2026-07-17T00:30:00Z
-  Message    : Cycle triggered — agent running in background
-  Summary    : Agent running in background — check container logs
-```
 
 ---
 
 ## runbook_rotation.py
 
-**Purpose:** Rotates expiring secrets for owned App Registrations, stores new values
-in Key Vault, adds Jira comments, and updates SharePoint.
+Rotates secrets automatically for P1 through P4 apps, once `ManualAppOwners` is set.
 
-**Runs:** Weekly at 01:00, 1 hour after monitoring.
+### What it does, step by step
 
-### What it does in two phases
+1. Reads `SecretAlertRegistry`, filtered to rows in an actionable status
+2. Checks any row already marked `RotatedPendingDeployment`. If its Jira ticket is now closed,
+   marks the row `Rotated`
+3. Filters remaining candidates to only apps where `ManualAppOwners` is set, the same gate
+   monitoring uses
+4. For each remaining candidate in P1 through P4 within the rotation threshold, calls
+   `addPassword` on the App Registration, using the credential for whichever tenant that app
+   actually lives in
+5. Stores the new secret value in the rotation Key Vault
+6. Adds a Jira comment with the new key ID, expiry date, and Key Vault reference
+7. Marks the row `RotatedPendingDeployment`, waiting for a person to deploy the new value and
+   close the ticket
 
-**Phase A — Closure check**
-
-Reads all `RotatedPendingDeployment` rows and checks if their Jira ticket is closed.
-If closed → updates SharePoint to `Rotated`. If still open → updates `LastChecked` only.
-
-**Phase B — Proactive rotation**
-
-For each actionable row (P1/P2/P3) owned by the configured owner:
-
-- Checks the Jira ticket is still open (skips if closed — someone already handled it)
-- Calls `POST /applications/{id}/addPassword` to create a new secret in Entra
-- Stores the new secret value in the rotation Key Vault
-- Adds a comment to the Jira ticket with the new keyId, expiry, and Key Vault name
-- Updates SharePoint to `RotatedPendingDeployment`
-- Waits 5 seconds before the next rotation (prevents Azure AD concurrency conflicts)
-
-### Ownership filter
-
-Only secrets where `AppOwners` contains a value from the `OWNER-EMAILS` Key Vault secret
-are rotated. Apps where the App Registration is not listed as an Entra owner will return
-403 from Graph — providing a second layer of protection at the API level.
-
-### Key behaviours
-
-| Behaviour | Detail |
-|-----------|--------|
-| **Never double-rotates** | If `NewSecretVaultName` is already set on a row, it is skipped |
-| **Jira check before rotation** | If the Jira ticket is already closed, marks as `JiraClosed-Unverified` instead of rotating |
-| **5s pause between rotations** | Prevents Azure AD concurrency conflicts on `addPassword` |
-| **OwnedBy enforced by API** | Non-owned apps return 403 — the system cannot accidentally rotate them |
-
-### Additional Key Vault secrets required
-
-| Secret | Purpose |
-|--------|---------|
-| `JIRA-BASE-URL` | Jira instance URL |
-| `JIRA-API-TOKEN` | Jira API token |
-| `JIRA-USER-EMAIL` | Jira account email |
-| `OWNER-EMAILS` | Comma-separated App Registration display name — e.g. `azure-secretgovernance-cross-tenant` |
-
-### Additional Automation Variables required
-
-| Variable | Value |
-|----------|-------|
-| `ROTATION_KV_URL` | Rotation Key Vault URL (where new secrets are stored) |
-
-<Callout type="warning">
-  `OWNER-EMAILS` must match the `AppOwners` value stamped in SharePoint by the discovery
-  runbook. If the App Registration is not listed as an Entra owner on the App Registration,
-  rotation will be skipped — this is enforced at the Graph API level (HTTP 403).
+<Callout type="info">
+  How long a newly rotated secret stays valid for is controlled by `SECRET-VALIDITY-DAYS` in Key
+  Vault. Change that number and every secret rotated afterward picks up the new value, no code
+  change needed. It falls back to 365 days if not set.
 </Callout>
 
-### Expected output
+### Required Key Vault secrets
 
-```
-ROTATION RUNBOOK — SUMMARY
-============================================================
-  Run Date                : 2026-07-17
-  Owner Filter            : ['azure-secretgovernance-cross-tenant']
-  SharePoint Rows Scanned : 1499
-  Skipped (not owned)     : 1464
-  New Secrets Generated   : 9
-  Rotations Completed     : 0
-  Jira Comments Added     : 9
-  SharePoint Updated      : 9
-  Errors                  : 0
-```
+`GRAPH-TENANT-ID`, `HOME-TENANT-ID`, `SHAREPOINT-SITE-ID`, `SHAREPOINT-LIST-ID`,
+`CROSS-TENANT-APP-ID`, `CROSS-TENANT-TENANT-IDS`, `SECRET-VALIDITY-DAYS`, `JIRA-BASE-URL`,
+`JIRA-API-TOKEN`, `JIRA-USER-EMAIL`
 
 ---
 
-## runbook_cleanup_sharepoint.py
+## Cleanup runbooks
 
-**Purpose:** Utility runbook — deletes ALL rows from `SecretAlertRegistry`. Use this
-to reset the list before a fresh test run.
+Three separate scripts, each a full, permanent reset of the lists it touches. None of them are
+meant to run on a schedule. Run one of them only when you deliberately want to wipe data and
+start fresh, most often before a clean test of the discovery and backup cycle.
 
-**Runs:** Manually only — never scheduled.
+| Script | Wipes |
+|--------|-------|
+| `runbook_cleanup_sharepoint.py` | `SecretAlertRegistry`, `SecretAlertRegistryBackup` |
+| `runbook_cleanup_sharepoint_ignored.py` | `IgnoredSecretRegistry`, `IgnoredSecretRegistryBackup` |
+| `runbook_cleanup_sharepoint_all.py` | All four lists in one run |
 
 <Callout type="warning">
-  This permanently deletes all rows. Run `runbook_discovery` immediately after to
-  repopulate. Only use on test environments or when intentionally starting fresh.
+  These delete every row permanently, including the entire backup snapshot. Run discovery again
+  immediately afterward, since there is nothing to restore from until it completes and writes a
+  fresh backup of its own.
 </Callout>
-
-### What it does
-
-Fetches all item IDs from SharePoint (with pagination) and deletes each one with a
-100ms pause between deletions to avoid throttling. Prints progress every 50 deletions.
-
-```
-Azure Portal → Automation Account → Runbooks
-→ runbook_cleanup_sharepoint → Start
-
-Expected output:
-  Total rows found : 1499
-  Deleted          : 1499
-  Failed           : 0
-  ✓ Done — run discovery runbook next to repopulate.
-```
 
 ---
 
-## How to upload runbooks to Azure Automation
+## Setting up the Automation Account
 
 <Steps>
 
-### Go to your Automation Account
+### Create Automation Variables
 
+In the Azure Automation Account, go to Shared Resources, Variables, and create:
+
+| Name | Value |
+|------|-------|
+| `ROTATOR_KV_URL` | URL of the config Key Vault |
+| `ROTATION_KV_URL` | URL of the rotation Key Vault |
+| `UAMI_CLIENT_ID` | Client ID of the User-Assigned Managed Identity |
+| `AGENT_ENDPOINT` | `https://<YOUR_CONTAINER_APP_FQDN>/run` |
+| `AGENT_API_KEY` | Leave blank to disable, or set a shared key value |
+
+### Assign the managed identity to the Automation Account
+
+```bash
+az automation account identity assign \
+  --automation-account-name <YOUR_AUTOMATION_ACCOUNT> \
+  --resource-group <YOUR_RG> \
+  --identity-type UserAssigned \
+  --user-assigned <UAMI_RESOURCE_ID>
 ```
-Azure Portal → Automation Accounts → <your-account> → Runbooks
+
+### Grant the identity access to both Key Vaults
+
+```bash
+az keyvault set-policy \
+  --name <YOUR_CONFIG_KEY_VAULT> \
+  --object-id <UAMI_PRINCIPAL_ID> \
+  --secret-permissions get list
+
+az keyvault set-policy \
+  --name <YOUR_ROTATION_KEY_VAULT> \
+  --object-id <UAMI_PRINCIPAL_ID> \
+  --secret-permissions get list set
 ```
 
 ### Import each runbook
 
-Click **Import a runbook** for each file:
+For each `.py` file, in the Automation Account, go to Process Automation, Runbooks, Create a
+runbook.
 
-| File | Runtime |
-|------|---------|
-| `runbook_discovery.py` | Python 3.10 |
-| `runbook_monitoring.py` | Python 3.10 |
-| `runbook_rotation.py` | Python 3.10 |
-| `runbook_cleanup_sharepoint.py` | Python 3.10 |
+- Name it after the file
+- Runtime: Python 3.10
+- Paste in the script content
+- Publish
 
-### Publish after import
+### Add schedules
 
-After importing each runbook, click **Publish** — runbooks stay in Draft state until published.
+Create three schedules under Shared Resources, Schedules, then link each one to its runbook
+under the runbook's own Schedules tab:
 
-### Set Automation Variables
+| Schedule | Time | Recurrence | Linked to |
+|----------|------|-----------|-----------|
+| Weekly Discovery | `00:00` | Every 7 days | `runbook_discovery.py` |
+| Weekly Monitoring | `00:30` | Every 7 days | `runbook_monitoring.py` |
+| Weekly Rotation | `01:00` | Every 7 days | `runbook_rotation.py` |
 
-```
-Automation Account → Variables → + Add a variable
-```
-
-Add all variables listed in the sections above.
-
-### Schedule the runbooks
-
-```
-Automation Account → Schedules → + Add a schedule
-```
-
-| Runbook | Schedule | Time |
-|---------|----------|------|
-| `runbook_discovery` | Weekly | Monday 00:00 UTC |
-| `runbook_monitoring` | Weekly | Monday 00:30 UTC |
-| `runbook_rotation` | Weekly | Monday 01:00 UTC |
+<Callout type="info">
+  `owner_sync_local.py` is never scheduled, since it needs a person present to run it. Do not
+  create a schedule for it.
+</Callout>
 
 </Steps>
 
@@ -332,11 +315,11 @@ Automation Account → Schedules → + Add a schedule
 
 ## Troubleshooting
 
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `HTTP 403` on Graph API | App Registration not owner on App Registration | Add as owner via PowerShell or portal |
-| `HTTP 403` on SharePoint | Sites.Selected not granted for site | Run Graph Explorer POST to grant site permission |
-| `HTTP 400` on SharePoint | Wrong `SHAREPOINT-SITE-ID` format | Use full 3-part composite ID from Graph API |
-| `Secrets Found: 0` | Federated credential not working | Check `CROSS-TENANT-APP-ID` and `CROSS-TENANT-TENANT-ID` in Key Vault |
-| `Rows Scanned: 0` on rotation | Wrong `OWNER-EMAILS` value | Must match `AppOwners` column value in SharePoint |
-| `api://AzureADTokenExchange` error | Federated credential not configured | Check UAMI object ID matches subject in federated credential |
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| A secret never gets a ticket or alert | `ManualAppOwners` is blank for that app | Fill it in on any one row for the app, monitoring copies it to the rest automatically on the next run |
+| Discovery reconciliation totals do not match | A write failed partway through | Check the run's error list, the summary always prints total apps and secrets seen, separate from what actually got written |
+| Backup rows look wrong or missing | Check whether the backup was written before or after the purge | The backup step always writes this run's snapshot first, then deletes the previous run's rows. A number that looks low is usually the previous run's smaller starting count, not a bug |
+| A Jira status change does not reach SharePoint | The automation rule's trigger list is missing that status | See the Jira automation page, the trigger needs to watch all six real statuses |
+| Rotation skips a secret that looks eligible | `ManualAppOwners` is blank, or the secret's bucket is P5 | P5 is never rotation eligible by design. Everything else needs `ManualAppOwners` set |
+| Secrets from only one tenant show up | `CROSS-TENANT-TENANT-IDS` is missing a tenant, or still set to the old singular `CROSS-TENANT-TENANT-ID` with only one value | Set the plural secret with every tenant ID, comma separated |
