@@ -11,7 +11,7 @@ import { Callout } from 'nextra/components'
 
 **Runtime:** Python 3.11 — Azure Container App (public port 8000)
 
-**What it does:** Hosts the LangChain agent (GPT-4o) that orchestrates the full governance cycle. Defines all tools that call Container 2, manages per-session chat memory, and exposes FastAPI endpoints for the runbook trigger, Jira webhook, and Teams bot.
+**What it does:** Hosts the LangChain agent (GPT-4o) that orchestrates the full governance cycle. Defines all tools that call Container 2, manages per-session chat memory, and exposes FastAPI endpoints for the runbook trigger, chat, and Teams bot.
 
 ---
 
@@ -22,8 +22,13 @@ import { Callout } from 'nextra/components'
 | `/health` | GET | Liveness probe |
 | `/run` | POST | Trigger governance cycle as background task — returns immediately |
 | `/chat` | POST | Conversational endpoint with per-session memory |
-| `/jira-webhook` | POST | Receives Jira ticket transitions — updates SharePoint directly, no AI |
 | `/teams-webhook` | POST | Receives Teams Bot messages — routes through LangChain agent |
+
+<Callout type="info">
+  `/jira-webhook` was retired from this container. Jira's automation rule now calls
+  Container 2's `/tools/jira-status-update` directly, so Container 1 is no longer part
+  of the Jira to SharePoint sync path.
+</Callout>
 
 ---
 
@@ -32,7 +37,6 @@ import { Callout } from 'nextra/components'
 | Decision | Reason |
 |----------|--------|
 | `/run` returns immediately | Prevents 504 timeout on the Azure Automation runbook side — agent runs in background via `asyncio.create_task` |
-| Jira webhook bypasses LangChain | No GPT-4o reasoning needed to update a SharePoint field — direct Container 2 call is 2s vs 60s |
 | Per-session `InMemoryChatMessageHistory` | Teams bot conversations maintain context across messages in the same session |
 | UAMI for Key Vault auth | No client secrets in environment variables — identity-based authentication only |
 | `max_iterations=30` on AgentExecutor | Prevents infinite loops on complex monitoring cycles with many tool calls |
