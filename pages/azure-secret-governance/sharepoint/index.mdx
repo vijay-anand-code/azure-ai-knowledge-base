@@ -1,319 +1,206 @@
 ---
 title: SharePoint Setup
-description: Create the SecretAlertRegistry list and configure it for secret governance tracking
+description: Create and configure the four SharePoint lists this system reads and writes
 ---
 
-import { Callout, Steps, Tabs, Tab } from 'nextra/components'
+import { Callout, Steps } from 'nextra/components'
 
 # SharePoint Setup
 
-The `SecretAlertRegistry` SharePoint list is the central audit trail for all monitored secrets.
-Every App Registration secret gets a row here — the system updates it automatically as secrets
-move through their lifecycle from discovery → monitoring → rotation → resolved.
+Four SharePoint lists, all on the same site. Two are the actual working data, and two are
+backup copies that discovery refreshes every run. Nothing else in this system writes anywhere
+else in SharePoint.
+
+| List | What it holds |
+|------|---------------|
+| `SecretAlertRegistry` | Every secret in buckets P1 through P5, the active, working list |
+| `SecretAlertRegistryBackup` | A snapshot of `SecretAlertRegistry`, taken right before each discovery run changes anything |
+| `IgnoredSecretRegistry` | Secrets expired 8 or more days, confirmed abandoned |
+| `IgnoredSecretRegistryBackup` | A snapshot of `IgnoredSecretRegistry`, same timing as above |
+
+<Callout type="info">
+  Only the most recent run's snapshot is ever kept in either backup list. Discovery writes the
+  new snapshot first, then removes the previous run's rows, so there is never a moment with zero
+  backup even if a run fails partway through. This means the backup lists do not hold deep
+  history, only the state immediately before the most recent run.
+</Callout>
 
 ---
 
-## Real world example of a list row
-
-| AppName | SeverityLevel | AlertStatus | AppOwners | JiraTicketKey | ExpirationDate |
-|---------|-------------|-------------|-----------|---------------|----------------|
-| PaymentService-Prod | P1 | Escalated | vijayanand@contoso.com, azure-secretgovernance-cross-tenant | KAN-2127 | 2026-07-17 |
-| AuthService-API | P2 | TeamsAlerted | azure-secretgovernance-cross-tenant | KAN-2128 | 2026-07-30 |
-| ReportingApp | P3 | JiraRaised | dinesh@contoso.com | KAN-2129 | 2026-08-10 |
-| DataPipeline | P4 | Discovered | azure-secretgovernance-cross-tenant | — | 2026-10-15 |
-
----
-
-## Create the SharePoint site
+## Create the site
 
 <Steps>
 
-### Create a team site
+### Create a SharePoint site
 
-- Go to [sharepoint.com](https://sharepoint.com) → **+ Create site → Team site**
-- Site name: `Contoso IT` *(or your preferred name)*
-- Click **Next → Finish**
+Go to your SharePoint admin center and create a new Team site, or use an existing one. Note
+its URL, you will need it for the site ID lookup later.
 
-### Get the Site ID and List ID
+### Create SecretAlertRegistry
 
-Run this in Graph Explorer or Azure CLI logged in as your admin:
-
-```bash
-# Replace <hostname> with e.g. contoso.sharepoint.com
-# Replace <sitename> with your site name e.g. ContosoIT
-az rest --method get \
-  --url 'https://graph.microsoft.com/v1.0/sites/<hostname>:/sites/<sitename>' \
-  --query id -o tsv
-```
-
-Output format — copy the **full string** including both GUIDs and commas:
-```
-contoso.sharepoint.com,eb7d38df-4022-4b6a-91ac-10f177c65098,d35b6bd8-064b-49c1-8f15-b1ad9aaf23c1
-```
-
-<Callout type="warning">
-  Use the full 3-part composite ID as your `SHAREPOINT-SITE-ID` in Key Vault.
-  Do not use the Web ID from SharePoint site settings — that is a single GUID and will
-  cause HTTP 400 errors when the runbook tries to access the list.
-</Callout>
-
-```bash
-# After creating the list, get its ID
-az rest --method get \
-  --url 'https://graph.microsoft.com/v1.0/sites/<SITE_ID>/lists' \
-  --query "value[?displayName=='SecretAlertRegistry'].id" -o tsv
-```
-
-### Grant App Registration access to the site
-
-The App Registration needs explicit write access to this specific SharePoint site.
-Run this in [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
-signed in as your admin:
-
-```
-POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
-```
-
-```json
-{
-  "roles": ["write"],
-  "grantedToIdentities": [{
-    "application": {
-      "id": "<CROSS_TENANT_APP_ID>",
-      "displayName": "azure-secretgovernance-cross-tenant"
-    }
-  }]
-}
-```
-
-A successful response returns HTTP 201 with the permission ID. Save the permission ID
-in case you need to delete and recreate it later.
-
-<Callout type="info">
-  To check existing site permissions at any time:
-
-  ```
-  GET https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
-  ```
-
-  To delete a permission (e.g. to update roles):
-
-  ```
-  DELETE https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions/<permission-id>
-  ```
-</Callout>
-
-### Create the SecretAlertRegistry list
-
-Inside the team site → **New → List → Blank list**
-- Name: `SecretAlertRegistry`
-- Click **Create**
-
-### Add all required columns
-
-The `Title` column is already there — rename it to `AppID` first, then add the rest.
-
-<Callout type="warning">
-  Column names are case-sensitive. Create them exactly as shown — the system uses these
-  names to read and write data via the Graph API.
-</Callout>
+Create a custom list named exactly `SecretAlertRegistry`. Add these columns:
 
 | Column name | Type | Notes |
 |-------------|------|-------|
-| **AppID** *(rename Title)* | Single line of text | The App Registration client ID (GUID) |
-| **AppName** | Single line of text | Display name of the App Registration |
-| **SecretID** | Single line of text | The secret's keyId GUID |
-| **SecretDescription** | Multiple lines of text | The secret's display name |
-| **ExpirationDate** | Date and time | Date only format |
-| **AlertStatus** | Choice | See choices below |
-| **AppOwners** | Single line of text | Comma-separated owners stamped by discovery runbook |
-| **ObjectID** | Single line of text | App Registration object ID |
-| **SeverityLevel** | Single line of text | Auto-set — P1, P2, P3, P4, ExpiredManualReview |
-| **ExpiryNotice** | Single line of text | Human-readable e.g. "Secret Expiring in 4 days" |
-| **JiraTicketKey** | Single line of text | e.g. KAN-2127 |
-| **JiraTicketCreatedDate** | Date and time | Date only format |
-| **AlertSentDate** | Date and time | Date only format |
-| **LastChecked** | Date and time | Date only format |
-| **SecretRotationDetectedDate** | Date and time | Date only format |
-| **NewSecretKeyId** | Single line of text | GUID of the newly created secret |
-| **NewSecretVaultName** | Single line of text | Key Vault secret name for the new value |
-| **TenantID** | Single line of text | Auto-stamped by the system |
-| **TenantName** | Single line of text | Auto-stamped by the system |
-| **AlertHistory** | Multiple lines of text | Escalation history audit trail |
-| **Counter** | Number | Default value: 1 — used for SharePoint Quick Charts |
-
-<Callout type="info">
-  **Internal vs Display names:** SharePoint column display names can differ from their
-  internal API names. The system always uses the internal name when writing via Graph API.
-  Key mappings to be aware of:
-
-  | Display name | Internal name (API) |
-  |-------------|-------------------|
-  | `SeverityLevel` | `ExpiryBucket` |
-  | `SecretRotationDetectedDate` | `RotationDetectedDate` |
-  | `AppID` | `LinkTitle` |
-
-  If you rename a column after creating it, the internal name does not change.
-  The system uses the internal names — do not worry about renaming display names after setup.
-</Callout>
-
-### Configure AlertStatus choices
-
-When creating the `AlertStatus` column, select **Choice** as the type and enter these values
-**exactly as shown** — spelling and capitalisation must match:
-
-| Choice value | When the system sets this |
-|-------------|--------------------------|
-| `Discovered` | Row first created by discovery runbook — not yet actioned by monitoring |
-| `JiraRaised` | A Jira incident ticket has been created (P3) |
-| `TeamsAlerted` | A Teams alert has been sent (P2) |
-| `Escalated` | Secret is critically close to expiry — P1 (0–7 days) |
-| `RotatedPendingDeployment` | New secret generated — waiting for team to deploy it |
-| `Rotated` | Secret has been rotated and deployment confirmed via Jira close |
-| `ExpiredManualReview` | Secret recently expired — requires manual review, NOT auto-rotated |
-| `JiraClosed-Unverified` | Jira ticket closed but rotation could not be verified |
-| `Resolved` | Secret has been fully resolved |
-| `Ignored` | Secret is intentionally excluded from monitoring |
+| `Title` | Single line of text | Holds the App ID, not a descriptive title |
+| `AppName` | Single line of text | |
+| `SecretID` | Single line of text | The secret's key ID from Entra |
+| `SecretDescription` | Single line of text | |
+| `ExpirationDate` | Single line of text | Stored as a formatted string, not a native date column |
+| `ExpiryBucket` | Single line of text | P1 through P5, ExpiredManualReview, or Ignore |
+| `ExpiryNotice` | Single line of text | Human readable notice text, refreshed every run |
+| `AlertStatus` | Single line of text | See the status lifecycle below |
+| `AppOwners` | Single line of text | Stamped automatically by discovery from Entra. Reference only, does not gate anything |
+| `ManualAppOwners` | Single line of text | The actual gate. A person fills this in, discovery never writes to it |
+| `ObjectID` | Single line of text | The app's Entra object ID, not its App ID |
+| `TenantID` | Single line of text | Which of the configured tenants this app actually lives in |
+| `TenantName` | Single line of text | |
+| `JiraTicketKey` | Single line of text | |
+| `JiraTicketCreatedDate` | Single line of text | |
+| `AlertSentDate` | Single line of text | |
+| `LastChecked` | Single line of text | Refreshed on every run that touches this row |
+| `AlertHistory` | Multiple lines of text | A running log of escalation events for this row |
+| `RotationDetectedDate` | Single line of text | |
+| `NewSecretKeyId` | Single line of text | Set once rotation creates a new secret |
+| `NewSecretVaultName` | Single line of text | Which Key Vault entry holds the newly rotated value |
 
 <Callout type="warning">
-  A typo in any choice value will cause incorrect system behaviour.
-  The system checks these values by exact string match.
+  `ManualAppOwners` is the only column that decides whether a secret gets monitored or rotated
+  at all. `AppOwners` looks similar and is easy to confuse with it, but it is only a reference
+  column, auto filled from Entra, and it does not gate anything.
 </Callout>
 
-### Index the AlertStatus column
+### Create SecretAlertRegistryBackup
 
-Required before the rotation runbook's OData filtering will work. Without indexing,
-SharePoint rejects filter queries with HTTP 400.
+Same columns as `SecretAlertRegistry`, including `ManualAppOwners`, plus two extra:
 
-**SharePoint → SecretAlertRegistry → List settings → Indexed columns → Create a new index**
+| Column name | Type |
+|-------------|------|
+| `OriginalItemId` | Single line of text |
+| `BackupRunDate` | Single line of text |
 
-- Primary column: `AlertStatus`
-- Click **Create**
+### Create IgnoredSecretRegistry
 
-### Enable versioning for audit trail
+A separate custom list, different column set:
 
-Versioning keeps a history of every change made to each row — useful for debugging
-and compliance.
+| Column name | Type | Notes |
+|-------------|------|-------|
+| `Title` | Single line of text | App ID |
+| `AppName` | Single line of text | |
+| `SecretID` | Single line of text | |
+| `SecretDescription` | Single line of text | |
+| `ExpirationDate` | Single line of text | |
+| `DaysExpired` | Number | |
+| `TenantID` | Single line of text | |
+| `TenantName` | Single line of text | |
+| `LoggedDate` | Single line of text | |
+| `IgnoreReason` | Single line of text | Set to a short note explaining why this secret was moved here |
 
-**SharePoint → SecretAlertRegistry → Settings (gear) → List settings → Versioning settings**
+### Create IgnoredSecretRegistryBackup
 
-- Create a version each time you edit: **Yes**
-- Keep the following number of versions: **50**
-- Click **OK**
+Same columns as `IgnoredSecretRegistry`, plus the same two extras as the other backup list:
+`OriginalItemId` and `BackupRunDate`.
 
 </Steps>
 
 ---
 
-## How the AppOwners column works
+## Status lifecycle
 
-The `AppOwners` column is the key to the ownership model. The discovery runbook reads
-every App Registration's owners from Entra ID and stamps them here as a comma-separated string.
+`AlertStatus` on `SecretAlertRegistry` moves through these values over a secret's life:
 
 ```
-App Registration: payments-service
-Entra owners: vijayanand@contoso.com, azure-secretgovernance-cross-tenant
-
-Discovery stamps to SharePoint:
-  AppOwners = "vijayanand@contoso.com, azure-secretgovernance-cross-tenant"
+Discovered
+   |
+   v
+JiraRaised  or  TeamsAlerted  or  Escalated  or  CriticalTagged
+   |  (depends on bucket, see the runbooks page for which bucket maps to which)
+   v
+RotatedPendingDeployment
+   |
+   v
+Rotated
 ```
 
-The monitoring and rotation runbooks then filter SharePoint rows by this column —
-only rows where `AppOwners` contains the value in the `OWNER-EMAIL` Key Vault secret
-are actioned. Everything else is skipped.
+Two statuses sit outside that normal flow, set only by the Jira automation rule, not by
+discovery, monitoring, or rotation:
+
+| Status | What it means |
+|--------|---------------|
+| `Blocked` | The Jira ticket is Blocked. Monitoring pauses alerts and escalation on this row until the ticket moves to a different status |
+| `AwaitingReporter` | The Jira ticket is Awaiting Reporter. Same pause behavior as Blocked |
+
+And two more that only appear if something needed manual attention:
+
+| Status | What it means |
+|--------|---------------|
+| `JiraClosed-Unverified` | The Jira ticket closed, but rotation could not confirm the secret was actually deployed. Needs a person to check |
+| `Ignored` | The Jira ticket was Canceled. The secret is no longer being tracked |
 
 <Callout type="info">
-  If `AppOwners` is blank for a row, that secret will never be monitored or rotated
-  until an admin fills it in. The discovery runbook runs weekly and will re-stamp
-  it automatically if the App Registration gains an owner in Entra.
+  Blocked and AwaitingReporter are not dead ends. Once the underlying Jira ticket moves to a
+  different status again, monitoring resumes on that row automatically, on its next run.
 </Callout>
 
 ---
 
-## AlertStatus lifecycle
+## How a secret moves between the two working lists
 
-Every secret row follows this lifecycle:
+Nothing in this system deletes a secret's history outright. A secret can move from
+`SecretAlertRegistry` into `IgnoredSecretRegistry`, and back again, depending on what actually
+happens to it.
 
-```
-Discovery runs
-      ↓
-AlertStatus = Discovered
-      ↓
-Monitoring runs
-      ↓
-P3 → JiraRaised
-P2 → TeamsAlerted
-P1 → Escalated
-      ↓
-Rotation runs
-      ↓
-AlertStatus = RotatedPendingDeployment
-NewSecretKeyId = <new key GUID>
-NewSecretVaultName = <KV secret name>
-      ↓
-Engineer deploys new secret
-Resolves Jira ticket
-      ↓
-Jira webhook fires → /jira-webhook
-      ↓
-AlertStatus = Rotated
-SecretRotationDetectedDate = today
-```
+**Into `IgnoredSecretRegistry`:** once a secret has been expired for 8 or more days, monitoring
+checks whether there is still a live Jira ticket for it. If there is no ticket at all, or the
+ticket has been Canceled, the row is moved. If there is still an open ticket in In Progress, To
+Do, Blocked, or Awaiting Reporter, the row stays in `SecretAlertRegistry` instead, marked
+clearly as overdue.
+
+**Back into `SecretAlertRegistry`:** if a secret sitting in `IgnoredSecretRegistry` shows up in
+a later discovery run with a later expiry date, meaning someone renewed it in Entra, discovery
+creates a fresh row for it in `SecretAlertRegistry` and removes the old row from
+`IgnoredSecretRegistry`.
 
 ---
 
-## SharePoint views to create
+## Grant the App Registration access to this site
 
-Create these filtered views to make the list easier to work with:
-
-| View name | Filter | Purpose |
-|-----------|--------|---------|
-| **Needs Action** | AlertStatus = Discovered | Newly discovered secrets not yet processed |
-| **Critical Secrets** | SeverityLevel = P1 | Secrets expiring within 7 days |
-| **Expiring This Month** | SeverityLevel = P2 or P3 | Secrets expiring within 30–60 days |
-| **Pending Deployment** | AlertStatus = RotatedPendingDeployment | Rotated but not yet deployed |
-| **All Items** | None | Full list — all secrets all statuses |
+The App Registration used for Graph access needs to be explicitly granted access to this
+specific site, since it uses the `Sites.Selected` permission rather than a tenant wide grant.
+See the infrastructure setup page for the exact Graph Explorer steps. That single grant covers
+all four lists described here, since it is a site level permission, not one you repeat per
+list.
 
 ---
 
-## Get all column internal names
+## Finding your list IDs
 
-To verify internal names of all columns in your list, run this in Graph Explorer:
+Every Key Vault secret that points at one of these lists needs the list's actual ID, not its
+name. Get it with:
 
-```
-GET https://graph.microsoft.com/v1.0/sites/<SITE_ID>/lists/<LIST_ID>/columns?$select=name,displayName
-```
-
-This returns every column's `name` (internal API name) and `displayName` (what you see in SharePoint).
-
----
-
-## Clean up all rows (reset)
-
-To fully reset the SharePoint list — for example before a fresh test run — use the
-`runbook_cleanup_sharepoint.py` runbook:
-
-```
-Azure Portal → Automation Account → Runbooks
-→ runbook_cleanup_sharepoint → Start
+```powershell
+az rest --method GET --uri "https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/lists?`$select=id,displayName" --output json
 ```
 
-After cleanup, run `runbook_discovery` immediately to repopulate the list.
+This returns every list on the site with its `id` and `displayName`. Match the `displayName` to
+the list you want and copy its `id` into the matching Key Vault secret.
 
-<Callout type="warning">
-  This permanently deletes all rows. Only run it on a test environment or when
-  you intentionally want to start fresh.
+<Callout type="info">
+  If you are on Windows PowerShell rather than Bash, the backtick before `$select` is required,
+  Graph OData query parameters otherwise get mangled by PowerShell's own variable expansion.
 </Callout>
 
 ---
 
-## Troubleshooting
+## Verifying row counts match across a list and its backup
 
-| Error | Cause | Fix |
-|-------|-------|-----|
-| `HTTP 403` on SharePoint | App Registration not granted site access | Run the Graph Explorer POST to grant site permissions |
-| `HTTP 400` on SharePoint | Wrong `SHAREPOINT-SITE-ID` format | Use full 3-part composite ID — not the Web ID |
-| `Field not recognized` error | Column internal name mismatch | Run the GET columns query to verify internal names |
-| `AlertStatus` filter failing | Column not indexed | Index the AlertStatus column in List settings |
-| `AppOwners` blank after discovery | App Registration not listed as Entra owner | Add App Registration as owner on the App Registration in Entra |
-| Rows not actioned by monitoring | `OWNER-EMAIL` doesn't match `AppOwners` | Ensure `OWNER-EMAIL` in Key Vault matches the App Registration display name exactly |
+Useful after a discovery run, to confirm nothing was lost or duplicated. Since SharePoint's
+Graph endpoint for list items does not support `$count` directly, page through and count:
+
+```powershell
+az rest --method GET --uri "https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/lists/<LIST_ID>/items?`$select=id&`$top=999" --output json > items.json
+(Get-Content items.json | ConvertFrom-Json).value.Count
+```
+
+If the count comes back as exactly 999, there is a further page. Check for `@odata.nextLink` in
+`items.json` and follow it the same way, adding its count to the first page's.
