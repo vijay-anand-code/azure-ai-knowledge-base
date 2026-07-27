@@ -92,13 +92,29 @@ Changes vs v3:
        them — final summary now reconciles Graph's raw count against what
        was actually processed, with a warning if the numbers don't match.
 
+  5. FULL-HISTORY BACKUP BEFORE EACH RUN
+       At the start of every run, the CURRENT state of SecretAlertRegistry
+       (as it exists BEFORE this run's changes) is copied in full to a
+       separate SecretAlertRegistryBackup list, tagged with a BackupRunDate
+       and OriginalItemId. Every run's backup is APPENDED, never overwritten
+       or deleted — full historical audit trail, so any run's pre-change
+       state can be inspected or restored from later if something goes wrong.
+
+  6. PARTIAL FIELD UPDATES ON EXISTING ROWS
+       Updates to existing SecretAlertRegistry rows now only PATCH fields
+       that actually changed compared to the row's current stored values —
+       not a blind resend of every field on every run. Reduces unnecessary
+       writes and makes AlertHistory/audit trails more meaningful (a PATCH
+       with no real changes no longer touches LastChecked-adjacent fields
+       needlessly).
+
   (v3 changes retained: parallel owner fetch, Graph $batch writes, retry
    on transient errors, all-secrets-included discovery.)
 
 Purpose : Scans ALL App Registrations from Entra ID, fetches owners in
-          parallel, classifies ALL secrets by expiry bucket (including P4),
-          batch-writes active rows to SecretAlertRegistry, and batch-writes
-          ignored rows (expired 8+ days) to IgnoredSecretRegistry.
+          parallel, classifies ALL secrets by expiry bucket, batch-writes
+          active rows (P1-P4, EMR — NOT P5) to SecretAlertRegistry, and
+          batch-writes ignored rows (expired 8+ days) to IgnoredSecretRegistry.
 
 Schedule: Weekly — 30 minutes before monitoring runbook.
           Also run manually when new App Registrations are added.
@@ -106,8 +122,8 @@ Schedule: Weekly — 30 minutes before monitoring runbook.
 What it does:
   1. Fetches ALL App Registrations + secrets from Entra ID
   2. For each app — fetches owners in parallel (ThreadPoolExecutor)
-  3. Classifies each secret into P1/P2/P3/P4/EMR/Ignore bucket
-  4. Batch-writes ACTIVE rows (P1-P4, EMR) to SecretAlertRegistry:
+  3. Classifies each secret into P1/P2/P3/P4/P5/EMR/Ignore bucket
+  4. Batch-writes ACTIVE rows (P1-P4, EMR — NOT P5) to SecretAlertRegistry:
        - New secret  → creates row with AlertStatus = Discovered
        - Existing row → updates AppOwners + ExpiryBucket + ExpirationDate
   5. Batch-writes IGNORED rows (expired 8+ days) to IgnoredSecretRegistry
@@ -119,10 +135,132 @@ Required Automation Variables:
   UAMI_CLIENT_ID  — User-assigned Managed Identity client ID
 
 Required Key Vault secrets:
-  GRAPH-TENANT-ID            — Azure tenant ID
+  GRAPH-TENANT-ID            — Azure tenant ID (home tenant identifier)
+  HOME-TENANT-ID             — Tenant where SharePoint actually lives.
+                                Falls back to GRAPH-TENANT-ID if not set —
+                                only needs to be explicitly set if it ever
+                                differs from GRAPH-TENANT-ID.
   SHAREPOINT-SITE-ID         — SharePoint site composite ID
   SHAREPOINT-LIST-ID         — SecretAlertRegistry list ID
   SHAREPOINT-IGNORED-LIST-ID — IgnoredSecretRegistry list ID (NEW in v4)
+  SHAREPOINT-BACKUP-LIST-ID  — SecretAlertRegistryBackup list ID (NEW in v5)
+  SHAREPOINT-IGNORED-BACKUP-LIST-ID — IgnoredSecretRegistryBackup list ID
+                                (NEW in v10). Falls back to skipping the
+                                Ignored-list backup (with a warning) if not
+                                set — same hard-gate-on-missing behavior as
+                                SHAREPOINT-BACKUP-LIST-ID.
+  CROSS-TENANT-TENANT-IDS    — Comma-separated list of tenant IDs to scan
+                                for App Registrations (NEW in v8, plural).
+                                e.g. "70afdd80-...,44458580-...". Falls back
+                                to the old singular CROSS-TENANT-TENANT-ID
+                                if not set, for backwards compatibility with
+                                existing single-tenant deployments.
+
+Changes in v10:
+  1. P5 NOW WRITTEN TO IgnoredSecretRegistry (not console-log-only)
+       Previously P5 (61+ days, safe) was counted and logged to console
+       only — no SharePoint row anywhere. Now P5 secrets are batch-written
+       to IgnoredSecretRegistry alongside the existing Ignore-bucket
+       (expired 8+ days ago) rows, tagged with an IgnoreReason field so
+       the two cases stay distinguishable ("P5-Safe" vs "Expired8Plus").
+       This gives a complete, queryable picture of every secret NOT in
+       SecretAlertRegistry — needed to reconcile total secret/app counts
+       against a manual Entra CLI count (see reconciliation totals below).
+
+  2. ManualAppOwners COLUMN — READ-ONLY, NEVER TOUCHED BY DISCOVERY
+       A new SecretAlertRegistry column, ManualAppOwners, holds owner
+       names admins fill in by hand for LangChain/rotation runbook use.
+       Discovery NEVER writes to this column on new rows (left absent
+       from the fields dict entirely, not even set to "") and NEVER
+       includes it in the diff/PATCH logic for existing rows — it is
+       simply excluded from every candidate_fields dict discovery builds.
+       This guarantees a manually-filled value can never be silently
+       clobbered by a discovery run, no matter what Entra reports for
+       the auto-fetched AppOwners column.
+
+  3. RECOVERY: IGNORED/P5 ITEM RE-ENTERING AN ACTIVE BUCKET
+       If a secret currently sitting in IgnoredSecretRegistry (either as
+       a P5-Safe or Expired8Plus row) is reclassified this run into an
+       active bucket (P1-P4, ExpiredManualReview) — e.g. its endDateTime
+       was extended in Entra — the runbook now:
+         a. Deletes the matching row(s) from IgnoredSecretRegistry
+         b. Creates a FRESH row for it in SecretAlertRegistry (this is
+            always a CREATE, never a PATCH, since the secret has no
+            existing SecretAlertRegistry row while it lived in Ignored —
+            ManualAppOwners is therefore blank on this new row, exactly
+            like any other brand-new secret, and is left for an admin to
+            fill in same as always)
+       Matching between IgnoredSecretRegistry rows and Entra secrets is
+       done the same way as SecretAlertRegistry: by (Title=appId,
+       SecretID) composite key.
+
+  4. BACKUP NOW COVERS BOTH LISTS
+       SecretAlertRegistryBackup previously snapshotted only
+       SecretAlertRegistry before each run's changes. It now ALSO
+       snapshots IgnoredSecretRegistry's pre-run state into a second
+       backup list, IgnoredSecretRegistryBackup, using the same
+       allowlist-based field-copy approach and the same hard-gate rule
+       (if either backup list isn't configured or either backup write
+       fails, the ENTIRE run aborts before touching either master list).
+
+  5. BACKUP ROTATION — KEEP ONLY THE LATEST RUN'S BACKUP
+       Previously every run's backup rows were appended forever, growing
+       both backup lists without bound. Now, immediately BEFORE writing
+       this run's backup rows, ALL existing rows in
+       SecretAlertRegistryBackup and IgnoredSecretRegistryBackup (from
+       any prior run) are deleted. Only the most recent run's pre-change
+       snapshot is ever kept — this is a deliberate tradeoff (no deep
+       multi-run history) in exchange for the backup lists never growing
+       unbounded. If a restore is ever needed, it must happen before the
+       NEXT discovery run overwrites it.
+
+  6. EXPLICIT RECONCILIATION TOTALS IN SUMMARY OUTPUT
+       The end-of-run summary now prints standalone "Total unique App
+       Registrations scanned" and "Total secrets seen in Graph" lines,
+       separate from the bucket breakdown, so they can be diffed directly
+       against a manual `az ad app list` / Graph CLI count without doing
+       any mental arithmetic across the bucket table.
+
+Changes in v9:
+  - P5 (61+ DAYS, SAFE) NO LONGER WRITTEN TO SecretAlertRegistry
+    Previously, discovery wrote ALL buckets including P5 to the main
+    registry — by original design, so the full picture (with owners
+    stamped) was visible in one place. In practice this cluttered
+    SecretAlertRegistry with hundreds of rows needing no action for
+    months (98+, 300+ days remaining), which matches the noise that
+    IgnoredSecretRegistry was built to avoid on the other end of the
+    timeline. P5 secrets are now counted (p5LoggedOnly) and logged to
+    console output only, matching decision_engine.py's existing P5
+    behavior — no SharePoint row is created or updated for them at all.
+
+Changes in v8:
+  - MULTI-TENANT SCANNING
+    Discovery now scans MULTIPLE tenants' App Registrations in a single
+    run, not just one. CROSS_TENANT_TENANT_IDS (plural, comma-separated)
+    replaces the old singular CROSS_TENANT_TENANT_ID. The SAME App
+    Registration (CROSS_TENANT_APP_ID) must be a multitenant app,
+    individually granted admin consent in each tenant listed. A separate
+    ClientAssertionCredential is built per tenant; each app fetched is
+    tagged with a '_sourceTenantId' key so owner lookups and TenantID/
+    TenantName fields correctly reflect which tenant each app actually
+    lives in — not just the home tenant. A failure fetching one tenant
+    logs an error but does not abort scanning the remaining tenants.
+    SharePoint writes remain single-tenant (home tenant), unchanged.
+
+Changes in v7:
+  - SEPARATE TOKEN SCOPING FOR ENTRA VS SHAREPOINT (critical fix)
+    Previously, ALL Graph calls (both scanning App Registrations AND
+    writing to SharePoint) shared one credential scoped to
+    CROSS_TENANT_TENANT_ID. This broke the moment CROSS_TENANT_TENANT_ID
+    was pointed at a genuinely different tenant to scan that tenant's App
+    Registrations — every SharePoint call then also got scoped to that
+    tenant, which may not even have a SharePoint license ("Tenant does
+    not have a SPO license" error). Now uses TWO separate credentials:
+    one for Entra scanning (follows CROSS_TENANT_TENANT_ID, changes when
+    testing cross-tenant discovery) and one for SharePoint (ALWAYS scoped
+    to HOME_TENANT_ID, regardless of what's being scanned). This is what
+    makes genuine cross-tenant App Registration scanning actually work
+    while still writing results back to the same home-tenant SharePoint.
 
 Required Entra ID permissions (on the cross-tenant App Registration used
 for the federated Graph credential):
@@ -150,6 +288,7 @@ import urllib.error
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import automationassets
@@ -213,6 +352,24 @@ except Exception as exc:
     log.warning("SHAREPOINT-IGNORED-LIST-ID not set — ignored secrets will NOT "
                 "be logged to a separate list this run: %s", exc)
 
+# NEW in v5 — backup list. Falls back gracefully — backup is skipped (with a
+# warning) rather than failing the entire discovery run if not provisioned.
+try:
+    SHAREPOINT_BACKUP_LIST_ID = _kv_get("SHAREPOINT-BACKUP-LIST-ID")
+except Exception as exc:
+    SHAREPOINT_BACKUP_LIST_ID = ""
+    log.warning("SHAREPOINT-BACKUP-LIST-ID not set — pre-run backup will NOT "
+                "be taken this run: %s", exc)
+
+# NEW in v10 — backup list for IgnoredSecretRegistry. Same graceful-fallback
+# pattern as SHAREPOINT_BACKUP_LIST_ID above.
+try:
+    SHAREPOINT_IGNORED_BACKUP_LIST_ID = _kv_get("SHAREPOINT-IGNORED-BACKUP-LIST-ID")
+except Exception as exc:
+    SHAREPOINT_IGNORED_BACKUP_LIST_ID = ""
+    log.warning("SHAREPOINT-IGNORED-BACKUP-LIST-ID not set — pre-run backup of "
+                "IgnoredSecretRegistry will NOT be taken this run: %s", exc)
+
 log.info("Config secrets loaded.")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,11 +415,58 @@ def _patch_retry(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
     return _http_with_retry("PATCH", url, {**hdrs, "Content-Type": "application/json"}, body, timeout)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
+# GRAPH TOKEN — TWO SEPARATE CREDENTIALS, TWO SEPARATE PURPOSES
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICAL: this runbook talks to Graph for two entirely different reasons,
+# and they must NOT share a token scope:
+#
+#   1. Entra App Registration scanning (fetch_all_applications, owners)
+#      → must be scoped to EACH tenant in CROSS_TENANT_TENANT_IDS (plural —
+#        this runbook now scans MULTIPLE tenants in one run, not just one).
+#
+#   2. SharePoint reads/writes (SecretAlertRegistry, IgnoredSecretRegistry,
+#      SecretAlertRegistryBackup)
+#      → must ALWAYS be scoped to the HOME tenant, where SHAREPOINT_SITE_ID
+#        actually lives — completely independent of whichever tenant(s) are
+#        currently being scanned for App Registrations.
+#
+# MULTI-TENANT SUPPORT: CROSS_TENANT_TENANT_IDS is a comma-separated list of
+# tenant IDs (e.g. "70afdd80-...,44458580-..."). The SAME App Registration
+# (CROSS_TENANT_APP_ID) must be a multitenant app, individually consented
+# (admin consent) into each tenant listed here — see the admin-consent URL
+# pattern documented in runbook-rotation.mdx for how that's done per tenant.
+# One ClientAssertionCredential is built per tenant (a credential is bound
+# to a single tenant_id at construction time), and discovery loops through
+# all of them, merging results before the single home-tenant SharePoint
+# write phase.
 # ─────────────────────────────────────────────────────────────────────────────
 
-CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
-CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+CROSS_TENANT_APP_ID = _kv_get("CROSS-TENANT-APP-ID")
+
+# NEW — plural, comma-separated. Falls back to the old singular
+# CROSS-TENANT-TENANT-ID secret if the plural one isn't set yet, so
+# existing single-tenant deployments keep working with zero config changes.
+try:
+    _tenant_ids_raw = _kv_get("CROSS-TENANT-TENANT-IDS")
+except Exception:
+    _tenant_ids_raw = _kv_get("CROSS-TENANT-TENANT-ID")
+    log.info("CROSS-TENANT-TENANT-IDS not set — falling back to singular "
+             "CROSS-TENANT-TENANT-ID for backwards compatibility.")
+
+CROSS_TENANT_TENANT_IDS = [t.strip() for t in _tenant_ids_raw.split(",") if t.strip()]
+log.info("Configured to scan %d tenant(s): %s", len(CROSS_TENANT_TENANT_IDS), CROSS_TENANT_TENANT_IDS)
+
+# HOME_TENANT_ID — the tenant where SharePoint/SHAREPOINT_SITE_ID actually
+# lives. Falls back to GRAPH_TENANT_ID (already loaded above, and always
+# meant to represent the home/primary tenant) if a dedicated secret isn't
+# set — this keeps existing single-tenant deployments working with zero
+# config changes, since GRAPH_TENANT_ID has always been the home tenant.
+try:
+    HOME_TENANT_ID = _kv_get("HOME-TENANT-ID")
+except Exception:
+    HOME_TENANT_ID = GRAPH_TENANT_ID
+    log.info("HOME-TENANT-ID not set — falling back to GRAPH-TENANT-ID (%s) "
+             "as the home tenant for SharePoint operations.", GRAPH_TENANT_ID)
 
 _uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
 
@@ -270,18 +474,47 @@ def _get_uami_assertion() -> str:
     token = _uami_credential.get_token("api://AzureADTokenExchange")
     return token.token
 
-_graph_credential = ClientAssertionCredential(
-    tenant_id = CROSS_TENANT_TENANT_ID,
+# One credential PER tenant being scanned — a ClientAssertionCredential is
+# bound to a single tenant_id at construction, so multi-tenant support
+# means building one of these per tenant, not reusing a single instance.
+_graph_credentials_by_tenant: dict[str, ClientAssertionCredential] = {
+    tenant_id: ClientAssertionCredential(
+        tenant_id = tenant_id,
+        client_id = CROSS_TENANT_APP_ID,
+        func      = _get_uami_assertion,
+    )
+    for tenant_id in CROSS_TENANT_TENANT_IDS
+}
+
+# Credential for SharePoint — ALWAYS scoped to the home tenant, regardless
+# of which tenant(s) are being scanned for App Registrations. Same app
+# registration (CROSS_TENANT_APP_ID), same UAMI trust — just a different
+# tenant_id parameter, since that's what determines which directory the
+# resulting token is valid for.
+_sp_graph_credential = ClientAssertionCredential(
+    tenant_id = HOME_TENANT_ID,
     client_id = CROSS_TENANT_APP_ID,
     func      = _get_uami_assertion,
 )
 
-def _graph_token() -> str:
-    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+def _graph_token_for_tenant(tenant_id: str) -> str:
+    """Token scoped to a SPECIFIC tenant being scanned for App Registrations."""
+    credential = _graph_credentials_by_tenant[tenant_id]
+    token = credential.get_token("https://graph.microsoft.com/.default")
     return token.token
 
-def _auth_hdrs() -> dict:
-    return {"Authorization": f"Bearer {_graph_token()}"}
+def _sp_graph_token() -> str:
+    """Token ALWAYS scoped to the HOME tenant — use for every SharePoint call."""
+    token = _sp_graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
+
+def _auth_hdrs_for_tenant(tenant_id: str) -> dict:
+    """Auth header for Entra/App-Registration-scanning Graph calls, for a SPECIFIC tenant."""
+    return {"Authorization": f"Bearer {_graph_token_for_tenant(tenant_id)}"}
+
+def _sp_auth_hdrs() -> dict:
+    """Auth header for SharePoint Graph calls — ALWAYS home tenant."""
+    return {"Authorization": f"Bearer {_sp_graph_token()}"}
 
 def get_tenant_name() -> str:
     """Returns tenant ID as the tenant identifier — no extra Graph permission needed."""
@@ -294,12 +527,20 @@ def get_tenant_name() -> str:
 def _classify_bucket(days: int) -> str:
     """
     Classify a secret into an expiry bucket based on days remaining.
-    All buckets including P4 are written to SharePoint (Ignore → separate list).
+    All buckets are classified; P5 (61+ days, safe) is logged only and NOT
+    written to SecretAlertRegistry (Ignore → separate list; P5 → console log only).
+
+    P1  0-3 days   CRITICAL     (most urgent)
+    P2  4-7 days   CRITICAL
+    P3  8-30 days  WARNING
+    P4  31-60 days INFORMATION
+    P5  61+ days   SAFE
     """
-    if days > 60:    return "P4"                  # safe — 61+ days
-    if days >= 31:   return "P3"                  # info — 31-60 days
-    if days >= 8:    return "P2"                  # warning — 8-30 days
-    if days >= 0:    return "P1"                  # critical — 0-7 days
+    if days > 60:    return "P5"                  # safe — 61+ days
+    if days >= 31:   return "P4"                  # info — 31-60 days
+    if days >= 8:    return "P3"                  # warning — 8-30 days
+    if days >= 4:    return "P2"                  # critical — 4-7 days
+    if days >= 0:    return "P1"                  # critical — 0-3 days
     if days >= -7:   return "ExpiredManualReview" # expired 1-7 days ago
     return "Ignore"                               # expired 8+ days ago
 
@@ -341,15 +582,40 @@ def _parse_graph_datetime(expiry_str: str) -> datetime:
         expiry_str = expiry_str[:match.start()] + '.' + frac + expiry_str[match.end():]
     return datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
 
+# US Eastern time — auto-handles EST/EDT daylight saving transitions.
+# All timestamps written to SharePoint (LastChecked, ExpirationDate,
+# BackupRunDate, LoggedDate, etc.) are displayed in this timezone.
+_EASTERN_TZ = ZoneInfo("America/New_York")
+
+def _format_datetime_est(dt: datetime) -> str:
+    """
+    Formats a datetime (assumed timezone-aware, or naive-UTC if not) as a
+    12-hour clock string in US Eastern time, with AM/PM — no ISO 8601
+    letters (no 'T', no 'Z'). Example: "2026-07-22 07:50:53 AM".
+
+    zoneinfo's America/New_York automatically applies EST (UTC-5) or EDT
+    (UTC-4) depending on the date — no manual DST handling needed.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    eastern_dt = dt.astimezone(_EASTERN_TZ)
+    return eastern_dt.strftime("%Y-%m-%d %I:%M:%S %p")
+
+def _now_est_string() -> str:
+    """Current moment, formatted per _format_datetime_est — used for
+    LastChecked, BackupRunDate, LoggedDate, and other 'as of now' fields."""
+    return _format_datetime_est(datetime.now(timezone.utc))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Fetch ALL App Registrations from Entra ID
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_all_applications() -> list[dict]:
+def fetch_all_applications_for_tenant(tenant_id: str) -> list[dict]:
     """
-    Fetches ALL App Registrations from Entra ID including all secrets.
-    No filtering — discovery classifies every secret; the Ignore bucket
-    is routed to a separate list rather than dropped.
+    Fetches ALL App Registrations from a SPECIFIC tenant's Entra ID,
+    including all secrets. No filtering — discovery classifies every
+    secret; the Ignore bucket is routed to a separate list rather than
+    dropped.
     """
     url = (
         "https://graph.microsoft.com/v1.0/applications"
@@ -358,94 +624,112 @@ def fetch_all_applications() -> list[dict]:
     )
 
     apps: list[dict] = []
+    hdrs = _auth_hdrs_for_tenant(tenant_id)
     while url:
-        b = _get(url, _auth_hdrs(), timeout=30)
+        b = _get(url, hdrs, timeout=30)
         apps.extend(b.get("value", []))
         url = b.get("@odata.nextLink")
 
-    log.info("Fetched %d App Registrations from Entra ID", len(apps))
+    log.info("Fetched %d App Registrations from tenant %s", len(apps), tenant_id)
     return apps
+
+def fetch_all_applications_all_tenants() -> list[dict]:
+    """
+    Loops through every tenant in CROSS_TENANT_TENANT_IDS, fetching all App
+    Registrations from each. Each app dict gets a '_sourceTenantId' key
+    added so downstream code (owner fetching, which also needs the correct
+    per-tenant token) knows which tenant it came from.
+
+    A failure fetching ONE tenant does not abort the whole run — it's
+    logged and that tenant contributes zero apps, but other tenants still
+    get scanned. This matters for multi-tenant reliability: a temporary
+    issue with one client's tenant (revoked consent, expired trust, etc.)
+    shouldn't block discovery for every other tenant.
+    """
+    all_apps: list[dict] = []
+    tenant_errors: list[str] = []
+
+    for tenant_id in CROSS_TENANT_TENANT_IDS:
+        try:
+            apps = fetch_all_applications_for_tenant(tenant_id)
+            for app in apps:
+                app["_sourceTenantId"] = tenant_id
+            all_apps.extend(apps)
+        except Exception as e:
+            tenant_errors.append(f"Tenant {tenant_id}: fetch_all_applications failed: {e}")
+            log.error("Failed to fetch applications from tenant %s: %s", tenant_id, e)
+
+    log.info("Fetched %d total App Registrations across %d tenant(s)",
+             len(all_apps), len(CROSS_TENANT_TENANT_IDS))
+    return all_apps, tenant_errors
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Fetch owners for one App Registration (called in parallel)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_app_owners(object_id: str) -> str:
+def fetch_app_owners(object_id: str, tenant_id: str) -> str:
     """
-    Fetches owners of an App Registration using its object ID.
-    Returns a comma-separated string of owner identifiers.
+    Fetches owners of an App Registration using its object ID, scoped to
+    the SPECIFIC tenant this app lives in.
+    Returns a single comma-separated string of display names — both User
+    owners and Service Principal/Managed Identity owners are represented
+    by their display name (e.g. "Vijay Anand, Subash Kumar, azure-secretgovernance-cross-tenant").
 
-    FORMAT: User owners are stored as "DisplayName <email>" (e.g.
-    "Vijay Anand <vijayanand@vijayinfra.click>") — this keeps the
-    SharePoint column human-readable (so an admin glancing at it can
-    tell who "M" is) while still containing the raw email as a
-    substring, which decision_engine.py and runbook_rotation.py rely
-    on for ownership matching:
-        if not any(email in app_owners for email in effective_owners):
-    That match is a plain substring check against app_owners.lower(),
-    so as long as the email appears anywhere in the stored string —
-    regardless of what else surrounds it — matching still works
-    correctly. Do not remove the email or the ownership filter will
-    silently stop matching this app's rows.
+    OWNERSHIP MATCHING: decision_engine.py and runbook_rotation.py match
+    ownership by NAME now (not email) — OWNER-EMAILS in Key Vault should
+    be configured with display names, e.g. "Vijay Anand, Subash Kumar",
+    and the substring match (`if name in app_owners`) works the same way
+    it always did, just against names instead of emails.
     """
     url = f"https://graph.microsoft.com/v1.0/applications/{object_id}/owners"
     try:
-        b      = _get(url, _auth_hdrs(), timeout=15)
+        b      = _get(url, _auth_hdrs_for_tenant(tenant_id), timeout=15)
         owners = b.get("value", [])
 
-        owner_list = []
+        names: list[str] = []
+
         for owner in owners:
             odata_type = owner.get("@odata.type", "").lower()
 
             if "user" in odata_type:
-                # User owner — need BOTH display name (for humans reading
-                # the SharePoint column) AND email (for ownership matching
-                # in decision_engine.py / runbook_rotation.py). Format:
-                # "Vijay Anand <vijayanand@vijayinfra.click>"
-                email = owner.get("userPrincipalName") or owner.get("mail")
                 name  = owner.get("displayName", "")
-                if email and name:
-                    owner_list.append(f"{name} <{email}>")
+                email = owner.get("userPrincipalName") or owner.get("mail")
+                if name:
+                    names.append(name)
                 elif email:
-                    # No display name on record — email alone still works
-                    # for matching, just less readable.
-                    owner_list.append(email)
+                    # No display name on record — email is still a usable
+                    # identifier, better than leaving this owner out entirely.
+                    names.append(email)
                 else:
-                    # Genuinely no email on this user record — flag it
-                    # explicitly rather than silently substituting a name
-                    # that would look fine but break ownership matching.
-                    fallback_name = name or owner.get("id", "unknown")
+                    fallback = owner.get("id", "unknown")
                     log.warning(
-                        "User owner on app object_id=%s has no userPrincipalName/mail — "
-                        "displayName=%r. Flagging as NoEmail so it's visible, not silently dropped.",
-                        object_id, fallback_name,
+                        "User owner on app object_id=%s has no displayName/email — id=%r. "
+                        "Flagging as NoName so it's visible, not silently dropped.",
+                        object_id, fallback,
                     )
-                    owner_list.append(f"NoEmail:{fallback_name}")
+                    names.append(f"NoName:{fallback}")
 
             elif "serviceprincipal" in odata_type:
                 # Service Principal / Managed Identity — no email concept,
                 # displayName is the correct and only identifier.
                 name = owner.get("displayName", "")
                 if name:
-                    owner_list.append(name)
+                    names.append(name)
 
             else:
-                # @odata.type missing/unrecognised — try email+name first
-                # (in case it's actually a user Graph didn't tag), fall
-                # back to whichever single field is available.
-                email = owner.get("userPrincipalName") or owner.get("mail", "")
+                # @odata.type missing/unrecognised — try name, fall back
+                # to email if that's all that's available.
                 name  = owner.get("displayName", "")
-                if email and name:
-                    owner_list.append(f"{name} <{email}>")
+                email = owner.get("userPrincipalName") or owner.get("mail", "")
+                if name:
+                    names.append(name)
                 elif email:
-                    owner_list.append(email)
-                elif name:
-                    owner_list.append(name)
+                    names.append(email)
 
-        return ", ".join(owner_list)
+        return ", ".join(names)
 
     except Exception as e:
-        log.warning("fetch_app_owners failed for object_id %s: %s", object_id, e)
+        log.warning("fetch_app_owners failed for object_id %s (tenant %s): %s", object_id, tenant_id, e)
         return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -455,16 +739,22 @@ def fetch_app_owners(object_id: str) -> str:
 def fetch_all_owners_parallel(applications: list[dict]) -> dict[str, str]:
     """
     Fetches owners for all apps in parallel using a thread pool.
-    Returns a dict mapping object_id → owners_string.
+    Returns a dict mapping object_id → owners_string (display names only).
+
+    Each app dict must have '_sourceTenantId' set (added by
+    fetch_all_applications_all_tenants) so the correct per-tenant
+    credential is used — an app's owners must be looked up in the SAME
+    tenant the app itself lives in, not necessarily the home tenant.
     """
     results: dict[str, str] = {}
 
     def _fetch(app: dict) -> tuple[str, str]:
         object_id = app.get("id", "")
-        if not object_id:
+        tenant_id = app.get("_sourceTenantId", "")
+        if not object_id or not tenant_id:
             return object_id, ""
-        owners = fetch_app_owners(object_id)
-        return object_id, owners
+        names = fetch_app_owners(object_id, tenant_id)
+        return object_id, names
 
     log.info("Fetching owners for %d apps in parallel (%d workers)...",
              len(applications), OWNER_FETCH_WORKERS)
@@ -474,8 +764,8 @@ def fetch_all_owners_parallel(applications: list[dict]) -> dict[str, str]:
         futures = {pool.submit(_fetch, app): app for app in applications}
         for future in as_completed(futures):
             try:
-                object_id, owners = future.result()
-                results[object_id] = owners
+                object_id, names = future.result()
+                results[object_id] = names
             except Exception as e:
                 app = futures[future]
                 log.warning("Owner fetch failed for %s: %s",
@@ -491,10 +781,15 @@ def fetch_all_owners_parallel(applications: list[dict]) -> dict[str, str]:
 #          Build a lookup: (appId, secretId) → SharePoint item ID
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_existing_sp_rows() -> dict[tuple[str, str], str]:
+def get_existing_sp_rows() -> tuple[dict[tuple[str, str], str], list[dict]]:
     """
-    Returns a dict mapping (appId, secretId) → SharePoint item ID.
-    Used to avoid creating duplicate rows on subsequent discovery runs.
+    Returns:
+      - existing: dict mapping (appId, secretId) → SharePoint item ID
+                  (used to avoid creating duplicate rows)
+      - raw_items: the full list of raw SharePoint items as returned by Graph
+                  (id + all fields) — reused by build_backup_write_ops() so
+                  we don't need a second, redundant fetch of the same list
+                  just to build the pre-run backup.
     """
     url = (
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
@@ -502,9 +797,12 @@ def get_existing_sp_rows() -> dict[tuple[str, str], str]:
         f"?$expand=fields&$select=id,fields&$top=500"
     )
     existing: dict[tuple[str, str], str] = {}
+    raw_items: list[dict] = []
     while url:
-        b = _get(url, _auth_hdrs(), timeout=30)
-        for item in b.get("value", []):
+        b = _get(url, _sp_auth_hdrs(), timeout=30)
+        page_items = b.get("value", [])
+        raw_items.extend(page_items)
+        for item in page_items:
             f         = item.get("fields", {})
             app_id    = f.get("Title", "")
             secret_id = f.get("SecretID", "")
@@ -514,7 +812,278 @@ def get_existing_sp_rows() -> dict[tuple[str, str], str]:
         url = b.get("@odata.nextLink")
 
     log.info("Found %d existing rows in SecretAlertRegistry", len(existing))
-    return existing
+    return existing, raw_items
+
+def get_all_ignored_sp_rows() -> tuple[dict[tuple[str, str], str], list[dict]]:
+    """
+    Mirrors get_existing_sp_rows() but reads IgnoredSecretRegistry instead.
+
+    Returns:
+      - existing: dict mapping (appId, secretId) → SharePoint item ID
+                  (used in v10 to detect RECOVERY — a secret currently
+                  sitting in Ignored that has been reclassified this run
+                  into an active bucket, so its Ignored row must be
+                  deleted)
+      - raw_items: full raw SharePoint items — reused for the
+                  IgnoredSecretRegistryBackup snapshot, same pattern as
+                  raw_current_items for the active list.
+
+    Returns empty results (not an error) if SHAREPOINT_IGNORED_LIST_ID
+    isn't configured — callers should check that separately if they need
+    to distinguish "not configured" from "configured but empty".
+    """
+    if not SHAREPOINT_IGNORED_LIST_ID:
+        return {}, []
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_IGNORED_LIST_ID}/items"
+        f"?$expand=fields&$select=id,fields&$top=500"
+    )
+    existing: dict[tuple[str, str], str] = {}
+    raw_items: list[dict] = []
+    while url:
+        b = _get(url, _sp_auth_hdrs(), timeout=30)
+        page_items = b.get("value", [])
+        raw_items.extend(page_items)
+        for item in page_items:
+            f         = item.get("fields", {})
+            app_id    = f.get("Title", "")
+            secret_id = f.get("SecretID", "")
+            item_id   = item.get("id", "")
+            if app_id and secret_id and item_id:
+                existing[(app_id, secret_id)] = item_id
+        url = b.get("@odata.nextLink")
+
+    log.info("Found %d existing rows in IgnoredSecretRegistry", len(existing))
+    return existing, raw_items
+
+def purge_all_sp_rows(list_id: str, list_label: str) -> tuple[int, list[str]]:
+    """
+    NEW in v10 — deletes EVERY row currently in the given list. Used for
+    backup rotation: immediately before writing this run's fresh backup
+    snapshot, all rows from the PREVIOUS run's backup are wiped, so only
+    the latest run's snapshot ever exists (bounded list size, at the cost
+    of deeper backup history — see v10 changelog point 5).
+
+    Reads item IDs directly (no $expand=fields needed — we only need IDs
+    to delete) and issues DELETE via Graph $batch, same batching/retry
+    infrastructure as every other SharePoint write in this runbook.
+
+    Returns: (deleted_count, errors)
+    """
+    if not list_id:
+        return 0, []
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{list_id}/items?$select=id&$top=500"
+    )
+    item_ids: list[str] = []
+    while url:
+        b = _get(url, _sp_auth_hdrs(), timeout=30)
+        for item in b.get("value", []):
+            iid = item.get("id", "")
+            if iid:
+                item_ids.append(iid)
+        url = b.get("@odata.nextLink")
+
+    if not item_ids:
+        log.info("%s backup list already empty — nothing to purge.", list_label)
+        return 0, []
+
+    log.info("Purging %d prior-run row(s) from %s before writing new backup...",
+              len(item_ids), list_label)
+
+    base_url = f"/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items"
+    deleted  = 0
+    errors: list[str] = []
+
+    for chunk_start in range(0, len(item_ids), SP_BATCH_SIZE):
+        chunk = item_ids[chunk_start: chunk_start + SP_BATCH_SIZE]
+        batch_requests = [
+            {
+                "id":     str(i),
+                "method": "DELETE",
+                "url":    f"{base_url}/{iid}",
+            }
+            for i, iid in enumerate(chunk)
+        ]
+        try:
+            responses = _execute_sp_batch(batch_requests)
+            for resp in responses:
+                status = resp.get("status", 0)
+                if status in (200, 204, 404):
+                    # 404 = already gone — treat as successfully absent,
+                    # not an error, since the end goal (row not present)
+                    # is already satisfied.
+                    deleted += 1
+                else:
+                    errors.append(
+                        f"Purge DELETE failed [{status}] for item in {list_label}: "
+                        f"{str(resp.get('body', ''))[:150]}"
+                    )
+        except Exception as e:
+            errors.append(f"Purge batch chunk failed for {list_label}: {e}")
+
+        if chunk_start + SP_BATCH_SIZE < len(item_ids):
+            time.sleep(SP_BATCH_PAUSE)
+
+    log.info("Purged %d/%d rows from %s.", deleted, len(item_ids), list_label)
+    return deleted, errors
+
+def purge_stale_backup_rows(list_id: str, list_label: str, current_run_date: str) -> tuple[int, list[str]]:
+    """
+    NEW — write-then-purge safe version of backup rotation. Unlike
+    purge_all_sp_rows (which deletes EVERY row unconditionally, used by the
+    standalone cleanup_sharepoint*.py scripts for a genuine full reset),
+    this ONLY deletes rows whose BackupRunDate is NOT current_run_date —
+    i.e. rows from a PRIOR run's backup, never this run's own freshly
+    written rows.
+
+    This is what makes write-then-purge actually safe: this run's backup
+    is written FIRST (see run_discovery's Step 3c), so by the time this
+    function runs, today's rows already exist and are protected by the
+    BackupRunDate filter — even if this purge fails or the process dies
+    immediately after, there is always at least one complete backup
+    snapshot present, never a window with zero.
+
+    Needs $expand=fields (not just $select=id like purge_all_sp_rows) since
+    the decision of what to delete depends on each row's BackupRunDate
+    value, not just its existence.
+
+    Returns: (deleted_count, errors)
+    """
+    if not list_id:
+        return 0, []
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{list_id}/items?$expand=fields&$select=id,fields&$top=500"
+    )
+    stale_item_ids: list[str] = []
+    while url:
+        b = _get(url, _sp_auth_hdrs(), timeout=30)
+        for item in b.get("value", []):
+            iid = item.get("id", "")
+            run_date = item.get("fields", {}).get("BackupRunDate", "")
+            if iid and run_date != current_run_date:
+                stale_item_ids.append(iid)
+        url = b.get("@odata.nextLink")
+
+    if not stale_item_ids:
+        log.info("%s — no stale rows from a prior run to purge (either empty, or "
+                 "everything present is already tagged with today's run).", list_label)
+        return 0, []
+
+    log.info("Purging %d stale row(s) (prior run's BackupRunDate) from %s — "
+             "this run's own fresh rows are excluded and untouched...",
+              len(stale_item_ids), list_label)
+
+    base_url = f"/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items"
+    deleted  = 0
+    errors: list[str] = []
+
+    for chunk_start in range(0, len(stale_item_ids), SP_BATCH_SIZE):
+        chunk = stale_item_ids[chunk_start: chunk_start + SP_BATCH_SIZE]
+        batch_requests = [
+            {
+                "id":     str(i),
+                "method": "DELETE",
+                "url":    f"{base_url}/{iid}",
+            }
+            for i, iid in enumerate(chunk)
+        ]
+        try:
+            responses = _execute_sp_batch(batch_requests)
+            for resp in responses:
+                status = resp.get("status", 0)
+                if status in (200, 204, 404):
+                    deleted += 1
+                else:
+                    errors.append(
+                        f"Stale-backup purge DELETE failed [{status}] for item in "
+                        f"{list_label}: {str(resp.get('body', ''))[:150]}"
+                    )
+        except Exception as e:
+            errors.append(f"Stale-backup purge batch chunk failed for {list_label}: {e}")
+
+        if chunk_start + SP_BATCH_SIZE < len(stale_item_ids):
+            time.sleep(SP_BATCH_PAUSE)
+
+    log.info("Purged %d/%d stale rows from %s.", deleted, len(stale_item_ids), list_label)
+    return deleted, errors
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3b — Build backup write operations from the CURRENT (pre-run) state
+#          Every field from every current row is copied as-is into a NEW
+#          row in SecretAlertRegistryBackup — full snapshot, append-only,
+#          never overwritten. Runs BEFORE any of this run's changes are made.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ALLOWLIST — exactly the real data columns confirmed present on the
+# SecretAlertRegistryBackup list schema (verified against Graph's actual
+# column listing for that list). Using an allowlist instead of a blocklist
+# is deliberate: SharePoint's $expand=fields response includes an unknown
+# number of internal, read-only system metadata fields (_ComplianceFlags,
+# _ColorTag, ComplianceAssetId, and others we haven't necessarily seen yet)
+# that vary by tenant/list configuration and are NOT safe to guess a
+# complete blocklist for. An allowlist can never accidentally include a
+# field we don't know about — worst case it silently omits a real field,
+# which is a much safer failure mode than a 403/400 breaking the entire
+# backup batch.
+_BACKUP_FIELD_ALLOWLIST = {
+    "Title", "AppName", "SecretID", "SecretDescription", "ExpirationDate",
+    "AlertStatus", "LastChecked", "AlertSentDate", "RotationDetectedDate",
+    "JiraTicketKey", "ExpiryNotice", "NewSecretKeyId", "NewSecretVaultName",
+    "TenantID", "TenantName", "JiraTicketCreatedDate", "AlertHistory",
+    "ExpiryBucket", "AppOwners", "ObjectID", "ManualAppOwners",
+}
+
+# NEW in v10 — separate allowlist for IgnoredSecretRegistry's own schema
+# (DaysExpired/LoggedDate/IgnoreReason instead of the active-list columns
+# like AlertStatus/ExpiryBucket, which don't exist on Ignored rows).
+_IGNORED_BACKUP_FIELD_ALLOWLIST = {
+    "Title", "AppName", "SecretID", "SecretDescription", "ExpirationDate",
+    "DaysExpired", "TenantID", "TenantName", "LoggedDate", "IgnoreReason",
+}
+
+def build_backup_write_ops(raw_items: list[dict], backup_run_date: str,
+                            field_allowlist: set[str] = _BACKUP_FIELD_ALLOWLIST) -> list[dict]:
+    """
+    Builds Graph $batch write operations to snapshot every current row in
+    a source list into its corresponding backup list, tagged with the
+    date of this discovery run. Always creates NEW rows (item_id=None) —
+    each run's backup is a full snapshot appended fresh (older backup rows
+    are deleted separately — see purge_all_sp_rows — so in practice only
+    one run's snapshot ever exists at a time; see v10 backup rotation).
+
+    Generic over field_allowlist so the same function backs up both
+    SecretAlertRegistry (_BACKUP_FIELD_ALLOWLIST) and IgnoredSecretRegistry
+    (_IGNORED_BACKUP_FIELD_ALLOWLIST) — see comment above for why an
+    allowlist is used instead of trying to blocklist every possible
+    SharePoint-managed system field.
+    """
+    backup_ops: list[dict] = []
+    for item in raw_items:
+        f = item.get("fields", {})
+        original_item_id = item.get("id", "")
+
+        backup_fields = {
+            k: v for k, v in f.items()
+            if k in field_allowlist
+        }
+        backup_fields["OriginalItemId"] = original_item_id
+        backup_fields["BackupRunDate"] = backup_run_date
+
+        label = f"{f.get('AppName', 'Unknown')}/{f.get('SecretDescription', '')}"
+        backup_ops.append({
+            "item_id": None,
+            "label":   f"BACKUP:{label}",
+            "fields":  backup_fields,
+        })
+
+    return backup_ops
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — Graph $batch writer (generic — takes target list ID as a param)
@@ -527,10 +1096,15 @@ def _execute_sp_batch(requests: list[dict]) -> list[dict]:
     Sends a single Graph $batch request containing up to 20 SP operations.
     Each request dict has: id, method, url, body (optional).
     Returns list of response dicts from Graph batch response.
+
+    ALWAYS uses _sp_auth_hdrs() (home tenant) — every SharePoint write in
+    this runbook (SecretAlertRegistry, IgnoredSecretRegistry,
+    SecretAlertRegistryBackup) funnels through this one function, so this
+    is the single most important place to get the token scope right.
     """
     batch_body = {"requests": requests}
     hdrs = {
-        **_auth_hdrs(),
+        **_sp_auth_hdrs(),
         "Content-Type": "application/json",
     }
     resp = _post_retry(
@@ -628,7 +1202,20 @@ def batch_write_sp_rows(write_ops: list[dict], list_id: str) -> tuple[int, int, 
         for op in retry_as_post:
             label  = op.get("label", "?")
             fields = op.get("fields", {})
-            if "AlertStatus" not in fields:
+            # FIX: this was unconditionally injecting AlertStatus="Discovered"
+            # into every retry-as-POST, assuming the target was always
+            # SecretAlertRegistry. batch_write_sp_rows is GENERIC over both
+            # lists (see docstring above) — IgnoredSecretRegistry has no
+            # AlertStatus column at all, so any retry against that list 400'd
+            # with "Field 'AlertStatus' is not recognized". This surfaced in
+            # production specifically when the SAME run's recovery logic
+            # deleted an IgnoredSecretRegistry row (moving it back to an
+            # active bucket) WHILE another operation in the same batch was
+            # still trying to PATCH that now-deleted row — the PATCH 404s,
+            # falls into this retry path, and previously always assumed
+            # SecretAlertRegistry's schema regardless of which list_id was
+            # actually being written to.
+            if list_id == SHAREPOINT_LIST_ID and "AlertStatus" not in fields:
                 fields["AlertStatus"] = "Discovered"
             retry_req = [{
                 "id":      "retry_0",
@@ -659,7 +1246,7 @@ def batch_write_sp_rows(write_ops: list[dict], list_id: str) -> tuple[int, int, 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_discovery() -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _now_est_string()
     now   = datetime.now(timezone.utc)
 
     summary: dict[str, Any] = {
@@ -672,22 +1259,31 @@ def run_discovery() -> dict:
                                     # secretsSeenInGraph - secretsSkippedMalformed)
         "rowsCreated":        0,   # SecretAlertRegistry — new rows
         "rowsUpdated":        0,   # SecretAlertRegistry — updated rows
-        "ignoredLogged":      0,   # IgnoredSecretRegistry — rows written
+        "ignoredLogged":      0,   # IgnoredSecretRegistry — rows written (Ignore + P5, v10)
         "ignoredSkippedNoList": 0, # would-be-ignored rows NOT written (list ID missing)
-        "byBucket":           {b: 0 for b in ["P1","P2","P3","P4","ExpiredManualReview","Ignore"]},
+        "p5ToIgnoredList":    0,   # RETIRED v10.2 — P5 no longer routes here, kept at 0 for compatibility
+        "recoveredFromIgnored": 0, # NEW v10 — rows deleted from Ignored + recreated as active
+        "backupRowsWritten":  0,   # SecretAlertRegistryBackup — pre-run snapshot rows
+        "backupSkippedNoList": 0,  # backup skipped entirely — list ID not configured
+        "ignoredBackupRowsWritten": 0,  # NEW v10 — IgnoredSecretRegistryBackup rows
+        "ignoredBackupSkippedNoList": 0, # NEW v10 — ignored backup skipped, list not configured
+        "backupRowsPurged":   0,   # NEW v10 — prior-run backup rows deleted before this run's snapshot
+        "ignoredBackupRowsPurged": 0,  # NEW v10 — same, for IgnoredSecretRegistryBackup
+        "byBucket":           {b: 0 for b in ["P1","P2","P3","P4","P5","ExpiredManualReview","Ignore"]},
         "errors":             [],
     }
 
-    # ── Step 1: Fetch ALL App Registrations (no filtering) ───────────────────
+    # ── Step 1: Fetch ALL App Registrations across ALL configured tenants ────
     try:
-        applications = fetch_all_applications()
+        applications, tenant_fetch_errors = fetch_all_applications_all_tenants()
         summary["appsScanned"] = len(applications)
+        summary["errors"].extend(tenant_fetch_errors)
     except Exception as e:
-        summary["errors"].append(f"fetch_all_applications failed: {e}")
+        summary["errors"].append(f"fetch_all_applications_all_tenants failed: {e}")
         return summary
 
     if not applications:
-        log.info("No applications found — nothing to do.")
+        log.info("No applications found across any configured tenant — nothing to do.")
         return summary
 
     # ── Step 2: Fetch owners in parallel ─────────────────────────────────────
@@ -697,24 +1293,179 @@ def run_discovery() -> dict:
         log.warning("fetch_all_owners_parallel failed: %s — proceeding with empty owners", e)
         owners_by_object_id = {}
 
-    # ── Step 3: Read existing SharePoint rows ─────────────────────────────────
+    # ── Step 3: Read existing SharePoint rows (this run's PRE-CHANGE state) ───
+    # Reads BOTH lists — SecretAlertRegistry (as before) AND, new in v10,
+    # IgnoredSecretRegistry, since recovery detection (v10 point 3) needs to
+    # know what's currently sitting in Ignored, and the Ignored backup (v10
+    # point 4) needs its pre-change snapshot too.
     try:
-        existing_rows = get_existing_sp_rows()
+        existing_rows, raw_current_items = get_existing_sp_rows()
     except Exception as e:
         summary["errors"].append(f"get_existing_sp_rows failed: {e}")
         return summary
 
-    # ── Step 4: Build write operations — active rows AND ignored rows ─────────
-    write_ops: list[dict]         = []   # → SecretAlertRegistry
-    ignored_write_ops: list[dict] = []   # → IgnoredSecretRegistry
+    try:
+        existing_ignored_rows, raw_current_ignored_items = get_all_ignored_sp_rows()
+    except Exception as e:
+        summary["errors"].append(f"get_all_ignored_sp_rows failed: {e}")
+        return summary
 
-    tenant_name = get_tenant_name()
+    # Full-fields lookup by (appId, secretId) — needed to diff against current
+    # values when updating, so we only PATCH fields that actually changed.
+    existing_fields_by_key: dict[tuple[str, str], dict] = {}
+    for item in raw_current_items:
+        f = item.get("fields", {})
+        key = (f.get("Title", ""), f.get("SecretID", ""))
+        if key[0] and key[1]:
+            existing_fields_by_key[key] = f
+
+    # ── Step 3b: Backup CURRENT state (BOTH lists) before making any changes ──
+    # HARD GATE: backup must succeed for BOTH SecretAlertRegistry AND
+    # IgnoredSecretRegistry before ANY master-list changes happen. If either
+    # backup list isn't configured, or either backup write fails, this run
+    # ABORTS here — it does NOT proceed to update either master list. This
+    # is deliberate: the whole point of the backup is to guarantee a restore
+    # point exists before every change; silently skipping backup and
+    # updating anyway would defeat that guarantee exactly when it's needed
+    # most (a bad run).
+    if not SHAREPOINT_BACKUP_LIST_ID or not SHAREPOINT_IGNORED_BACKUP_LIST_ID:
+        summary["backupSkippedNoList"] = len(raw_current_items)
+        summary["ignoredBackupSkippedNoList"] = len(raw_current_ignored_items)
+        missing = []
+        if not SHAREPOINT_BACKUP_LIST_ID:
+            missing.append("SHAREPOINT-BACKUP-LIST-ID")
+        if not SHAREPOINT_IGNORED_BACKUP_LIST_ID:
+            missing.append("SHAREPOINT-IGNORED-BACKUP-LIST-ID")
+        summary["errors"].append(
+            f"{', '.join(missing)} not configured — aborting run WITHOUT "
+            "updating either master list. Backup of BOTH SecretAlertRegistry "
+            "and IgnoredSecretRegistry is a hard prerequisite; configure the "
+            "missing Key Vault secret(s) and re-run."
+        )
+        log.error("ABORTING — %s not set. Existing rows were NOT backed up, "
+                  "so master-list updates will NOT proceed.", ', '.join(missing))
+        return summary
+
+    # ── Step 3c: Write THIS run's backup FIRST, then purge the PRIOR run's ───
+    # rows — NOT the other way around. This was flagged as a risk earlier and
+    # is fixed here: the old order (purge-then-write) has a real window,
+    # however brief, where a mid-run failure leaves BOTH backup lists with
+    # ZERO rows until the next successful run. Write-then-purge means there
+    # is always at least one complete backup snapshot on disk — briefly two
+    # (this run's + the prior run's) immediately after the write, then back
+    # down to one once the purge below completes. A failure between write
+    # and purge simply leaves the OLD backup rows sitting alongside the new
+    # ones — extra rows, not zero, which is a far safer failure mode.
+    try:
+        backup_ops = build_backup_write_ops(raw_current_items, today, _BACKUP_FIELD_ALLOWLIST)
+        if backup_ops:
+            backup_created, _backup_updated, backup_errors = batch_write_sp_rows(
+                backup_ops, SHAREPOINT_BACKUP_LIST_ID
+            )
+            summary["backupRowsWritten"] = backup_created
+            if backup_errors:
+                # ANY backup write failure aborts the run — a partial/incomplete
+                # backup is not a safe foundation for proceeding to update the
+                # master list. Better to stop and retry than risk updating rows
+                # whose pre-change state didn't actually get captured. Since
+                # nothing has been purged yet at this point, the PRIOR run's
+                # backup is still fully intact — this abort loses nothing.
+                summary["errors"].extend(f"[Backup] {e}" for e in backup_errors)
+                summary["errors"].append(
+                    f"ABORTING — {len(backup_errors)} backup row(s) failed to write. "
+                    f"Master-list updates will NOT proceed this run. The prior run's "
+                    f"backup is untouched and still intact."
+                )
+                log.error("ABORTING — %d/%d backup rows failed. Master-list updates "
+                          "will NOT proceed. Prior backup untouched. See errors above.",
+                          len(backup_errors), len(backup_ops))
+                return summary
+            log.info("Backed up %d rows to SecretAlertRegistryBackup (run date %s) — "
+                     "proceeding to purge the prior run's backup rows.", backup_created, today)
+        else:
+            log.info("No existing rows to back up — SecretAlertRegistry was empty. "
+                     "Nothing to protect — proceeding directly.")
+
+        ignored_backup_ops = build_backup_write_ops(
+            raw_current_ignored_items, today, _IGNORED_BACKUP_FIELD_ALLOWLIST
+        )
+        if ignored_backup_ops:
+            ig_backup_created, _ig_backup_updated, ig_backup_errors = batch_write_sp_rows(
+                ignored_backup_ops, SHAREPOINT_IGNORED_BACKUP_LIST_ID
+            )
+            summary["ignoredBackupRowsWritten"] = ig_backup_created
+            if ig_backup_errors:
+                summary["errors"].extend(f"[Ignored Backup] {e}" for e in ig_backup_errors)
+                summary["errors"].append(
+                    f"ABORTING — {len(ig_backup_errors)} IgnoredSecretRegistryBackup "
+                    f"row(s) failed to write. Master-list updates will NOT proceed this run. "
+                    f"The prior run's backup is untouched and still intact."
+                )
+                log.error("ABORTING — %d/%d ignored-backup rows failed. Prior backup untouched.",
+                          len(ig_backup_errors), len(ignored_backup_ops))
+                return summary
+            log.info("Backed up %d rows to IgnoredSecretRegistryBackup (run date %s).",
+                     ig_backup_created, today)
+        else:
+            log.info("No existing rows to back up — IgnoredSecretRegistry was empty.")
+    except Exception as e:
+        summary["errors"].append(
+            f"ABORTING — backup write step raised an exception: {e}. "
+            f"Master-list updates will NOT proceed this run. The prior run's "
+            f"backup is untouched and still intact."
+        )
+        log.error("ABORTING — backup write step raised an exception, master-list "
+                  "updates will NOT proceed. Prior backup untouched: %s", e)
+        return summary
+
+    # Now purge ONLY rows from a DIFFERENT (older) BackupRunDate than today's
+    # — this run's just-written rows are tagged BackupRunDate=today and must
+    # survive the purge. A purge failure here does NOT abort the run — this
+    # run's fresh backup already exists and master-list updates are safe to
+    # proceed; the only consequence of a purge failure is that OLD backup
+    # rows linger an extra run (cosmetic — a bigger list — not a data-loss risk).
+    try:
+        purged_active, purge_active_errors = purge_stale_backup_rows(
+            SHAREPOINT_BACKUP_LIST_ID, "SecretAlertRegistryBackup", today
+        )
+        summary["backupRowsPurged"] = purged_active
+        if purge_active_errors:
+            summary["errors"].extend(f"[Backup Purge — non-fatal] {e}" for e in purge_active_errors)
+            log.warning("%d purge error(s) on SecretAlertRegistryBackup — this run's fresh "
+                       "backup is safe; old rows will be retried next run.",
+                       len(purge_active_errors))
+
+        purged_ignored, purge_ignored_errors = purge_stale_backup_rows(
+            SHAREPOINT_IGNORED_BACKUP_LIST_ID, "IgnoredSecretRegistryBackup", today
+        )
+        summary["ignoredBackupRowsPurged"] = purged_ignored
+        if purge_ignored_errors:
+            summary["errors"].extend(f"[Ignored Backup Purge — non-fatal] {e}" for e in purge_ignored_errors)
+            log.warning("%d purge error(s) on IgnoredSecretRegistryBackup — this run's fresh "
+                       "backup is safe; old rows will be retried next run.",
+                       len(purge_ignored_errors))
+    except Exception as e:
+        # Non-fatal by design — see comment above. This run's backup already
+        # succeeded; a purge exception just means old rows linger.
+        summary["errors"].append(f"[Backup Purge — non-fatal] purge step raised an exception: {e}")
+        log.warning("Backup purge step raised an exception (non-fatal — fresh backup "
+                   "already written this run): %s", e)
+
+    # ── Step 4: Build write operations — active rows AND ignored rows ─────────
+    write_ops: list[dict]           = []   # → SecretAlertRegistry
+    ignored_write_ops: list[dict]   = []   # → IgnoredSecretRegistry
+    ignored_delete_ops: list[dict]  = []   # → IgnoredSecretRegistry (v10 recovery — deletes)
+    # Tracks which (appId, secretId) keys we've SEEN this run that also exist
+    # in Ignored right now — anything in existing_ignored_rows NOT touched
+    # by this loop stays in Ignored untouched (still Ignore or still P5).
+    recovered_keys: set[tuple[str, str]] = set()
 
     for app in applications:
-        app_id    = app.get("appId", "")
-        app_name  = app.get("displayName", "Unknown")
-        object_id = app.get("id", "")
-        secrets   = app.get("passwordCredentials", [])
+        app_id      = app.get("appId", "")
+        app_name    = app.get("displayName", "Unknown")
+        object_id   = app.get("id", "")
+        secrets     = app.get("passwordCredentials", [])
+        source_tenant_id = app.get("_sourceTenantId", GRAPH_TENANT_ID)
 
         if not app_id or not object_id:
             summary["appsSkippedMalformed"] += 1
@@ -756,33 +1507,53 @@ def run_discovery() -> dict:
                     "Failed to parse endDateTime=%r for app=%s (%s) secret=%s: %s",
                     expiry_str, app_name, app_id, secret_id, e,
                 )
-                days = -9999  # fail SAFE — routes to Ignore, never P4
+                days = -9999  # fail SAFE — routes to Ignore, never P5
                 parse_failed = True
 
             summary["secretsFound"] += 1
             bucket = _classify_bucket(days)
             notice = _expiry_notice(days, bucket)
 
-            # IMPORTANT: expiry_str[:10] is a naive slice — it "succeeds" and
-            # produces a plausible-looking date even when the full string is
-            # malformed (that slice doesn't validate anything). If the real
-            # parse above failed, do NOT trust the slice — it would silently
-            # display a wrong/garbage date next to a bucket that says "Ignore".
-            # Show the raw string instead so it's obviously flagged for review.
+            # Use the already-parsed expiry_dt to format date+time consistently,
+            # rather than slicing the raw string (which only gave date-only and
+            # was fragile — see _parse_graph_datetime for why raw slicing is
+            # unreliable). If parsing failed, show the raw string so it's
+            # obviously flagged for review instead of a fake-looking date.
             if parse_failed:
                 expiry_date = f"UNPARSEABLE: {expiry_str[:50]}"
+            elif expiry_str:
+                expiry_date = _format_datetime_est(expiry_dt)
             else:
-                expiry_date = expiry_str[:10] if expiry_str else ""
+                expiry_date = ""
 
             summary["byBucket"][bucket] += 1
 
             label = f"{app_name}/{secret_desc}"
 
-            # ── Ignore bucket → route to IgnoredSecretRegistry, not dropped ──
+            row_key = (app_id, secret_id)
+
+            # ── Ignore + P5 buckets → BOTH route to IgnoredSecretRegistry (v10) ──
+            # v10.2 CHANGE (one-time requirement): P5 (61+ days, safe) now
+            # falls through to the NORMAL active-bucket path below and is
+            # written to SecretAlertRegistry, NOT IgnoredSecretRegistry.
+            # Only genuinely-expired (8+ days ago) secrets still route to
+            # IgnoredSecretRegistry. This is a deliberate one-time-run change
+            # — the client wants the full picture (P1 through P5) visible in
+            # one place, at least for this run; IgnoredSecretRegistry is now
+            # reserved purely for "Ignore" (Expired8Plus).
             if bucket == "Ignore":
+                ignore_reason = "Expired8Plus"
+
                 if SHAREPOINT_IGNORED_LIST_ID:
+                    already_ignored_id = existing_ignored_rows.get(row_key)
                     ignored_write_ops.append({
-                        "item_id": None,   # always append — audit trail, not synced state
+                        # If this (appId, secretId) already has a row in
+                        # IgnoredSecretRegistry from a prior run, PATCH it
+                        # in place instead of appending a duplicate — the
+                        # ignored list reflects CURRENT ignore state, not
+                        # an append-only log (the backup list is what
+                        # preserves history now, per v10 point 4/5).
+                        "item_id": already_ignored_id,
                         "label":   label,
                         "fields": {
                             "Title":             app_id,
@@ -791,17 +1562,41 @@ def run_discovery() -> dict:
                             "SecretDescription": secret_desc,
                             "ExpirationDate":    expiry_date,
                             "DaysExpired":       abs(days) if days != -9999 else None,
-                            "TenantID":          GRAPH_TENANT_ID,
-                            "TenantName":        tenant_name,
+                            "TenantID":          source_tenant_id,
+                            "TenantName":        source_tenant_id,
                             "LoggedDate":        today,
+                            "IgnoreReason":      ignore_reason,
                         },
                     })
+                    if already_ignored_id is not None:
+                        recovered_keys.add(row_key)  # still ignored — not a recovery, just mark seen
                 else:
                     summary["ignoredSkippedNoList"] += 1
                 continue
 
-            row_key     = (app_id, secret_id)
+            # ── Active bucket (P1-P4, ExpiredManualReview) ────────────────────
             existing_id = existing_rows.get(row_key)
+
+            # v10 RECOVERY: this secret is classified into an ACTIVE bucket
+            # this run, but it currently has a row sitting in
+            # IgnoredSecretRegistry (e.g. was P5 or Expired8Plus last run,
+            # its endDateTime was extended in Entra, now it's back to P1-P4).
+            # Delete the stale Ignored row and fall through to the normal
+            # "new row" creation path below — ManualAppOwners is intentionally
+            # left blank on this fresh SecretAlertRegistry row, same as any
+            # other brand-new secret, per the v10 design decision.
+            stale_ignored_id = existing_ignored_rows.get(row_key)
+            if stale_ignored_id is not None:
+                ignored_delete_ops.append({
+                    "item_id": stale_ignored_id,
+                    "label":   f"RECOVERED:{label}",
+                })
+                recovered_keys.add(row_key)
+                summary["recoveredFromIgnored"] += 1
+                log.info("Recovery — %s moved from IgnoredSecretRegistry back to "
+                         "an active bucket (%s). Deleting Ignored row %s, creating "
+                         "fresh SecretAlertRegistry row.", label, bucket, stale_ignored_id)
+                existing_id = None  # force CREATE, not PATCH — no active row exists yet
 
             if existing_id is None:
                 write_ops.append({
@@ -817,26 +1612,62 @@ def run_discovery() -> dict:
                         "ExpiryNotice":      notice,
                         "AppOwners":         app_owners,
                         "ObjectID":          object_id,
+                        "TenantID":          source_tenant_id,
+                        "TenantName":        source_tenant_id,
                         "LastChecked":       today,
                         "AlertStatus":       "Discovered",
                     },
                 })
             else:
+                # PARTIAL UPDATE — only send fields that actually changed vs
+                # the row's current stored values. LastChecked is always
+                # included regardless of diffing — it's a heartbeat/"last
+                # verified" timestamp, not a value that should be gated on
+                # whether anything else changed.
+                current = existing_fields_by_key.get(row_key, {})
+                # NOTE (v10.1): candidate_fields is the EXHAUSTIVE list of fields
+                # discovery ever writes on an update. ManualAppOwners is
+                # deliberately absent — it is a manually-maintained column
+                # (admin-filled, used by the LangChain/rotation runbooks) and
+                # must never be touched by discovery, whether or not Entra's
+                # own AppOwners value has changed. Do not add it here.
+                #
+                # TenantID/TenantName ADDED in v10.1 — a bug in v10 wrote these
+                # to Ignore/P5 rows only, never to active-bucket rows on either
+                # create or update, leaving TenantID permanently blank on every
+                # SecretAlertRegistry row. Included here so existing rows with
+                # a blank/stale TenantID get corrected on the next discovery
+                # run, not just newly-created ones.
+                candidate_fields = {
+                    "AppOwners":      app_owners,
+                    "ExpiryBucket":   bucket,
+                    "ExpiryNotice":   notice,
+                    "ExpirationDate": expiry_date,
+                    "ObjectID":       object_id,
+                    "TenantID":       source_tenant_id,
+                    "TenantName":     source_tenant_id,
+                }
+                changed_fields = {
+                    k: v for k, v in candidate_fields.items()
+                    if str(current.get(k, "")) != str(v)
+                }
+                changed_fields["LastChecked"] = today
+
+                if len(changed_fields) > 1:
+                    # Something beyond just the heartbeat actually changed —
+                    # log what, for a readable audit trail without needing
+                    # to diff SharePoint versions manually.
+                    real_changes = {k: v for k, v in changed_fields.items() if k != "LastChecked"}
+                    log.info("Row changed — %s: %s", label, real_changes)
+
                 write_ops.append({
                     "item_id": existing_id,
                     "label":   label,
-                    "fields": {
-                        "AppOwners":      app_owners,
-                        "ExpiryBucket":   bucket,
-                        "ExpiryNotice":   notice,
-                        "ExpirationDate": expiry_date,
-                        "ObjectID":       object_id,
-                        "LastChecked":    today,
-                    },
+                    "fields":  changed_fields,
                 })
 
-    log.info("Built %d active write ops + %d ignored write ops",
-             len(write_ops), len(ignored_write_ops))
+    log.info("Built %d active write ops + %d ignored write ops + %d ignored delete ops (recovery)",
+             len(write_ops), len(ignored_write_ops), len(ignored_delete_ops))
 
     # ── Step 5: Batch-write active rows to SecretAlertRegistry ────────────────
     if write_ops:
@@ -847,15 +1678,51 @@ def run_discovery() -> dict:
     else:
         log.info("No active write operations to execute.")
 
-    # ── Step 6: Batch-write ignored rows to IgnoredSecretRegistry ─────────────
+    # ── Step 6: Batch-write (create-or-update) ignored rows to IgnoredSecretRegistry ─
+    # v10: this is now an upsert (existing Ignore/P5 rows are PATCHed in
+    # place, not duplicated) — created+updated together equal ignoredLogged.
     if ignored_write_ops:
-        ig_created, _ig_updated, ig_errors = batch_write_sp_rows(
+        ig_created, ig_updated, ig_errors = batch_write_sp_rows(
             ignored_write_ops, SHAREPOINT_IGNORED_LIST_ID
         )
-        summary["ignoredLogged"] = ig_created
+        summary["ignoredLogged"] = ig_created + ig_updated
         summary["errors"].extend(f"[IgnoredSecretRegistry] {e}" for e in ig_errors)
     else:
         log.info("No ignored write operations to execute.")
+
+    # ── Step 6b: Delete RECOVERED rows from IgnoredSecretRegistry (v10) ──────
+    # These are secrets that were sitting in Ignored (Expired8Plus — P5 no
+    # Expired8Plus) but reclassified this run into an active bucket — their
+    # fresh SecretAlertRegistry row was already created in Step 5 above, so
+    # the stale Ignored row is now redundant and must be removed so the two
+    # lists don't both claim the same secret.
+    if ignored_delete_ops and SHAREPOINT_IGNORED_LIST_ID:
+        base_url = f"/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_IGNORED_LIST_ID}/items"
+        for chunk_start in range(0, len(ignored_delete_ops), SP_BATCH_SIZE):
+            chunk = ignored_delete_ops[chunk_start: chunk_start + SP_BATCH_SIZE]
+            batch_requests = [
+                {"id": str(i), "method": "DELETE", "url": f"{base_url}/{op['item_id']}"}
+                for i, op in enumerate(chunk)
+            ]
+            try:
+                responses = _execute_sp_batch(batch_requests)
+                for resp in responses:
+                    status = resp.get("status", 0)
+                    if status not in (200, 204, 404):
+                        req_id = str(resp.get("id", ""))
+                        idx = int(req_id) if req_id.isdigit() else -1
+                        label = chunk[idx].get("label", req_id) if 0 <= idx < len(chunk) else req_id
+                        summary["errors"].append(
+                            f"[Recovery Delete] Failed to delete stale Ignored row for "
+                            f"{label} [{status}]: {str(resp.get('body', ''))[:150]}"
+                        )
+            except Exception as e:
+                summary["errors"].append(f"[Recovery Delete] Batch chunk failed: {e}")
+
+            if chunk_start + SP_BATCH_SIZE < len(ignored_delete_ops):
+                time.sleep(SP_BATCH_PAUSE)
+
+        log.info("Deleted %d recovered row(s) from IgnoredSecretRegistry.", len(ignored_delete_ops))
 
     return summary
 
@@ -864,48 +1731,97 @@ def run_discovery() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Discovery Runbook v4 started (all secrets + owners + ignored-list logging)")
+    log.info("Discovery Runbook v10.2 started (v10.2 ONE-TIME CHANGE: P5 now written to "
+             "SecretAlertRegistry, not IgnoredSecretRegistry — IgnoredSecretRegistry is now "
+             "Expired8Plus only) "
+             "(v10.1 fix: TenantID/TenantName now written "
+             "to SecretAlertRegistry on both create and update, not just Ignored/P5 rows) "
+             "(P5+Ignore both written to IgnoredSecretRegistry, "
+             "ManualAppOwners preserved untouched, Ignored-list recovery detection, "
+             "dual-list backup with rotation-to-latest, reconciliation totals) "
+             "+ display-name-only owners + EST 12hr timestamps + hard-gated backup "
+             "+ partial updates + separate Entra/SharePoint token scoping + multi-tenant scanning)")
     t0      = time.time()
     summary = run_discovery()
     elapsed = time.time() - t0
 
-    apps_scanned      = summary.get("appsScanned", 0)
-    apps_skipped      = summary.get("appsSkippedMalformed", 0)
-    secrets_in_graph  = summary.get("secretsSeenInGraph", 0)
-    secrets_skipped   = summary.get("secretsSkippedMalformed", 0)
-    secrets_found     = summary.get("secretsFound", 0)
-    rows_created      = summary.get("rowsCreated", 0)
-    rows_updated      = summary.get("rowsUpdated", 0)
-    ignored_logged    = summary.get("ignoredLogged", 0)
-    ignored_skipped   = summary.get("ignoredSkippedNoList", 0)
-    by_bucket         = summary.get("byBucket", {})
-    errors            = summary.get("errors", [])
+    apps_scanned         = summary.get("appsScanned", 0)
+    apps_skipped         = summary.get("appsSkippedMalformed", 0)
+    secrets_in_graph     = summary.get("secretsSeenInGraph", 0)
+    secrets_skipped      = summary.get("secretsSkippedMalformed", 0)
+    secrets_found        = summary.get("secretsFound", 0)
+    rows_created         = summary.get("rowsCreated", 0)
+    rows_updated         = summary.get("rowsUpdated", 0)
+    ignored_logged       = summary.get("ignoredLogged", 0)
+    ignored_skipped      = summary.get("ignoredSkippedNoList", 0)
+    p5_to_ignored        = summary.get("p5ToIgnoredList", 0)  # retired v10.2 — always 0 now
+    recovered            = summary.get("recoveredFromIgnored", 0)
+    backup_written        = summary.get("backupRowsWritten", 0)
+    backup_skipped        = summary.get("backupSkippedNoList", 0)
+    backup_purged         = summary.get("backupRowsPurged", 0)
+    ignored_backup_written = summary.get("ignoredBackupRowsWritten", 0)
+    ignored_backup_skipped = summary.get("ignoredBackupSkippedNoList", 0)
+    ignored_backup_purged  = summary.get("ignoredBackupRowsPurged", 0)
+    by_bucket             = summary.get("byBucket", {})
+    errors                = summary.get("errors", [])
 
     # Sanity check — bucket totals should always equal secrets found.
     bucket_sum = sum(by_bucket.values())
 
     print("=" * 60)
-    print("DISCOVERY RUNBOOK v4 — SUMMARY")
+    print("DISCOVERY RUNBOOK v10 — SUMMARY")
     print("=" * 60)
     print(f"  Run Date              : {summary.get('runDate')}")
     print(f"  Total Runtime         : {elapsed:.1f}s")
+
+    # ── Reconciliation totals (v10 point 6) — diff these directly against a
+    #    manual `az ad app list` / Graph CLI count. Deliberately standalone,
+    #    not buried in the bucket breakdown below.
+    print(f"\n  ── Reconciliation Totals (compare against manual CLI count) ──")
+    print(f"  Total unique App Registrations scanned : {apps_scanned}")
+    print(f"  Total secrets seen in Graph             : {secrets_in_graph}")
+    print(f"  Total secrets classified                : {secrets_found}")
+    print(f"  → SecretAlertRegistry (active, P1-P4/EMR): {rows_created + rows_updated}")
+    print(f"  → IgnoredSecretRegistry (P5 + expired8+) : {ignored_logged}")
+    accounted_for = rows_created + rows_updated + ignored_logged
+    if secrets_found and accounted_for != secrets_found:
+        print(f"\n  ⚠ WARNING: {secrets_found} secrets classified, but only {accounted_for} "
+              f"appear across both lists (SecretAlertRegistry + IgnoredSecretRegistry) this run. "
+              f"Note: rows_updated counts PATCHes not net-new totals, so this can legitimately "
+              f"differ on a run with no new secrets — use this as a directional check, not exact "
+              f"parity, and cross-verify against actual list row counts in SharePoint if it looks off.")
+
+    print(f"\n  Backup Rows Purged    : {backup_purged} (prior-run SecretAlertRegistryBackup rows deleted)")
+    print(f"  Backup Rows Written   : {backup_written} (this run's snapshot — SecretAlertRegistryBackup)")
+    if backup_skipped:
+        print(f"  Backup SKIPPED        : {backup_skipped} rows NOT backed up "
+              f"(SHAREPOINT-BACKUP-LIST-ID not configured — see warning above)")
+    print(f"  Ignored Backup Purged : {ignored_backup_purged} (prior-run IgnoredSecretRegistryBackup rows deleted)")
+    print(f"  Ignored Backup Written: {ignored_backup_written} (this run's snapshot — IgnoredSecretRegistryBackup)")
+    if ignored_backup_skipped:
+        print(f"  Ignored Backup SKIPPED: {ignored_backup_skipped} rows NOT backed up "
+              f"(SHAREPOINT-IGNORED-BACKUP-LIST-ID not configured — see warning above)")
+
+    print(f"\n  Tenants Scanned       : {len(CROSS_TENANT_TENANT_IDS)} ({', '.join(CROSS_TENANT_TENANT_IDS)})")
     print(f"  Apps Scanned          : {apps_scanned}")
     if apps_skipped:
         print(f"  Apps Skipped (bad data): {apps_skipped} (missing appId/object id — see WARNING logs above)")
     print(f"  Secrets Seen in Graph  : {secrets_in_graph} (raw count, before any skip)")
     if secrets_skipped:
         print(f"  Secrets Skipped (bad data): {secrets_skipped} (missing keyId/endDateTime — see WARNING logs above)")
-    print(f"  Secrets Found         : {secrets_found} (all buckets including P4)")
+    print(f"  Secrets Found         : {secrets_found} (all buckets classified)")
     if secrets_in_graph != secrets_found + secrets_skipped:
         print(f"\n  ⚠ WARNING: {secrets_in_graph} seen in Graph, but only "
               f"{secrets_found} classified + {secrets_skipped} skipped = "
               f"{secrets_found + secrets_skipped}. Numbers don't reconcile — investigate.")
     print(f"  Rows Created          : {rows_created} (new secrets — SecretAlertRegistry)")
-    print(f"  Rows Updated          : {rows_updated} (existing secrets — SecretAlertRegistry)")
-    print(f"  Ignored Logged        : {ignored_logged} (expired 8+ days — IgnoredSecretRegistry)")
+    print(f"  Rows Updated          : {rows_updated} (existing secrets — SecretAlertRegistry, partial-field PATCH)")
+    print(f"  Ignored Logged        : {ignored_logged} (expired 8+ days only — IgnoredSecretRegistry, upsert)")
     if ignored_skipped:
         print(f"  Ignored NOT Logged    : {ignored_skipped} "
               f"(SHAREPOINT-IGNORED-LIST-ID not configured — see warning above)")
+    print(f"  P5 → SecretAlertRegistry: now included in the active list (v10.2 one-time change)")
+    print(f"  Recovered from Ignored: {recovered} (moved back to SecretAlertRegistry — endDateTime extended)")
 
     print(f"\n  Bucket breakdown:")
     for bucket, count in by_bucket.items():
@@ -927,10 +1843,16 @@ def main():
         print(f"\n  Next steps:")
         print(f"  1. Go to SharePoint → SecretAlertRegistry")
         print(f"  2. For apps with blank AppOwners — fill in the owner email manually")
-        print(f"  3. Go to SharePoint → IgnoredSecretRegistry to review audit log of expired-8+-day secrets")
-        print(f"  4. Monitoring container will run in 30 minutes")
+        print(f"  3. For LangChain/rotation runbook use — fill in ManualAppOwners for any row that "
+              f"needs it (discovery never touches this column, so nothing here is ever overwritten)")
+        print(f"  4. Go to SharePoint → IgnoredSecretRegistry to review expired-8+-day secrets "
+              f"(check the IgnoreReason column to tell the two cases apart)")
+        print(f"  5. Go to SharePoint → SecretAlertRegistryBackup / IgnoredSecretRegistryBackup to view "
+              f"this run's pre-change snapshots (BackupRunDate={summary.get('runDate')}) if you need to "
+              f"compare or restore — NOTE: only the LATEST run's snapshot is kept, prior backups were "
+              f"purged before this run wrote its own")
+        print(f"  6. Monitoring container will run in 30 minutes")
         print(f"     It reads AppOwners from each SP row — no OWNER-EMAIL filter needed")
 
 main()
-
 ```
