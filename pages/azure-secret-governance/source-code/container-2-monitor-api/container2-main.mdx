@@ -172,7 +172,7 @@ log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
 #
 # FIX #2 (matches runbook_discovery.py's v8 fix — this file never got this one
 # either): CROSS-TENANT-TENANT-ID in Key Vault was actually set to BOTH tenant
-# IDs, comma-joined ("70afdd80-...,c721d616-...") — the same format
+# IDs, comma-joined ("<tenant-id-1>,<tenant-id-2>") — the same format
 # runbook_discovery.py's PLURAL CROSS-TENANT-TENANT-IDS secret uses. But this
 # file was reading it as a SINGULAR value and passing the whole malformed
 # comma-joined string directly to ClientAssertionCredential(tenant_id=...).
