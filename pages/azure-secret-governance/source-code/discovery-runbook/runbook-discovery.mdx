@@ -157,8 +157,10 @@ Schedule: Weekly — 30 minutes before monitoring runbook.
 What it does:
   1. Fetches ALL App Registrations + secrets from Entra ID
   2. For each app — fetches owners in parallel (ThreadPoolExecutor)
-  3. Classifies each secret into P1/P2/P3/P4/P5/EMR/Ignore bucket
-  4. Batch-writes ACTIVE rows (P1-P4, EMR — NOT P5) to SecretAlertRegistry:
+  3. Classifies each secret into P1/P2/P3/P4/EMR/Ignore bucket (four active
+     buckets after the renumbering that merged the old P1/P2 into one P1 —
+     see _classify_bucket for the exact day ranges)
+  4. Batch-writes ALL active buckets (P1-P4, EMR) to SecretAlertRegistry:
        - New secret  → creates row with AlertStatus = Discovered
        - Existing row → updates AppOwners + ExpiryBucket + ExpirationDate
   5. Batch-writes IGNORED rows (expired 8+ days) to IgnoredSecretRegistry
@@ -562,21 +564,28 @@ def get_tenant_name() -> str:
 def _classify_bucket(days: int) -> str:
     """
     Classify a secret into an expiry bucket based on days remaining.
-    All buckets are classified and written to SecretAlertRegistry, including
-    P5 (61+ days, safe), per the v10.2 change below. Only "Ignore" (expired
-    8+ days ago) is routed to IgnoredSecretRegistry instead.
+    All buckets are classified and written to SecretAlertRegistry, except
+    Ignore (8+ days expired), which goes to IgnoredSecretRegistry instead.
 
-    P1  0-3 days   CRITICAL     (most urgent)
-    P2  4-7 days   CRITICAL
-    P3  8-30 days  WARNING
-    P4  31-60 days INFORMATION
-    P5  61+ days   SAFE
+    CORRECTED — matches decision_engine.py's classify_bucket() exactly,
+    after the renumbering that merged the old P1 (0-3) and P2 (4-7) into a
+    single P1 (0-7), and shifted every bucket below it down by one. Whether
+    a P1 secret specifically tags someone (0-3 days) or sends a plain Teams
+    alert (4-7 days) is a decision made in decision_engine.py's
+    should_tag_p1(), not something discovery needs to know about — discovery
+    only classifies the bucket, it does not send alerts or tickets.
+
+    P1  0-7 days   CRITICAL     (0-3 days additionally tags someone, in
+                                  monitoring — discovery does not distinguish
+                                  this, it only classifies)
+    P2  8-30 days  WARNING
+    P3  31-60 days INFORMATION
+    P4  61+ days   SAFE
     """
-    if days > 60:    return "P5"                  # safe — 61+ days
-    if days >= 31:   return "P4"                  # info — 31-60 days
-    if days >= 8:    return "P3"                  # warning — 8-30 days
-    if days >= 4:    return "P2"                  # critical — 4-7 days
-    if days >= 0:    return "P1"                  # critical — 0-3 days
+    if days > 60:    return "P4"                  # safe — 61+ days
+    if days >= 31:   return "P3"                  # info — 31-60 days
+    if days >= 8:    return "P2"                  # warning — 8-30 days
+    if days >= 0:    return "P1"                  # critical — 0-7 days
     if days >= -7:   return "ExpiredManualReview" # expired 1-7 days ago
     return "Ignore"                               # expired 8+ days ago
 
@@ -1305,7 +1314,7 @@ def run_discovery() -> dict:
         "ignoredBackupSkippedNoList": 0, # NEW v10 — ignored backup skipped, list not configured
         "backupRowsPurged":   0,   # NEW v10 — prior-run backup rows deleted before this run's snapshot
         "ignoredBackupRowsPurged": 0,  # NEW v10 — same, for IgnoredSecretRegistryBackup
-        "byBucket":           {b: 0 for b in ["P1","P2","P3","P4","P5","ExpiredManualReview","Ignore"]},
+        "byBucket":           {b: 0 for b in ["P1","P2","P3","P4","ExpiredManualReview","Ignore"]},
         "errors":             [],
     }
 
@@ -1818,7 +1827,7 @@ def main():
     print(f"  Total secrets seen in Graph             : {secrets_in_graph}")
     print(f"  Total secrets classified                : {secrets_found}")
     print(f"  → SecretAlertRegistry (active, P1-P4/EMR): {rows_created + rows_updated}")
-    print(f"  → IgnoredSecretRegistry (expired8+ only) : {ignored_logged}")
+    print(f"  → IgnoredSecretRegistry (P5 + expired8+) : {ignored_logged}")
     accounted_for = rows_created + rows_updated + ignored_logged
     if secrets_found and accounted_for != secrets_found:
         print(f"\n  ⚠ WARNING: {secrets_found} secrets classified, but only {accounted_for} "
@@ -1856,7 +1865,7 @@ def main():
     if ignored_skipped:
         print(f"  Ignored NOT Logged    : {ignored_skipped} "
               f"(SHAREPOINT-IGNORED-LIST-ID not configured — see warning above)")
-    print(f"  P5 → SecretAlertRegistry: now included in the active list (v10.2 one-time change)")
+    print(f"  P4 (61+ days, safe) → SecretAlertRegistry: written with owners stamped, no alert or ticket")
     print(f"  Recovered from Ignored: {recovered} (moved back to SecretAlertRegistry — endDateTime extended)")
 
     print(f"\n  Bucket breakdown:")
