@@ -42,7 +42,7 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 |-------|-------------|
 | Phase 1 — New secrets, Jira | For secrets not yet in SharePoint: create Jira tickets in batches of 5 |
 | Phase 2 — New secrets, SP + Teams | Write SharePoint rows and send Teams alerts in batches of 10 |
-| Phase 3 — P4 secrets | Log only — no SharePoint row, no alert |
+| Phase 3 — new P5 secrets | Log only — no SharePoint row, no alert |
 | Phase 4 — Existing secrets | Escalate or update existing rows based on current bucket vs recorded status |
 
 ---
@@ -51,12 +51,13 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 
 | Bucket | Days | Alert status set | Teams alert |
 |--------|------|-----------------|-------------|
-| P3 | 31–60 | `JiraRaised` | No |
-| P2 | 8–30 | `TeamsAlerted` | Yes — WARNING |
-| P1 | 0–7 | `Escalated` | Yes — CRITICAL |
+| P1 | 0–3 | `CriticalTagged` | Yes — CRITICAL, tags a specific person |
+| P2 | 4–7 | `Escalated` | Yes — CRITICAL, no tagging |
+| P3 | 8–30 | `TeamsAlerted` | Yes — WARNING |
+| P4 | 31–60 | `JiraRaised` | No |
+| P5 | 61+ | Written to SharePoint if already tracked and refreshed each run; brand-new P5 secrets are log only | No |
 | ExpiredManualReview | -7 to -1 | `ExpiredManualReview` | Yes — EXPIRED |
-| P4 | 61+ | Not written | No |
-| Ignore | -8 and older | Not written | No |
+| Ignore, subject to abandonment check | -8 and older | Stays visible and marked overdue if the Jira ticket is still open, otherwise moved to `IgnoredSecretRegistry` | No |
 
 ---
 
@@ -68,12 +69,14 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 | `asyncio.gather` in batches | Concurrent writes without flooding Graph or Jira APIs |
 | Escalation stage check | `BUCKET_STAGE` vs `STATUS_STAGE` prevents sending duplicate alerts for the same severity |
 | Self-heal missing Jira ticket | If an existing SP row has no `JiraTicketKey`, the engine creates a new ticket rather than silently skipping |
-| `MONITOR_SKIP_STATUSES` | `Rotated`, `Ignored`, `Resolved`, and `RotatedPendingDeployment` rows are never re-alerted |
-| Owner filter in SP index | Rows not owned by `owner_emails` are excluded from the SP index before any processing begins |
+| `MONITOR_SKIP_STATUSES` | `Rotated`, `Ignored`, `Resolved`, and `RotatedPendingDeployment` rows are never re-alerted. `Blocked` and `AwaitingReporter` rows are also skipped, but only while paused — they resume once the Jira ticket moves to a different status |
+| `ManualAppOwners` gate | Monitoring is gated on `ManualAppOwners` in SharePoint, filled in by a human, and propagated app-wide before filtering. Legacy `owner_emails` matching against `AppOwners` is still accepted as a parameter but ignored by default |
 
 <Callout type="info">
-  `OWNER-EMAILS` supports multiple comma-separated values. A row passes the ownership
-  filter if **any** of the configured emails appears in its `AppOwners` column.
+  Monitoring gates on `ManualAppOwners` in SharePoint being non-blank, not `AppOwners`
+  (auto-stamped from Entra, informational only) and not a fixed `OWNER-EMAILS` list from
+  Key Vault. If `ManualAppOwners` is filled in on any one secret row for an app,
+  monitoring copies that value onto every other row for the same app automatically.
 </Callout>
 
 ---

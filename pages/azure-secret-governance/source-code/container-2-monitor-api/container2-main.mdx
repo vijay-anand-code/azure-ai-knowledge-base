@@ -28,8 +28,8 @@ import { Callout } from 'nextra/components'
 | `/tools/add_jira_comment` | POST | Adds a comment to a Jira ticket |
 | `/tools/send_teams_alert` | POST | Sends an Adaptive Card to the Teams webhook |
 | `/tools/run_secret_monitoring` | POST | Runs the full monitoring cycle via `decision_engine.py` |
-| `/tools/update_on_jira_close` | POST | Marks matching SharePoint rows as `Rotated` |
-| `/tools/jira-status-update` | POST | Unified Jira transition handler (close + reopen) |
+| `/tools/update_on_jira_close` | POST | Legacy — marks matching rows `Rotated`. Superseded by `/tools/jira-status-update` |
+| `/tools/jira-status-update` | POST | Unified Jira transition handler — maps all six workflow statuses (To Do, In Progress, Done, Canceled, Blocked, Awaiting Reporter) to SharePoint |
 
 ---
 
@@ -38,15 +38,15 @@ import { Callout } from 'nextra/components'
 | Decision | Reason |
 |----------|--------|
 | UAMI for Graph auth | No client secrets in code or environment variables — UAMI token obtained at runtime |
-| `OWNER-EMAILS` from Key Vault | Comma-separated multi-owner support; falls back to legacy `OWNER-EMAIL` |
+| `ManualAppOwners` gate | Monitoring is gated on `ManualAppOwners` in SharePoint, filled in by a human. Legacy `OWNER-EMAILS`/`OWNER-EMAIL` matching against `AppOwners` is still read but ignored by default |
 | Jira webhook handled directly | Status transitions don't need AI reasoning — direct SharePoint update is faster (2–3s vs 30–60s) and avoids OpenAI rate limits |
 | `httpx.AsyncClient` | All tool implementations are async for compatibility with FastAPI's async event loop |
 | Date columns truncated to 10 chars | SharePoint date-only fields reject ISO timestamps — all date writes are sliced to `YYYY-MM-DD` |
 
 <Callout type="info">
-  Container 2 runs on the internal network only (port 8001) and is not exposed publicly.
-  Only Container 1 calls it. The Jira webhook arrives at Container 1 (`/jira-webhook`)
-  and is forwarded to Container 2's `/tools/jira-status-update`.
+  Most `/tools/*` endpoints are only ever called by Container 1. `/tools/jira-status-update`
+  is the exception: Jira's automation rule calls it directly, not through Container 1 or
+  its retired `/jira-webhook` endpoint.
 </Callout>
 
 ---
