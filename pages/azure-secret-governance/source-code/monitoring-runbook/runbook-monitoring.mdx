@@ -105,6 +105,7 @@ def trigger_monitoring() -> dict:
     )
 
     try:
+        # Short timeout — /run returns immediately now (background task)
         with urllib.request.urlopen(req, timeout=30) as response:
             body = response.read().decode("utf-8")
             return json.loads(body)
@@ -114,7 +115,8 @@ def trigger_monitoring() -> dict:
         raise RuntimeError(f"Agent returned HTTP {e.code}: {error_body[:500]}") from e
 
     except Exception:
-        # Timeout or connection reset — agent accepted and is running in background
+        # Timeout or connection reset — agent accepted the request and is
+        # running in background. Treat as success.
         print("[INFO] No immediate response — agent is running in background.")
         return {
             "success": True,
