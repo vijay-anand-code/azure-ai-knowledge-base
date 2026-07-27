@@ -42,11 +42,37 @@ import { Callout } from 'nextra/components'
 | Jira webhook handled directly | Status transitions don't need AI reasoning — direct SharePoint update is faster (2–3s vs 30–60s) and avoids OpenAI rate limits |
 | `httpx.AsyncClient` | All tool implementations are async for compatibility with FastAPI's async event loop |
 | Date columns truncated to 10 chars | SharePoint date-only fields reject ISO timestamps — all date writes are sliced to `YYYY-MM-DD` |
+| Two credential scopes, not one | Entra scanning and SharePoint access are deliberately kept on separate federated credentials. See "Multi-tenant credentials" below |
 
 <Callout type="info">
   Most `/tools/*` endpoints are only ever called by Container 1. `/tools/jira-status-update`
   is the exception: Jira's automation rule calls it directly, not through Container 1 or
   its retired `/jira-webhook` endpoint.
+</Callout>
+
+---
+
+## Multi-tenant credentials
+
+Container 2 scans App Registrations across multiple Entra ID tenants, but SharePoint itself only ever lives in one tenant. Those two facts need two separate credential scopes:
+
+| Credential | Tenant scope | Used for |
+|---|---|---|
+| Per-tenant scanning credential | One `ClientAssertionCredential` is built for every entry in `CROSS-TENANT-TENANT-IDS` (plural, comma-separated). Falls back to the older singular `CROSS-TENANT-TENANT-ID` if the plural secret isn't set | `fetch_azure_secrets`, `fetch_app_owners` |
+| Home-tenant SharePoint credential | Always `HOME-TENANT-ID`, falling back to `GRAPH-TENANT-ID` if not set | `get_sharepoint_state`, `write_sharepoint_row` |
+
+Both credentials assert through the same UAMI and the same `CROSS-TENANT-APP-ID` App Registration — the split is about which `tenant_id` each `ClientAssertionCredential` is constructed with, not a second App Registration.
+
+<Callout type="warning">
+  An earlier version of this file used a single credential, scoped to whatever tenant was
+  currently being scanned, for both Entra and SharePoint calls. That happened to work only
+  because the scanned tenant and the SharePoint tenant were the same at the time. Once
+  `CROSS-TENANT-TENANT-IDS` started pointing at a genuinely different tenant for multi-tenant
+  scanning, every SharePoint call in this file inherited that same tenant scope too — producing
+  `{"code":"BadRequest","message":"Tenant does not have a SPO license."}`. The fix is to build
+  one federated credential per scanned tenant for Entra calls, and keep a separate credential
+  permanently pinned to the home tenant for every SharePoint call, regardless of which tenant is
+  currently being scanned.
 </Callout>
 
 ---
