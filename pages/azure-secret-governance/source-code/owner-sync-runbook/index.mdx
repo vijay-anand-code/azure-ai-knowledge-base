@@ -1,0 +1,16 @@
+---
+title: Owner Sync Runbook
+description: Local script that adds ManualAppOwners identities as Entra owners, run from a laptop
+---
+
+# Owner Sync Runbook
+
+**File:** `owner_sync_local.py`
+**Runtime:** Python 3.10+ — run locally, from a laptop, not Azure Automation
+**Schedule:** Manual, run whenever `ManualAppOwners` has changed
+
+Reads `ManualAppOwners` in `SecretAlertRegistry` and adds the named identity as an Entra owner on
+the matching App Registration, using the operator's own signed in `az login` session instead of
+the shared automation identity.
+
+- [View source](/azure-secret-governance/source-code/owner-sync-runbook/owner-sync-local)

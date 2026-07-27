@@ -1,0 +1,689 @@
+---
+title: owner_sync_local.py
+description: Local script that resolves ManualAppOwners identities and adds them as Entra owners
+---
+
+import { Callout } from 'nextra/components'
+
+# owner_sync_local.py
+
+**Location:** `secret-governance-infra/runbooks/owner_sync_local.py`
+
+**Runtime:** Python 3.10+, run locally from a laptop under the operator's own `az login`
+session, not Azure Automation
+
+**Schedule:** Manual, run whenever `ManualAppOwners` has changed
+
+**What it does:** Reads the `ManualAppOwners` column in `SecretAlertRegistry`. For every row
+where it's filled in, resolves that name to an Entra object ID and adds it as an owner on the
+matching App Registration, using the operator's own signed in session rather than any shared
+identity.
+
+---
+
+## Why this runs locally, not on a schedule
+
+Adding a new owner to an App Registration needs a Graph permission broader than anything else in
+this system holds. Granting that permission to the shared automation identity would mean every
+runbook sharing it could add ownership to any app in either tenant, unattended, with no single
+person accountable for it.
+
+Running this step locally means the Entra write happens under a real person's own sign in,
+subject to whatever role and approval requirements already apply to that person, instead of a
+shared identity with no single owner behind it.
+
+---
+
+## What it does, step by step
+
+1. Reads every row in `SecretAlertRegistry` where `ManualAppOwners` is filled in
+2. For each identifier listed in that column, resolves it to an Entra object ID, see
+   "Identifier resolution" below for the exact order
+3. Adds the resolved identity as an owner on the matching App Registration, via
+   `POST /applications/{id}/owners/$ref`, using the credential for whichever tenant that
+   specific app actually lives in
+4. Skips identities already listed as owners, so re-running the script safely does nothing to
+   rows that already resolved correctly
+5. Never writes to `ManualAppOwners` itself, that column is only ever read
+
+---
+
+## Identifier resolution
+
+Each identifier in `ManualAppOwners` is resolved in this order, scoped strictly to the app's own
+tenant, resolution never falls through to a different tenant:
+
+1. If the identifier contains an `@`, tries an exact user UPN match first
+2. Otherwise, tries an exact service principal `displayName` match
+3. Otherwise, if the identifier looks like a GUID, tries an exact `appId` match
+
+Resolution is scoped strictly to the app's own tenant because display names aren't guaranteed
+unique across tenants, searching the wrong one risks granting ownership in the wrong directory
+entirely.
+
+<Callout type="warning">
+  If an identifier matches more than one object in that tenant, for example two service
+  principals sharing a display name, the script adds all of them as owners and logs it clearly
+  as ambiguous in the run summary. This isn't gated by a ticket or any other checkpoint, it's a
+  deliberate, explicit behavior. This is the one place a typo or a genuine name collision could
+  grant ownership to something unintended, worth checking the run summary for after every run.
+</Callout>
+
+---
+
+## Multi-tenant handling
+
+A single `az login` session can only be authenticated into one tenant at a time, so the script
+groups apps by tenant and processes one tenant's apps at a time. If it finds an app belonging to
+a different tenant than the one currently signed into, it pauses and prints the exact command to
+switch:
+
+```
+az login --tenant <tenant-id>
+```
+
+It waits for the operator to run that in a separate terminal, then continues once confirmed.
+
+---
+
+## Key design decisions
+
+| Decision | Reason |
+|----------|--------|
+| Runs locally under the operator's own `az login` | Adding ownership needs a broader Graph permission than any shared identity in this system holds, see "Why this runs locally" above |
+| Strictly scoped to the app's own tenant | Display names aren't guaranteed unique across tenants, resolving in the wrong one risks granting ownership in the wrong directory |
+| Groups apps by tenant, pauses between tenants | A single `az login` session can only be authenticated into one tenant at a time |
+| Already-owners skipped, not re-added | Re-running the script safely does nothing to rows that already resolved correctly |
+| Ambiguous matches add all of them, not gated | A deliberate, explicit behavior, see the warning callout above |
+| `ManualAppOwners` is read-only here | Never cleared or modified by this script, only ever read |
+| No Jira ticket filed for any outcome | Success, failure, and ambiguous matches are all visible only in that run's own printed summary |
+
+---
+
+## Prerequisites
+
+- `az login`, signed in as yourself, before running the script
+- Your account needs sufficient Entra permission to add owners on the apps involved, ideally a
+  PIM-activated role rather than something held standing
+
+---
+
+## How to run it
+
+```bash
+az login
+```
+
+```powershell
+$env:ROTATOR_KV_URL = "<YOUR_KEY_VAULT_URL>"
+python owner_sync_local.py
+```
+
+---
+
+## Required Key Vault secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
+| `SHAREPOINT-LIST-ID` | `SecretAlertRegistry` list ID |
+| `CROSS-TENANT-TENANT-IDS` | Comma separated tenant IDs to check for matching apps. Falls back to the older singular `CROSS-TENANT-TENANT-ID` if not set |
+
+---
+
+## Source
+
+```python
+"""
+owner_sync_local.py — LOCAL SCRIPT (v4.1 — Run From Your Laptop, Not Azure Automation)
+=========================================================================================
+Purpose : Reads the ManualAppOwners column in SharePoint SecretAlertRegistry and
+          adds the named identity(ies) as owners directly on the matching App
+          Registration in Entra ID — using YOUR OWN signed-in `az login` session,
+          not a shared managed identity or app registration.
+
+          THIS IS DELIBERATELY A LOCAL SCRIPT, NOT AN AZURE AUTOMATION RUNBOOK.
+          Prior versions (v1-v3) ran unattended on a schedule, using the UAMI
+          federated to CROSS_TENANT_APP_ID. Granting that shared identity
+          Application.ReadWrite.All to add owners meant EVERY runbook sharing
+          that one app registration (discovery, rotation, owner_sync) gained
+          standing, tenant-wide write over App Registration ownership, a real
+          permission-scope problem flagged before v3 was built.
+
+          v4 removed that entirely, no service principal, no federated
+          credential, no Application.ReadWrite.All grant on the shared app
+          registration anywhere in this script. It authenticates as YOU, using
+          whatever `az login` session is already active. Every Entra write this
+          script makes is attributed to your own individually-accountable
+          account, subject to whatever role, Conditional Access, and MFA
+          already govern you.
+
+          CHANGES IN v4.1 (fixing the "Apps Checked: 0 / Apps Skipped: 243"
+          issue seen on first real run):
+            - v4 silently lumped THREE different skip reasons (blank ObjectID,
+              blank ManualAppOwners, blank/unrecognised TenantID) into one
+              counter with no way to tell which one actually fired. v4.1 tracks
+              each reason separately and prints a breakdown, so a
+              misconfigured or blank column is diagnosable from the summary
+              alone, not by adding a debug print and re-running.
+            - If TenantID is BLANK on a row but exactly ONE tenant is
+              configured in CROSS_TENANT_TENANT_IDS, v4.1 now falls back to
+              that single tenant rather than skipping the row outright, this
+              matches how runbook_discovery.py itself falls back to
+              GRAPH_TENANT_ID when a source tenant isn't recorded, and covers
+              older/test rows created before TenantID was consistently
+              stamped on every row. With MULTIPLE tenants configured, a blank
+              TenantID is still skipped, there's no safe single tenant to
+              assume, and guessing would risk resolving the identifier in the
+              wrong directory entirely.
+            - If TenantID is non-blank but does NOT match any tenant in
+              CROSS_TENANT_TENANT_IDS, that is now reported as its own
+              distinct reason ("tenant_not_configured") rather than being
+              folded into the same bucket as "blank", these mean different
+              things operationally (missing data vs. missing config) and
+              should not look identical in the summary.
+
+          CROSS-TENANT SUPPORT, confirmed working as designed:
+          This script fully supports the multi-tenant setup already used by
+          runbook_discovery.py. It groups every app by its row's TenantID,
+          processes ONE TENANT'S apps at a time, and, since a single
+          `az login` session can only be scoped to one tenant at once, PAUSES
+          before starting a new tenant's batch, printing the exact
+          `az login --tenant <id>` command and waiting for you to confirm
+          you've switched before making any write in that tenant. It never
+          silently re-scopes your session or guesses which tenant to write
+          into; a tenant mismatch on your CLI session causes that tenant's
+          apps to be skipped and reported, not silently attempted in the
+          wrong directory.
+
+          PREREQUISITE, before running this script:
+            1. `az login`, sign in as yourself
+            2. Your account needs sufficient Entra permission to add owners to
+               the specific App Registrations involved (e.g. you are already
+               an owner of that app, or hold a role such as Application
+               Administrator, ideally PIM-activated for the duration of this
+               session, not held standing)
+            3. `pip install azure-identity azure-keyvault-secrets tzdata`
+               (tzdata is required on Windows, zoneinfo has no OS-level tz
+               database to read there, unlike Linux/macOS)
+
+          CONFIG:
+          Set ROTATOR_KV_URL to read SHAREPOINT_SITE_ID / SHAREPOINT_LIST_ID /
+          CROSS_TENANT_TENANT_IDS from Key Vault using your own az login
+          session (requires Key Vault secret read access on your account,
+          read-only, a much smaller ask than any Entra write permission). Or
+          set SHAREPOINT_SITE_ID / SHAREPOINT_LIST_ID / CROSS_TENANT_TENANT_IDS
+          directly as environment variables and skip Key Vault entirely.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Any
+
+from azure.identity import AzureCliCredential
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                    format="%(levelname)s: %(message)s")
+log = logging.getLogger("owner-sync-local")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIMEZONE — optional. Only used for a human-readable timestamp in this
+# script's own console output (not written anywhere), so a missing tzdata
+# package on Windows should never be fatal here — fall back to plain UTC.
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    from zoneinfo import ZoneInfo
+    _EASTERN_TZ = ZoneInfo("America/New_York")
+except Exception:
+    _EASTERN_TZ = None
+    log.warning("zoneinfo/tzdata not available — falling back to UTC timestamps. "
+                "Run `pip install tzdata` to get US Eastern timestamps instead.")
+
+def _now_string() -> str:
+    now = datetime.now(timezone.utc)
+    if _EASTERN_TZ:
+        now = now.astimezone(_EASTERN_TZ)
+        return now.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    return now.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+SHAREPOINT_SITE_ID = os.environ.get("SHAREPOINT_SITE_ID", "")
+SHAREPOINT_LIST_ID = os.environ.get("SHAREPOINT_LIST_ID", "")
+CROSS_TENANT_TENANT_IDS = [
+    t.strip() for t in os.environ.get("CROSS_TENANT_TENANT_IDS", "").split(",") if t.strip()
+]
+ROTATOR_KV_URL = os.environ.get("ROTATOR_KV_URL", "")
+
+SKIP_STATUSES = {"Rotated", "Ignored", "Resolved", "JiraClosed-Unverified"}
+RETRY_MAX     = 3
+RETRY_BACKOFF = 2.0
+
+
+def _fail_config(name: str) -> None:
+    print(f"\nMissing required config: {name}")
+    print(f"Set it as an environment variable before running, e.g.:")
+    print(f"  $env:{name} = \"<value>\"     (PowerShell)")
+    print(f"  set {name}=<value>           (cmd.exe)")
+    print(f"  export {name}=<value>        (macOS/Linux)")
+    sys.exit(1)
+
+
+def get_config_from_keyvault(vault_url: str) -> None:
+    global SHAREPOINT_SITE_ID, SHAREPOINT_LIST_ID, CROSS_TENANT_TENANT_IDS
+    from azure.keyvault.secrets import SecretClient
+    cred = AzureCliCredential()
+    kv = SecretClient(vault_url=vault_url, credential=cred)
+    SHAREPOINT_SITE_ID = kv.get_secret("SHAREPOINT-SITE-ID").value
+    SHAREPOINT_LIST_ID = kv.get_secret("SHAREPOINT-LIST-ID").value
+    try:
+        raw = kv.get_secret("CROSS-TENANT-TENANT-IDS").value
+    except Exception:
+        raw = kv.get_secret("CROSS-TENANT-TENANT-ID").value
+    CROSS_TENANT_TENANT_IDS = [t.strip() for t in raw.split(",") if t.strip()]
+    log.info("Loaded config from Key Vault using your az login session.")
+
+
+if ROTATOR_KV_URL:
+    get_config_from_keyvault(ROTATOR_KV_URL)
+
+if not SHAREPOINT_SITE_ID:
+    _fail_config("SHAREPOINT_SITE_ID")
+if not SHAREPOINT_LIST_ID:
+    _fail_config("SHAREPOINT_LIST_ID")
+if not CROSS_TENANT_TENANT_IDS:
+    _fail_config("CROSS_TENANT_TENANT_IDS")
+
+print(f"Configured tenants: {CROSS_TENANT_TENANT_IDS}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTH — YOUR az login session.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_cli_credential = AzureCliCredential()
+
+def _graph_token() -> str:
+    """
+    Gets a Graph token from your az login session, retrying on transient
+    subprocess failures. AzureCliCredential shells out to the `az` binary
+    on every single call — occasionally this fails with something like
+    "Failed to invoke the Azure CLI" for reasons unrelated to your actual
+    login state (a slow first invocation, a brief lock on the az binary,
+    etc.), not because the session itself is invalid. Retrying a couple of
+    times with a short pause clears this in practice; if it's a genuinely
+    expired/invalid session, all retries will fail the same way and the
+    real error surfaces after the last attempt rather than being masked.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, RETRY_MAX + 1):
+        try:
+            token = _cli_credential.get_token("https://graph.microsoft.com/.default")
+            return token.token
+        except Exception as exc:
+            last_exc = exc
+            if attempt < RETRY_MAX:
+                wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+                log.warning("az CLI token request failed (attempt %d/%d): %s — retrying in %.1fs",
+                            attempt, RETRY_MAX, exc, wait)
+                time.sleep(wait)
+    raise RuntimeError(
+        f"Could not get a token from your az login session after {RETRY_MAX} attempts: {last_exc}. "
+        f"Try running `az account get-access-token --output none` to refresh your session, "
+        f"then re-run this script."
+    ) from last_exc
+
+def _auth_hdrs() -> dict:
+    return {"Authorization": f"Bearer {_graph_token()}"}
+
+def get_current_cli_tenant() -> str:
+    import base64
+    token = _graph_token()
+    payload_b64 = token.split(".")[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    return payload.get("tid", "")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _http(method: str, url: str, headers: dict,
+          body: dict | None = None, timeout: int = 30) -> dict:
+    data = json.dumps(body).encode("utf-8") if body else None
+    req  = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode("utf-8")[:300]
+        raise RuntimeError(f"HTTP {e.code} {method} {url}: {body_text}") from e
+
+def _http_with_retry(method: str, url: str, headers: dict,
+                     body: dict | None = None, timeout: int = 30) -> dict:
+    last_exc: Exception | None = None
+    for attempt in range(1, RETRY_MAX + 1):
+        try:
+            return _http(method, url, headers, body, timeout)
+        except (RuntimeError, urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+            if attempt < RETRY_MAX:
+                wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+                log.warning("Attempt %d/%d failed (%s) — retrying in %.1fs",
+                            attempt, RETRY_MAX, exc, wait)
+                time.sleep(wait)
+    raise RuntimeError(f"All {RETRY_MAX} attempts failed: {last_exc}") from last_exc
+
+def _get(url: str, timeout: int = 30) -> dict:
+    return _http("GET", url, _auth_hdrs(), timeout=timeout)
+
+def _post_retry(url: str, body: dict, timeout: int = 30) -> dict:
+    hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
+    return _http_with_retry("POST", url, hdrs, body, timeout)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Read active SharePoint rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_active_sp_rows() -> list[dict]:
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_LIST_ID}/items"
+        f"?$expand=fields&$select=id,fields&$top=999"
+    )
+    all_items: list[dict] = []
+    while url:
+        b = _get(url, timeout=30)
+        all_items.extend(b.get("value", []))
+        url = b.get("@odata.nextLink")
+
+    active = [
+        item for item in all_items
+        if item.get("fields", {}).get("AlertStatus") not in SKIP_STATUSES
+    ]
+    log.info("SharePoint: %d total rows, %d active, %d terminal (skipped)",
+             len(all_items), len(active), len(all_items) - len(active))
+    return active
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Entra owners + resolution, scoped to whichever tenant your CLI
+# session is CURRENTLY in.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_entra_owners(object_id: str) -> set[str]:
+    url = f"https://graph.microsoft.com/v1.0/applications/{object_id}/owners"
+    try:
+        b = _get(url, timeout=15)
+        return {o.get("displayName", "").strip().lower()
+                for o in b.get("value", []) if o.get("displayName")}
+    except Exception as e:
+        log.warning("fetch_entra_owners failed for %s: %s", object_id, e)
+        return set()
+
+def resolve_identifier(identifier: str) -> list[dict]:
+    matches: list[dict] = []
+
+    if "@" in identifier:
+        filter_expr = urllib.parse.quote(f"userPrincipalName eq '{identifier}'")
+        url = f"https://graph.microsoft.com/v1.0/users?$filter={filter_expr}&$select=id,displayName"
+        try:
+            b = _get(url, timeout=15)
+            for u in b.get("value", []):
+                matches.append({"id": u["id"], "displayName": u.get("displayName", identifier), "kind": "user"})
+        except Exception as e:
+            log.warning("User lookup failed for %r: %s", identifier, e)
+        if matches:
+            return matches
+
+    filter_expr = urllib.parse.quote(f"displayName eq '{identifier}'")
+    url = f"https://graph.microsoft.com/v1.0/servicePrincipals?$filter={filter_expr}&$select=id,displayName&$count=true"
+    try:
+        req = urllib.request.Request(url, headers={**_auth_hdrs(), "ConsistencyLevel": "eventual"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            b = json.loads(resp.read().decode("utf-8"))
+        for sp in b.get("value", []):
+            matches.append({"id": sp["id"], "displayName": sp.get("displayName", identifier), "kind": "servicePrincipal"})
+    except Exception as e:
+        log.warning("Service principal lookup failed for %r: %s", identifier, e)
+    if matches:
+        return matches
+
+    import re as _re
+    if _re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', identifier, _re.IGNORECASE):
+        filter_expr2 = urllib.parse.quote(f"appId eq '{identifier}'")
+        url2 = f"https://graph.microsoft.com/v1.0/servicePrincipals?$filter={filter_expr2}&$select=id,displayName"
+        try:
+            b2 = _get(url2, timeout=15)
+            for sp in b2.get("value", []):
+                matches.append({"id": sp["id"], "displayName": sp.get("displayName", identifier), "kind": "servicePrincipal"})
+        except Exception as e:
+            log.warning("Service principal appId lookup failed for %r: %s", identifier, e)
+
+    return matches
+
+def add_owner_to_app(app_object_id: str, owner_object_id: str,
+                     identifier: str, app_name: str) -> dict:
+    url  = f"https://graph.microsoft.com/v1.0/applications/{app_object_id}/owners/$ref"
+    body = {"@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{owner_object_id}"}
+    try:
+        _post_retry(url, body, timeout=20)
+        log.info("Added owner %s to %s", identifier, app_name)
+        return {"status": "added", "identifier": identifier, "error": None}
+    except RuntimeError as e:
+        err_str = str(e)
+        if "already exist" in err_str.lower():
+            return {"status": "already_exists", "identifier": identifier, "error": None}
+        return {"status": "failed", "identifier": identifier, "error": err_str[:250]}
+
+def process_app(app_object_id: str, app_name: str, manual_owners_str: str) -> dict:
+    result = {"app_name": app_name, "object_id": app_object_id,
+              "added": [], "already": [], "failed": [], "unresolved": [], "ambiguous": []}
+
+    identifiers = [o.strip() for o in manual_owners_str.split(",") if o.strip()]
+    if not identifiers:
+        return result
+
+    entra_owners_normalised = fetch_entra_owners(app_object_id)
+
+    for identifier in identifiers:
+        matches = resolve_identifier(identifier)
+
+        if not matches:
+            result["unresolved"].append(identifier)
+            log.warning("Could not resolve %r for app %s — skipping.", identifier, app_name)
+            continue
+
+        if len(matches) > 1:
+            result["ambiguous"].append({"identifier": identifier, "matched": [m["displayName"] for m in matches]})
+            log.warning("AMBIGUOUS — %r matched %d objects for app %s: %s. Adding ALL per configured behavior.",
+                        identifier, len(matches), app_name, [m["displayName"] for m in matches])
+
+        for match in matches:
+            name_lower = match["displayName"].strip().lower()
+            if name_lower in entra_owners_normalised:
+                result["already"].append(match["displayName"])
+                continue
+            add_result = add_owner_to_app(app_object_id, match["id"], match["displayName"], app_name)
+            if add_result["status"] in ("added", "already_exists"):
+                result["added"].append(match["displayName"])
+                entra_owners_normalised.add(name_lower)
+            else:
+                result["failed"].append(match["displayName"])
+                log.error("Failed to add %s to %s: %s", match["displayName"], app_name, add_result["error"])
+
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN — groups by tenant, pauses between tenants for you to switch
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run() -> dict:
+    summary: dict[str, Any] = {
+        "rowsScanned": 0, "appsChecked": 0,
+        "skippedBlankObjectId": 0, "skippedBlankManualOwners": 0,
+        "skippedBlankTenant": 0, "skippedTenantNotConfigured": 0,
+        "ownersAdded": 0, "ownersAlready": 0, "ownersFailed": 0,
+        "unresolved": 0, "ambiguousCount": 0,
+        "changes": [], "ambiguousDetail": [], "unresolvedDetail": [], "errors": [],
+    }
+
+    print("Checking current az login session tenant...")
+    try:
+        current_tenant = get_current_cli_tenant()
+        print(f"  Currently signed into tenant: {current_tenant}\n")
+    except Exception as e:
+        print(f"\nCould not get a token from your az login session: {e}")
+        print("Run `az login` first, then re-run this script.")
+        sys.exit(1)
+
+    active_rows = get_active_sp_rows()
+    summary["rowsScanned"] = len(active_rows)
+    if not active_rows:
+        print("No active rows — nothing to sync.")
+        return summary
+
+    single_tenant_fallback = CROSS_TENANT_TENANT_IDS[0] if len(CROSS_TENANT_TENANT_IDS) == 1 else None
+
+    apps: dict[str, dict] = {}
+    for item in active_rows:
+        f             = item.get("fields", {})
+        object_id     = f.get("ObjectID", "")
+        app_name      = f.get("AppName", "Unknown")
+        tenant_id     = (f.get("TenantID") or "").strip()
+        manual_owners = (f.get("ManualAppOwners") or "").strip()
+
+        if not manual_owners:
+            continue  # not an error — most rows legitimately have no manual entry
+
+        if not object_id:
+            summary["skippedBlankObjectId"] += 1
+            log.warning("Row %s has ManualAppOwners set but blank ObjectID — cannot act on it.", app_name)
+            continue
+
+        if not tenant_id:
+            if single_tenant_fallback:
+                tenant_id = single_tenant_fallback
+                log.info("Row %s has blank TenantID — only one tenant configured (%s), using it.",
+                         app_name, tenant_id)
+            else:
+                summary["skippedBlankTenant"] += 1
+                log.warning("Row %s has ManualAppOwners set but blank TenantID, and multiple "
+                            "tenants are configured — cannot safely guess which one. Skipping.",
+                            app_name)
+                continue
+        elif tenant_id not in CROSS_TENANT_TENANT_IDS:
+            summary["skippedTenantNotConfigured"] += 1
+            log.warning("Row %s has TenantID=%s, not in configured CROSS_TENANT_TENANT_IDS=%s — skipping.",
+                        app_name, tenant_id, CROSS_TENANT_TENANT_IDS)
+            continue
+
+        apps.setdefault(tenant_id, {})[object_id] = {"app_name": app_name, "manual_owners": manual_owners}
+
+    summary["appsChecked"] = sum(len(v) for v in apps.values())
+
+    for tenant_id, tenant_apps in apps.items():
+        print("=" * 60)
+        print(f"TENANT {tenant_id} — {len(tenant_apps)} app(s) to process")
+        print("=" * 60)
+
+        if tenant_id != current_tenant:
+            print(f"\n  Your CLI session is NOT currently in this tenant.")
+            print(f"  Run this in another terminal, or here after Ctrl+C:")
+            print(f"\n    az login --tenant {tenant_id}\n")
+            input("  Press Enter once you've switched (or Ctrl+C to skip this tenant)... ")
+            new_tenant = get_current_cli_tenant()
+            if new_tenant != tenant_id:
+                print(f"  Still signed into {new_tenant}, not {tenant_id} — skipping this tenant.")
+                summary["errors"].append(f"Tenant {tenant_id}: CLI session never switched — skipped")
+                continue
+            print(f"  Confirmed — now signed into {tenant_id}.\n")
+
+        for object_id, info in tenant_apps.items():
+            try:
+                result = process_app(object_id, info["app_name"], info["manual_owners"])
+                summary["ownersAdded"]   += len(result["added"])
+                summary["ownersAlready"] += len(result["already"])
+                summary["ownersFailed"]  += len(result["failed"])
+                summary["unresolved"]    += len(result["unresolved"])
+                summary["ambiguousCount"] += len(result["ambiguous"])
+                if result["added"]:
+                    summary["changes"].append({"app": info["app_name"], "tenant": tenant_id, "added": result["added"]})
+                for amb in result["ambiguous"]:
+                    summary["ambiguousDetail"].append({"app": info["app_name"], "tenant": tenant_id, **amb})
+                for u in result["unresolved"]:
+                    summary["unresolvedDetail"].append({"app": info["app_name"], "tenant": tenant_id, "identifier": u})
+                for f_owner in result["failed"]:
+                    summary["errors"].append(f"Failed to add {f_owner} to {info['app_name']} (tenant {tenant_id})")
+            except Exception as e:
+                summary["errors"].append(f"process_app failed for {info['app_name']}: {e}")
+
+    return summary
+
+def main():
+    print(f"owner_sync_local.py v4.1 — run manually, writes to Entra as YOU")
+    print(f"Started: {_now_string()}\n")
+    t0 = time.time()
+    summary = run()
+    elapsed = time.time() - t0
+
+    print("\n" + "=" * 60)
+    print("OWNER SYNC (LOCAL) — SUMMARY")
+    print("=" * 60)
+    print(f"  Total Runtime      : {elapsed:.1f}s")
+    print(f"  SP Rows Scanned    : {summary['rowsScanned']}")
+    print(f"  Apps Checked       : {summary['appsChecked']}  (non-blank ManualAppOwners, usable)")
+    print(f"  Owners Added       : {summary['ownersAdded']}")
+    print(f"  Already in Entra   : {summary['ownersAlready']}")
+    print(f"  Failed             : {summary['ownersFailed']}")
+    print(f"  Unresolved         : {summary['unresolved']}")
+    print(f"  Ambiguous          : {summary['ambiguousCount']}")
+
+    skip_total = (summary['skippedBlankObjectId'] + summary['skippedBlankManualOwners']
+                  + summary['skippedBlankTenant'] + summary['skippedTenantNotConfigured'])
+    if skip_total:
+        print(f"\n  Skipped rows with ManualAppOwners set but unusable ({skip_total}):")
+        if summary['skippedBlankObjectId']:
+            print(f"    Blank ObjectID              : {summary['skippedBlankObjectId']}")
+        if summary['skippedBlankTenant']:
+            print(f"    Blank TenantID (multi-tenant, can't guess) : {summary['skippedBlankTenant']}")
+        if summary['skippedTenantNotConfigured']:
+            print(f"    TenantID not in CROSS_TENANT_TENANT_IDS    : {summary['skippedTenantNotConfigured']}")
+
+    if summary["changes"]:
+        print(f"\n  Changes made:")
+        for c in summary["changes"]:
+            print(f"    {c['app']} (tenant {c['tenant']}) — added: {', '.join(c['added'])}")
+
+    if summary["ambiguousDetail"]:
+        print(f"\n  ⚠ AMBIGUOUS — verify these were intended:")
+        for a in summary["ambiguousDetail"]:
+            print(f"    {a['app']} (tenant {a['tenant']}) — {a['identifier']!r} matched: {', '.join(a['matched'])}")
+
+    if summary["unresolvedDetail"]:
+        print(f"\n  Unresolved:")
+        for u in summary["unresolvedDetail"]:
+            print(f"    {u['app']} (tenant {u['tenant']}) — {u['identifier']!r} not found")
+
+    if summary["errors"]:
+        print(f"\n  ERRORS ({len(summary['errors'])}):")
+        for err in summary["errors"][:15]:
+            print(f"    - {err}")
+        sys.exit(1)
+    else:
+        print(f"\n  Done.")
+
+if __name__ == "__main__":
+    main()
+```
