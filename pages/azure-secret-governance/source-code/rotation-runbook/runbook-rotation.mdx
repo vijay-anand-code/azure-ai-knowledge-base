@@ -13,7 +13,7 @@ import { Callout } from 'nextra/components'
 
 **Schedule:** Weekly at `01:00`, 1 hour after monitoring.
 
-**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P4 secrets whose SharePoint row has `ManualAppOwners` filled in by a human (Phase B). New secret values are stored in the rotation Key Vault and a comment is posted to the Jira ticket with retrieval instructions.
+**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P3 secrets whose SharePoint row has `ManualAppOwners` filled in by a human (Phase B). P4 (61+ days, safe) is never rotation eligible. New secret values are stored in the rotation Key Vault, or in a row's `ProductTeamkeyVaultName` Key Vault instead if that column is filled in, and a comment is posted to the Jira ticket with retrieval instructions.
 
 ---
 
@@ -26,7 +26,8 @@ import { Callout } from 'nextra/components'
 | Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
 | 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
-| `ManualAppOwners` gate | Rotation is gated on `ManualAppOwners` in SharePoint, filled in by a human — not the auto-stamped `AppOwners` column, which is informational only |
+| `ManualAppOwners` gate | Rotation is gated on `ManualAppOwners` in SharePoint, filled in by a human or resolved from `ProductName` by monitoring — not the auto-stamped `AppOwners` column, which is informational only |
+| `ProductTeamkeyVaultName` override | If a row has this column filled in, `store_rotated_secret()` writes the newly rotated value into that specific Key Vault instead of the shared rotation Key Vault. A `SecretClient` for a given override vault is built once and reused for the rest of the run |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
 | Fractional-seconds normalization | Graph's `endDateTime` can return 5 or 7-digit fractional seconds. Python 3.10's `fromisoformat()` only accepts 0, 3, or 6 digits and raises on anything else — normalized before parsing so valid expiry dates aren't silently skipped |
 
@@ -160,9 +161,10 @@ on the target app's row. Trigger it manually:
 Open the `SecretAlertRegistry` row for the target app — `AppOwners` should now
 include the cross-tenant app's display name (or `Name <email>` for user owners),
 confirming the Entra ownership landed. Rotation itself is gated by `ManualAppOwners`,
-so also make sure that field is filled in by a human on this row. Once both are set,
-rotation will act on this app on its next run, provided the app's secret is also in
-a `P1`-`P4` bucket.
+so also make sure that field is filled in by a human on this row (or resolved from
+`ProductName`). Once both are set, rotation will act on this app on its next run,
+provided the app's secret is also in a `P1`-`P3` bucket. `P4` (61+ days, safe) is
+never rotation eligible.
 
 <Callout type="warning">
   Removing an owner works the same way with `-Method Delete` against
@@ -200,12 +202,21 @@ Changes in v3 (this version):
      default 365, replacing the old hardcoded 12-month calculation.
 
   5. BUCKET SCHEME CORRECTED (NEW in v3) — this file previously had its
-     OWN, stale bucket classifier (P4=safe/61+, P3=31-60, P2=8-30,
-     P1=0-7 — the OLD pre-split scheme) that disagreed with
-     decision_engine.py's current P1=0-3/P2=4-7/P3=8-30/P4=31-60/P5=61+.
-     _classify_bucket() now matches exactly. ROTATION_ELIGIBLE_BUCKETS is
-     {"P1","P2","P3","P4"} — same 0-60 day range as before, re-expressed
-     under the current names. P5 is never rotation-eligible.
+     OWN, stale bucket classifier that disagreed with decision_engine.py's
+     bucket names AT THE TIME (v3 shipped under the five-bucket scheme:
+     P1=0-3, P2=4-7, P3=8-30, P4=31-60, P5=61+ safe). _classify_bucket()
+     was brought in line with decision_engine.py's names as of v3.
+     ROTATION_ELIGIBLE_BUCKETS at the time was {"P1","P2","P3","P4"} — the
+     same 0-60 day range as before, re-expressed under v3's names. P5 was
+     never rotation-eligible under that scheme.
+
+     SUPERSEDED since v3: decision_engine.py later merged the old P1/P2
+     into one P1 (0-7 days) and renumbered everything below it down by
+     one — see the ROTATION_ELIGIBLE_BUCKETS definition and
+     _classify_bucket() further down in this file for the four-bucket
+     names actually in effect now. Under the current names,
+     ROTATION_ELIGIBLE_BUCKETS is {"P1","P2","P3"}, and P4 (now the safe,
+     61+ day bucket) is never rotation-eligible.
 
   (v1 retained: "Discovered" in ACTIONABLE_STATUSES and the SharePoint
    OData filter.)

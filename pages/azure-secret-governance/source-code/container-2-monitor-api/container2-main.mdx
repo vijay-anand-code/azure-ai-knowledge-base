@@ -43,6 +43,7 @@ import { Callout } from 'nextra/components'
 | `httpx.AsyncClient` | All tool implementations are async for compatibility with FastAPI's async event loop |
 | Date columns truncated to 10 chars | SharePoint date-only fields reject ISO timestamps — all date writes are sliced to `YYYY-MM-DD` |
 | Two credential scopes, not one | Entra scanning and SharePoint access are deliberately kept on separate federated credentials. See "Multi-tenant credentials" below |
+| `get_product_service_principal()` | Looks up a Key Vault secret named exactly after a row's `ProductName` and returns its value, or `None` if no such secret exists. A missing secret is expected, not an error, so one unrecognized product doesn't fail the whole run. Passed into `decision_engine.py` as `get_product_service_principal`, see its ProductName lookup section for how it's used |
 
 <Callout type="info">
   Most `/tools/*` endpoints are only ever called by Container 1. `/tools/jira-status-update`

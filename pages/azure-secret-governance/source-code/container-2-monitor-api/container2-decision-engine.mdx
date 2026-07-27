@@ -42,8 +42,27 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 |-------|-------------|
 | Phase 1 — New secrets, Jira | For secrets not yet in SharePoint: create Jira tickets in batches of 5 |
 | Phase 2 — New secrets, SP + Teams | Write SharePoint rows and send Teams alerts in batches of 10 |
-| Phase 3 — new P5 secrets | Log only — no SharePoint row, no alert |
+| Phase 3 — new P4 secrets (61+ days, safe) | Written to SharePoint with owners stamped, no alert, no ticket. An earlier version of this phase only logged these to the console with no SharePoint row at all, inconsistent with how an already-existing P4 row was treated — fixed so both paths write the same way |
 | Phase 4 — Existing secrets | Escalate or update existing rows based on current bucket vs recorded status |
+
+---
+
+## Bucket renumbering: five buckets to four
+
+An earlier version of this system used five buckets: P1 (0-3 days), P2 (4-7 days), P3 (8-30
+days), P4 (31-60 days), P5 (61+ days, safe). That has been replaced with four buckets. P1 and P2
+merged into a single P1 covering 0 to 7 days, and every bucket below it shifted down by one name:
+old P3 is now P2, old P4 is now P3, old P5 (safe) is now P4.
+
+The tagging-vs-plain-alert distinction that used to be the P1/P2 boundary didn't disappear, it
+moved inside bucket P1: `should_tag_p1()` decides, from the secret's actual day count, whether a
+P1 Teams alert tags a specific person (0 to 3 days) or sends a plain alert (4 to 7 days). Both
+halves still raise a Jira ticket and send a Teams alert, only the tagging differs.
+
+The four Jira priority names, P1 through P4, already existed in the Jira project before this
+change, so nothing needed creating there, only the day ranges each name maps to moved. P4 no
+longer maps to any ticket at all now that it means the safe bucket, since P4 secrets never raise
+a ticket.
 
 ---
 
@@ -51,13 +70,37 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 
 | Bucket | Days | Alert status set | Teams alert |
 |--------|------|-----------------|-------------|
-| P1 | 0–3 | `CriticalTagged` | Yes — CRITICAL, tags a specific person |
-| P2 | 4–7 | `Escalated` | Yes — CRITICAL, no tagging |
-| P3 | 8–30 | `TeamsAlerted` | Yes — WARNING |
-| P4 | 31–60 | `JiraRaised` | No |
-| P5 | 61+ | Written to SharePoint if already tracked and refreshed each run; brand-new P5 secrets are log only | No |
+| P1, 0 to 3 days | 0–3 | `CriticalTagged` | Yes — CRITICAL, tags a specific person |
+| P1, 4 to 7 days | 4–7 | `Escalated` | Yes — CRITICAL, no tagging |
+| P2 | 8–30 | `TeamsAlerted` | Yes — WARNING |
+| P3 | 31–60 | `JiraRaised` | No |
+| P4 | 61+ | Written to SharePoint, owners stamped, refreshed every run | No |
 | ExpiredManualReview | -7 to -1 | `ExpiredManualReview` | Yes — EXPIRED |
 | Ignore, subject to abandonment check | -8 and older | Stays visible and marked overdue if the Jira ticket is still open, otherwise moved to `IgnoredSecretRegistry` | No |
+
+---
+
+## ProductName lookup
+
+A row's `ManualAppOwners` can be filled in two ways: a human types it in directly, or it gets
+resolved automatically from the row's `ProductName` column.
+
+If `ProductName` is filled in, `get_product_service_principal()` looks up a Key Vault secret
+literally named after that product (a secret called `ProductA` for a row with `ProductName`
+`ProductA`) and writes its value, a service principal name, into `ManualAppOwners` for that row.
+This always overwrites whatever was there already, `ProductName` is meant to be the team's
+single source of truth going forward. A `ProductName` with no matching Key Vault secret leaves
+`ManualAppOwners` untouched rather than failing the run.
+
+This lookup runs before the `ManualAppOwners` propagation step below, so a value it sets can
+still reach every sibling row for the same app in the same run. Lookups are cached per product
+name within a single run, so a product used across many rows only costs one Key Vault read.
+
+<Callout type="info">
+  `ProductTeamkeyVaultName`, a separate column, is unrelated to this lookup. It controls where
+  `runbook_rotation.py` stores a newly rotated secret's value, not where `ManualAppOwners` comes
+  from. See the rotation runbook page for that.
+</Callout>
 
 ---
 
@@ -70,7 +113,9 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 | Escalation stage check | `BUCKET_STAGE` vs `STATUS_STAGE` prevents sending duplicate alerts for the same severity |
 | Self-heal missing Jira ticket | If an existing SP row has no `JiraTicketKey`, the engine creates a new ticket rather than silently skipping |
 | `MONITOR_SKIP_STATUSES` | `Rotated`, `Ignored`, `Resolved`, and `RotatedPendingDeployment` rows are never re-alerted. `Blocked` and `AwaitingReporter` rows are also skipped, but only while paused — they resume once the Jira ticket moves to a different status |
-| `ManualAppOwners` gate | Monitoring is gated on `ManualAppOwners` in SharePoint, filled in by a human, and propagated app-wide before filtering. Legacy `owner_emails` matching against `AppOwners` is still accepted as a parameter but ignored by default |
+| `ManualAppOwners` gate | Monitoring is gated on `ManualAppOwners` in SharePoint, filled in by a human or resolved from `ProductName`, and propagated app-wide before filtering. Legacy `owner_emails` matching against `AppOwners` is still accepted as a parameter but ignored by default |
+| `should_tag_p1()` | Whether a P1 Teams alert tags someone is a day-count decision within the bucket, not a separate bucket membership check |
+| `ProductName` lookup, cached per run | Resolves `ManualAppOwners` from a Key Vault secret named after the product, so onboarding a new product is one Key Vault secret, no code change |
 
 <Callout type="info">
   Monitoring gates on `ManualAppOwners` in SharePoint being non-blank, not `AppOwners`

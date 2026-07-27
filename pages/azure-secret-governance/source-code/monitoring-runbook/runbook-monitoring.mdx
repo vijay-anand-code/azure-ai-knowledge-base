@@ -1,6 +1,6 @@
 ---
 title: runbook_monitoring.py
-description: Triggers the weekly secret monitoring cycle in Container 1
+description: Triggers the weekly secret monitoring cycle, pointed directly at Container 2
 ---
 
 import { Callout } from 'nextra/components'
@@ -11,9 +11,23 @@ import { Callout } from 'nextra/components'
 
 **Runtime:** Python 3.10 — Azure Automation Account
 
-**Schedule:** Weekly at `00:30`, 30 minutes after discovery.
+**Schedule:** Weekly at `00:30`, 30 minutes after discovery. The gap gives discovery time to
+finish writing to `SecretAlertRegistry` before monitoring reads that same list, so monitoring
+never reads a half-written run.
 
-**What it does:** Sends a POST to the Container App `/run` endpoint with an instruction to run the weekly monitoring check. Returns immediately — the container handles the full cycle as a background task.
+**What it does:** Sends a POST to whatever `AGENT_ENDPOINT` points at, with an instruction to run
+the weekly monitoring check, and returns as soon as the request is accepted. The actual
+classification, ticket creation, and alerting all happen elsewhere, in Container 2's
+`decision_engine.py`, this runbook contains none of that logic itself, only the trigger.
+
+<Callout type="info">
+  `AGENT_ENDPOINT` is pointed directly at Container 2's monitoring endpoint in the current
+  deployment, bypassing Container 1's LangChain agent entirely. A scheduled trigger needs no
+  reasoning step, so going through GPT-4o added cost, rate-limit exposure, and tens of seconds of
+  latency for nothing. Pointing `AGENT_ENDPOINT` at Container 1's `/run` instead would route the
+  same trigger through the LangChain agent, but that is not how this runbook is currently
+  configured.
+</Callout>
 
 ---
 
@@ -21,9 +35,9 @@ import { Callout } from 'nextra/components'
 
 | Decision | Reason |
 |----------|--------|
-| Fire-and-forget pattern | `/run` returns immediately; the LangChain agent runs in background. A 30s timeout avoids the runbook hanging if the container is slow to respond |
-| Timeout treated as success | If no response arrives within 30s, the request was accepted and the agent is running. Raising an error would be a false failure |
-| Minimal runbook | All business logic lives in Container 1. The runbook is a thin scheduler trigger — nothing to break or debug here |
+| Fire-and-forget pattern | The container returns immediately and runs the actual cycle as a background task. A 30s timeout avoids the runbook hanging if the container is slow to respond |
+| Timeout treated as success | If no response arrives within 30s, or the connection resets, the request was already accepted and the cycle is running. Only a genuine HTTP error status from the container counts as a real failure. Raising an error on a plain timeout would be a false failure |
+| Minimal runbook | All classification, ticket, and alert logic lives in Container 2's `decision_engine.py`. This runbook is a thin scheduler trigger — nothing to break or debug here |
 
 ---
 
@@ -33,14 +47,8 @@ import { Callout } from 'nextra/components'
 
 | Variable | Value |
 |----------|-------|
-| `AGENT_ENDPOINT` | `https://<container-app-fqdn>/run` |
-| `AGENT_API_KEY` | Shared secret header value (set to empty string `""` to disable auth) |
-
-<Callout type="info">
-  To bypass LangChain and call monitoring directly — skipping GPT-4o entirely — change
-  `AGENT_ENDPOINT` to `https://<fqdn>/run-monitoring`. This calls Container 2 directly
-  with zero OpenAI tokens used.
-</Callout>
+| `AGENT_ENDPOINT` | The Container 1 or Container 2 `/run` URL. Currently pointed at Container 2, bypassing Container 1's LangChain agent |
+| `AGENT_API_KEY` | Shared secret header value (set to empty string `""` to disable the header entirely) |
 
 ---
 
@@ -50,7 +58,8 @@ import { Callout } from 'nextra/components'
 """
 runbook_monitoring.py — Azure Automation Runbook
 =================================================
-Purpose : Trigger the Secret Monitoring governance cycle in Container 1
+Purpose : Trigger the Secret Monitoring governance cycle at AGENT_ENDPOINT
+          (currently Container 2 directly, bypassing Container 1's LangChain agent)
 Schedule: Every 7 days (configured in Azure Automation Account)
 Runtime : Python 3.10 (Azure Automation)
 

@@ -381,10 +381,10 @@ The UAMI is only used to assert identity, it holds no direct Graph permissions o
 
 | Time | Runbook | What it does |
 |------|---------|-------------|
-| `00:00` | `runbook_discovery.py` | Scans every configured tenant, classifies every secret P1 through P5, backs up both SharePoint lists before writing |
+| `00:00` | `runbook_discovery.py` | Scans every configured tenant, classifies every secret P1 through P4, backs up both SharePoint lists before writing |
 | Run manually | `owner_sync_local.py` | Reads `ManualAppOwners` and adds the named identity as an Entra owner. Runs on a laptop, not on the Automation Account, so this step is deliberately outside the schedule |
 | `00:30` | `runbook_monitoring.py` | Triggers the monitoring container, raises Jira tickets and Teams alerts, propagates `ManualAppOwners` to sibling rows |
-| `01:00` | `runbook_rotation.py` | Rotates P1 through P4 secrets, stores new values in Key Vault |
+| `01:00` | `runbook_rotation.py` | Rotates P1 through P3 secrets, stores new values in Key Vault |
 
 <Callout type="info">
   The 30-minute gap between discovery and monitoring gives discovery time to finish writing
