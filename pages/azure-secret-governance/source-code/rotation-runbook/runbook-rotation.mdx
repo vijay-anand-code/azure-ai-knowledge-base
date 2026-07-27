@@ -13,7 +13,7 @@ import { Callout } from 'nextra/components'
 
 **Schedule:** Weekly at `01:00`, 1 hour after monitoring.
 
-**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1/P2/P3 secrets owned by the configured owner (Phase B). New secret values are stored in the rotation Key Vault and a comment is posted to the Jira ticket with retrieval instructions.
+**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P4 secrets whose SharePoint row has `ManualAppOwners` filled in by a human (Phase B). New secret values are stored in the rotation Key Vault and a comment is posted to the Jira ticket with retrieval instructions.
 
 ---
 
@@ -26,7 +26,7 @@ import { Callout } from 'nextra/components'
 | Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
 | 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
-| `OWNER-EMAIL` fallback | Reads `OWNER-EMAILS` first, falls back to legacy `OWNER-EMAIL` for backwards compatibility |
+| `ManualAppOwners` gate | Rotation is gated on `ManualAppOwners` in SharePoint, filled in by a human — not the auto-stamped `AppOwners` column, which is informational only |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
 | Fractional-seconds normalization | Graph's `endDateTime` can return 5 or 7-digit fractional seconds. Python 3.10's `fromisoformat()` only accepts 0, 3, or 6 digits and raises on anything else — normalized before parsing so valid expiry dates aren't silently skipped |
 
@@ -51,16 +51,20 @@ import { Callout } from 'nextra/components'
 | `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
 | `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
 | `CROSS-TENANT-APP-ID` | App Registration client ID for federated credential |
-| `CROSS-TENANT-TENANT-ID` | Tenant ID where App Registration lives |
+| `CROSS-TENANT-TENANT-IDS` | Comma-separated tenant IDs to scan for App Registrations (falls back to singular `CROSS-TENANT-TENANT-ID` if not set) |
+| `HOME-TENANT-ID` | Tenant ID for SharePoint access — always this tenant regardless of which tenant is being scanned (falls back to `GRAPH-TENANT-ID` if not set) |
+| `SECRET-VALIDITY-DAYS` | How many days a newly rotated secret stays valid (falls back to 365 if not set) |
 | `JIRA-BASE-URL` | Jira instance URL |
 | `JIRA-API-TOKEN` | Jira API token |
 | `JIRA-USER-EMAIL` | Jira account email |
-| `OWNER-EMAIL` | App Registration display name — e.g. `azure-secretgovernance-cross-tenant` |
+| `OWNER-EMAILS` | Legacy owner filter, logged only (falls back to `OWNER-EMAIL`) — no longer used to gate rotation; that's now `ManualAppOwners` in SharePoint |
 
 <Callout type="warning">
-  The runbook will only rotate secrets for apps where `AppOwners` in SharePoint contains
-  the value from `OWNER-EMAIL`. Apps where the App Registration is not listed as an Entra
-  owner return HTTP 403 from the Graph `addPassword` endpoint — a second layer of enforcement.
+  The runbook will only rotate secrets for apps where `ManualAppOwners` in SharePoint is
+  filled in by a human — the auto-stamped `AppOwners` column is informational only and is
+  never used to gate rotation. Separately, apps where the App Registration is not listed as
+  an Entra owner return HTTP 403 from the Graph `addPassword` endpoint — a second layer of
+  enforcement.
 </Callout>
 
 <Callout type="info">
@@ -76,11 +80,13 @@ import { Callout } from 'nextra/components'
 
 ## Testing rotation — adding the cross-tenant app as an owner
 
-Rotation only acts on apps where `AppOwners` in SharePoint contains the configured
-`OWNER-EMAIL`/`OWNER-EMAILS` value. To test rotation end-to-end on a specific app,
-add the cross-tenant App Registration's Service Principal as an **owner** of that
-target app in Entra ID, then re-run discovery so the ownership is stamped into
-SharePoint before rotation reads it.
+Rotation itself is gated on `ManualAppOwners` in SharePoint being filled in by a human.
+Separately, the Graph `addPassword` call requires the cross-tenant App Registration's
+Service Principal to be listed as an **owner** of the target app in Entra ID, or it
+returns HTTP 403. To test rotation end-to-end on a specific app, add the cross-tenant
+Service Principal as an owner of that target app in Entra ID, then re-run discovery so
+the ownership is stamped into SharePoint's `AppOwners` column, and fill in
+`ManualAppOwners` on that row yourself.
 
 ### 1. Get a fresh Graph token
 
@@ -143,17 +149,20 @@ owner alongside any existing owners.
 
 ### 6. Re-run discovery to sync ownership into SharePoint
 
-Rotation reads `AppOwners` from **SharePoint**, not Entra ID directly. The ownership
-change made above won't be visible to rotation until `runbook_discovery.py` runs
-again and re-stamps `AppOwners` on the target app's row. Trigger it manually:
+The `AppOwners` column in SharePoint is auto-stamped from Entra and used here only to
+confirm the ownership change landed — it doesn't gate rotation. That change won't be
+visible in SharePoint until `runbook_discovery.py` runs again and re-stamps `AppOwners`
+on the target app's row. Trigger it manually:
 **Azure Portal → Automation Account → Runbooks → `SecretDiscovery` → Start**.
 
 ### 7. Confirm in SharePoint
 
 Open the `SecretAlertRegistry` row for the target app — `AppOwners` should now
-include the cross-tenant app's display name (or `Name <email>` for user owners).
-Once confirmed, rotation's `OWNER_EMAILS` filter will match this app on its next
-run, provided the app's secret is also in a `P1`/`P2`/`P3` bucket.
+include the cross-tenant app's display name (or `Name <email>` for user owners),
+confirming the Entra ownership landed. Rotation itself is gated by `ManualAppOwners`,
+so also make sure that field is filled in by a human on this row. Once both are set,
+rotation will act on this app on its next run, provided the app's secret is also in
+a `P1`-`P4` bucket.
 
 <Callout type="warning">
   Removing an owner works the same way with `-Method Delete` against
