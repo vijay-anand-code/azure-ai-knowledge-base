@@ -562,8 +562,9 @@ def get_tenant_name() -> str:
 def _classify_bucket(days: int) -> str:
     """
     Classify a secret into an expiry bucket based on days remaining.
-    All buckets are classified; P5 (61+ days, safe) is logged only and NOT
-    written to SecretAlertRegistry (Ignore → separate list; P5 → console log only).
+    All buckets are classified and written to SecretAlertRegistry, including
+    P5 (61+ days, safe), per the v10.2 change below. Only "Ignore" (expired
+    8+ days ago) is routed to IgnoredSecretRegistry instead.
 
     P1  0-3 days   CRITICAL     (most urgent)
     P2  4-7 days   CRITICAL
@@ -1817,7 +1818,7 @@ def main():
     print(f"  Total secrets seen in Graph             : {secrets_in_graph}")
     print(f"  Total secrets classified                : {secrets_found}")
     print(f"  → SecretAlertRegistry (active, P1-P4/EMR): {rows_created + rows_updated}")
-    print(f"  → IgnoredSecretRegistry (P5 + expired8+) : {ignored_logged}")
+    print(f"  → IgnoredSecretRegistry (expired8+ only) : {ignored_logged}")
     accounted_for = rows_created + rows_updated + ignored_logged
     if secrets_found and accounted_for != secrets_found:
         print(f"\n  ⚠ WARNING: {secrets_found} secrets classified, but only {accounted_for} "
