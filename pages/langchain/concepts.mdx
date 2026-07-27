@@ -1,0 +1,221 @@
+---
+title: Core concepts
+description: The building blocks LangChain gives you, and how they fit together
+---
+
+import { Callout } from 'nextra/components'
+
+# Core concepts
+
+LangChain is a Python (and JavaScript) framework for building applications on top of large
+language models. On its own, an LLM is a single function: text in, text out. Almost everything
+useful you'd want to build, a chatbot with memory, an agent that can call tools, a pipeline that
+retrieves documents and summarizes them, needs more than that single call. LangChain's job is to
+give you standard, composable building blocks for the "more than that" part, so you're not
+reinventing prompt formatting, output parsing, tool-calling loops, and conversation history from
+scratch on every project.
+
+This page covers the vocabulary and mental model. The other pages in this section go deep on
+each piece: [Chains & runnables](/langchain/chains), [Agents & tools](/langchain/agents),
+[Memory & state](/langchain/memory), [Azure OpenAI integration](/langchain/azure-integration),
+and worked [Code examples](/langchain/code-examples).
+
+---
+
+## The building blocks
+
+| Concept | What it is | Where it lives (package) |
+|---------|-----------|---------------------------|
+| Chat model | A wrapper around a specific LLM provider's API, exposing one consistent interface regardless of vendor | `langchain_openai`, `langchain_anthropic`, etc. |
+| Prompt template | A parameterized template that renders into the messages you send to a chat model | `langchain_core.prompts` |
+| Output parser | Turns raw model output into a structured Python value, a string, a Pydantic model, JSON | `langchain_core.output_parsers` |
+| Runnable | The common interface every one of the above implements, `invoke`, `batch`, `stream`, and their async equivalents | `langchain_core.runnables` |
+| Chain | Two or more Runnables composed together into one pipeline | Built from Runnables using LCEL, see [Chains & runnables](/langchain/chains) |
+| Tool | A Python function (or API call) wrapped so a model can decide to call it, with a name, description, and typed arguments | `langchain_core.tools` |
+| Agent | A loop that lets the model decide which tools to call, in what order, based on the conversation so far | `langchain.agents` |
+| Memory | Anything that persists conversation state (messages, summaries) across multiple calls to a chain or agent | `langchain_core.chat_history`, `langchain_core.runnables.history` |
+
+<Callout type="info">
+  You will see two overlapping vocabularies in LangChain code and documentation: an older
+  "Chains" API built around specific classes like `LLMChain` and `ConversationChain`, and the
+  current **LCEL** (LangChain Expression Language) approach, which composes plain `Runnable`
+  objects with the `|` operator. LCEL is the current recommended approach and is what this whole
+  section assumes unless a page says otherwise. The old class-based chains still work, and
+  you'll still see them in older code and tutorials, but new code in this org is written in
+  LCEL style.
+</Callout>
+
+---
+
+## The mental model: everything is a Runnable
+
+The single most useful thing to internalize about modern LangChain is that a chat model, a
+prompt template, an output parser, a retriever, a tool, and an entire agent all implement the
+same interface: `Runnable`. That interface guarantees, at minimum:
+
+- `invoke(input)`, run once, synchronously, return the result
+- `ainvoke(input)`, the async equivalent
+- `batch(inputs)` / `abatch(inputs)`, run many inputs, possibly in parallel
+- `stream(input)` / `astream(input)`, yield partial results as they become available
+
+Because every piece shares this interface, you can compose them with the `|` operator and the
+result is *also* a `Runnable`, with the same four methods. A prompt piped into a model piped into
+a parser is a three-stage pipeline that behaves, from the outside, exactly like a single model
+call:
+
+```python
+chain = prompt | model | parser
+result = chain.invoke({"topic": "otters"})
+```
+
+This composability is the core idea the rest of this section builds on. [Chains &
+runnables](/langchain/chains) covers it in depth, including the parallel and branching variants
+(`RunnableParallel`, `RunnableLambda`, `RunnableBranch`) you reach for once a straight pipeline
+isn't enough.
+
+---
+
+## Chat models vs. the older LLM interface
+
+LangChain still has a generic `LLM` interface (text in, text string out), left over from a time
+when most providers only exposed a completion API. Almost everything you'll touch today,
+including every Azure OpenAI GPT model, uses the newer `ChatModel` interface instead: input and
+output are structured **messages** (`SystemMessage`, `HumanMessage`, `AIMessage`, `ToolMessage`),
+not raw strings. This matters because:
+
+- System prompts, few-shot examples, and conversation history are all just messages in a list,
+  there's one shape for all of it
+- Tool-calling is expressed as an `AIMessage` with a `tool_calls` field, not by parsing text
+- Multi-turn conversations are naturally a growing list of messages, which is exactly what
+  memory (see [Memory & state](/langchain/memory)) manages for you
+
+If you're integrating with Azure OpenAI specifically, you'll be using `AzureChatOpenAI` from
+`langchain_openai`, a `ChatModel` implementation. See [Azure OpenAI
+integration](/langchain/azure-integration) for the exact setup this org uses.
+
+---
+
+## Prompts
+
+A prompt template separates the fixed structure of what you send a model from the values that
+change per call. `ChatPromptTemplate` builds a list of messages from a mix of fixed text and
+placeholders:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant that only answers questions about {topic}."),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+])
+```
+
+`MessagesPlaceholder` is worth calling out specifically: it's how conversation history and agent
+scratchpad (the record of tool calls an agent has made so far, mid-reasoning) get spliced into
+the message list at render time, rather than being hardcoded as one static message.
+
+---
+
+## Output parsers
+
+A raw `ChatModel` response is an `AIMessage` object, useful, but usually not the shape your
+calling code actually wants. Output parsers convert that into something plainer:
+
+| Parser | Produces |
+|--------|----------|
+| `StrOutputParser` | Just the text content, as a plain string |
+| `JsonOutputParser` | Parses the model's output as JSON |
+| `PydanticOutputParser` | Parses into, and validates against, a Pydantic model you define |
+
+You compose a parser onto the end of a chain the same way as everything else:
+
+```python
+from langchain_core.output_parsers import StrOutputParser
+
+chain = prompt | model | StrOutputParser()
+```
+
+For tool-calling agents specifically, you generally don't need an explicit output parser on the
+final step, the agent framework handles turning tool-call messages into actual function calls
+and feeding the results back in. See [Agents & tools](/langchain/agents).
+
+---
+
+## Tools
+
+A tool is a plain Python function decorated with `@tool`, which uses the function's type hints
+and docstring to build a schema the model can understand, a name, an argument list with types,
+and a natural-language description of what it does and when to use it:
+
+```python
+from langchain_core.tools import tool
+
+@tool
+async def get_weather(city: str) -> str:
+    """Returns the current weather for the given city name."""
+    ...
+```
+
+The docstring is not decoration, it's the only thing the model sees to decide whether and when
+to call this tool. A vague docstring produces a model that calls the tool at the wrong times, or
+never. This is covered in more depth, with real examples, in [Agents & tools](/langchain/agents).
+
+---
+
+## Agents
+
+A chain is a fixed pipeline, you decide the order of operations at code-writing time. An agent is
+different: the model itself decides, at run time, which tools to call, with what arguments, and
+whether it has enough information yet to produce a final answer. `AgentExecutor` is the loop that
+drives this: it calls the model, sees whether the response is a tool call or a final answer, runs
+the tool if needed, feeds the result back to the model, and repeats until the model produces a
+final answer or a `max_iterations` cap is hit.
+
+This is the piece with the most moving parts, and [Agents & tools](/langchain/agents) is written
+around it, including a walkthrough of the actual `AgentExecutor` setup used in Container 1 of the
+Azure Secret Governance system.
+
+---
+
+## Memory
+
+An LLM call, and a chain built from one, is stateless by default, it has no idea what was said in
+a previous call unless you explicitly pass that history back in as part of the input. "Memory" in
+LangChain is the umbrella term for anything that manages that history for you: storing it after
+each turn, and re-injecting it (usually via a `MessagesPlaceholder`) on the next turn. The current
+approach wraps an existing chain or agent with `RunnableWithMessageHistory`, backed by a
+per-session history store. See [Memory & state](/langchain/memory) for the full picture,
+including the exact pattern used in this org's own agents.
+
+---
+
+## Putting it together
+
+A typical LangChain-based agent, like the one powering Container 1's chat and automation
+endpoints in the Secret Governance system, is a composition of everything above:
+
+```
+ChatPromptTemplate (system prompt + history placeholder + human input placeholder)
+        |
+create_tool_calling_agent(llm, tools, prompt)
+        |
+AgentExecutor(agent, tools, max_iterations=...)
+        |
+RunnableWithMessageHistory(executor, get_session_history, ...)
+```
+
+Each layer adds one capability: the prompt defines structure, the agent adds tool-calling
+reasoning, the executor adds the run loop and iteration limit, and `RunnableWithMessageHistory`
+adds per-session memory on top of all of it. None of these layers know about the others'
+internals, they compose because they're all `Runnable`s.
+
+---
+
+## Where to go next
+
+- [Chains & runnables](/langchain/chains), the composition model in depth
+- [Agents & tools](/langchain/agents), tool-calling agents and the `AgentExecutor` loop
+- [Memory & state](/langchain/memory), conversation history across turns and sessions
+- [Azure OpenAI integration](/langchain/azure-integration), wiring `AzureChatOpenAI` up correctly
+- [Code examples](/langchain/code-examples), complete, runnable snippets for each pattern above

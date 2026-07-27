@@ -1,19 +1,45 @@
+---
+title: LangChain
+description: How LangChain is used across our Azure agents, and how to build on it
+---
+
 # LangChain
 
-LangChain is the orchestration framework used inside our Azure agents to chain LLM calls, manage memory, and connect to tools.
-
-> **In progress** — This section is being written. Check back soon, or add your notes here if you've been working with LangChain.
+LangChain is the orchestration framework used inside our Azure agents to chain LLM calls, manage
+memory, and connect to tools. This section is a general knowledge-transfer reference: what
+LangChain actually is, the concepts you need to use it, and how it's concretely used in this
+org's own agents, most notably Container 1 of the Azure Secret Governance system, whose full
+source is linked throughout as a real, running example rather than a hypothetical one.
 
 ## What we use it for
 
+- Building the tool-calling agent behind Container 1 in Azure Secret Governance: scheduled
+  governance-cycle triggers, an ad hoc chat endpoint, and a Microsoft Teams bot, all served from
+  the same underlying LangChain agent
+- Connecting an Azure OpenAI GPT-4o deployment to a set of typed tools that call out to a REST API
+- Managing per-session conversation memory across multi-turn chat and Teams conversations
 - Building the agent chains inside Azure Multi-Agent Foundry
-- Connecting Azure OpenAI models to MCP tools
-- Managing conversation memory across multi-turn sessions
 
 ## Pages in this section
 
-- [Core concepts](/langchain/concepts)
-- [Chains & runnables](/langchain/chains)
-- [Agents & tools](/langchain/agents)
-- [Azure OpenAI integration](/langchain/azure-integration)
-- [Code examples](/langchain/code-examples)
+Read them in order if you're new to LangChain, or jump straight to the one you need:
+
+- [Core concepts](/langchain/concepts), the vocabulary: chat models, prompts, output parsers,
+  Runnables, chains, tools, agents, memory, and how they relate
+- [Chains & runnables](/langchain/chains), the `Runnable` interface and LCEL, how `|` composes
+  pipelines, and the parallel/branching primitives beyond a straight line
+- [Agents & tools](/langchain/agents), tool-calling agents, the `AgentExecutor` loop, and a
+  walkthrough of Container 1's real agent
+- [Memory & state](/langchain/memory), `RunnableWithMessageHistory`, session ID strategies, and
+  the persistence tradeoffs of in-memory history
+- [Azure OpenAI integration](/langchain/azure-integration), wiring up `AzureChatOpenAI`
+  correctly, credentials, deployments, and rate limits
+- [Code examples](/langchain/code-examples), complete runnable snippets for every pattern above,
+  building up to the real production pattern
+
+## Related pages
+
+- [main.py (Container 1)](/azure-secret-governance/source-code/container-1-langchain-agent/container1-main),
+  the full real source every grounded example on these pages is drawn from
+- [teams_bot.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-teams-bot),
+  how the Teams bot routes messages into the same agent

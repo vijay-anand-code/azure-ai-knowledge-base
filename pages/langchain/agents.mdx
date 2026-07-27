@@ -1,0 +1,176 @@
+---
+title: Agents & tools
+description: Tool-calling agents, the AgentExecutor loop, and how Container 1's real agent is built
+---
+
+import { Callout } from 'nextra/components'
+
+# Agents & tools
+
+A [chain](/langchain/chains) runs a fixed sequence of steps you decided at code-writing time. An
+agent is different: you give the model a set of tools and a goal, and the model itself decides,
+turn by turn, whether it needs to call a tool, which one, with what arguments, and when it has
+enough information to give a final answer. This page covers how that loop actually works, and
+walks through the real agent powering Container 1 in the Azure Secret Governance system as a
+concrete example.
+
+---
+
+## Tools
+
+A tool is a plain async (or sync) Python function, decorated with `@tool` from
+`langchain_core.tools`. The decorator inspects the function's type hints and docstring to build a
+schema the model can read: a name, a description of what the tool does and when to use it, and a
+typed argument list.
+
+```python
+from langchain_core.tools import tool
+
+@tool
+async def get_jira_issue(issue_key: str) -> dict:
+    """Returns the current status and summary of a Jira issue by its key (e.g. KAN-96)."""
+    return await _call_monitor("get_jira_issue", {"issue_key": issue_key})
+```
+
+<Callout type="warning">
+  The docstring is not a comment for other developers, it's the *only* thing the model sees when
+  deciding whether to call this tool. "Returns the current status and summary of a Jira issue by
+  its key" tells the model exactly when this tool is useful. A vague docstring like "Gets Jira
+  stuff" produces a model that either never calls the tool, or calls it at the wrong times. Treat
+  tool docstrings as prompt engineering, not internal documentation.
+</Callout>
+
+Once you have a set of tool functions, you pass them to the agent as a plain list:
+
+```python
+TOOLS = [
+    run_secret_monitoring,
+    fetch_azure_secrets,
+    get_sharepoint_state,
+    get_jira_issue,
+    add_jira_comment,
+    send_teams_alert,
+    write_sharepoint_row,
+    create_jira_ticket,
+]
+```
+
+This is the exact tool list from Container 1's `main.py`, eight tools, each one a thin async
+wrapper that calls a Container 2 REST endpoint (`/tools/*`) and returns the JSON response. The
+tools themselves contain no reasoning, they're just typed, described entry points the model can
+choose to invoke.
+
+---
+
+## Building a tool-calling agent
+
+`create_tool_calling_agent` wires an LLM, a tool list, and a prompt together into an agent, which
+you then run inside an `AgentExecutor`:
+
+```python
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+agent    = create_tool_calling_agent(llm, TOOLS, prompt)
+executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True, max_iterations=30)
+```
+
+This is, again, Container 1's actual setup. Two things worth calling out:
+
+- **`agent_scratchpad`**, this `MessagesPlaceholder` is where the record of tool calls made *so
+  far, within the current turn* gets injected back into the prompt. Each time the model calls a
+  tool, the tool's result is appended here before the model is called again, so the model can
+  see what it already tried and what it learned, without that scratchpad polluting the visible
+  `chat_history` shown to the user.
+- **`max_iterations=30`**, `AgentExecutor` will keep looping (call model, maybe call a tool, call
+  model again) until the model produces a final answer or this cap is hit. Without a cap, a
+  model that keeps deciding "I need one more tool call" on a complex multi-step monitoring cycle
+  could loop indefinitely. 30 is generous headroom for the kind of multi-tool governance cycles
+  this agent runs (scan secrets, raise tickets, send alerts, write SharePoint rows can easily be
+  a dozen-plus tool calls in one turn), while still guaranteeing the request eventually
+  terminates.
+
+---
+
+## The AgentExecutor loop
+
+At a conceptual level, `AgentExecutor.invoke(...)` (or `ainvoke`) does this:
+
+```
+1. Render the prompt (system + chat_history + human input + agent_scratchpad so far)
+2. Call the model
+3. Is the response a tool call, or a final answer?
+     - Final answer  -> done, return it
+     - Tool call(s)  -> run the tool(s), append results to agent_scratchpad, go to step 1
+4. If max_iterations is reached before a final answer, stop and return whatever's available
+```
+
+`verbose=True` prints each of these steps as they happen, which tool was called, with what
+arguments, and what it returned, which is genuinely useful while developing or debugging an
+agent and is exactly why Container 1 runs with it enabled.
+
+---
+
+## System prompt design
+
+The system prompt is where you tell the model what tools exist conceptually (in addition to the
+schema-level description on each `@tool`), and give it operating rules. Container 1's system
+prompt, condensed:
+
+```python
+SYSTEM_PROMPT = """You are the Azure Secret Governance Agent.
+
+You have access to tools that interact with Azure Entra ID, SharePoint, Jira, and Teams:
+- run_secret_monitoring    : runs the full weekly monitoring cycle (use this for scheduled runs)
+- fetch_azure_secrets      : fetch all App Registrations and their secrets from Entra ID
+- get_sharepoint_state     : read all rows from the SecretAlertRegistry SharePoint list
+...
+
+Guidelines:
+- For a full monitoring cycle, call run_secret_monitoring().
+- For specific questions ("What is the status of KAN-96?", "Show secrets for App X"),
+  use the targeted individual tools rather than the full cycle.
+- Jira ticket status changes ... are synced to SharePoint automatically by a Jira
+  automation rule calling Container 2 directly, this agent does not need to handle that flow.
+...
+"""
+```
+
+Notice the pattern: list the tools with a one-line purpose each (reinforcing, in the model's own
+context, what each `@tool` docstring already told it), then give explicit guidelines about *when*
+to reach for the heavyweight tool (`run_secret_monitoring`, a multi-minute full cycle) versus a
+narrow, targeted one. Without that guideline, a model asked "what's the status of KAN-96" might
+reasonably, but wastefully, kick off the entire monitoring cycle just to answer a one-ticket
+question.
+
+---
+
+## ReAct agents vs. tool-calling agents
+
+You may see older LangChain material describe "ReAct agents" (`create_react_agent`), which get a
+model to interleave `Thought: / Action: / Observation:` text in its own output, parsed by
+LangChain to extract which tool to call. This approach predates native tool/function-calling
+support in most model APIs.
+
+Modern chat models, including the Azure OpenAI GPT-4o deployment this org uses, support native
+tool calling: the model returns a structured `tool_calls` field on its response, no text parsing
+required. `create_tool_calling_agent` uses this native mechanism, and is what this org's agents
+are built with. It's more reliable (no risk of the model's "Action:" text being malformed and
+unparseable) and is the current recommended approach for any model that supports it.
+
+---
+
+## Where to go next
+
+- [Memory & state](/langchain/memory), how `chat_history` and `agent_scratchpad` actually get
+  populated across turns and sessions
+- [Azure OpenAI integration](/langchain/azure-integration), configuring the `AzureChatOpenAI`
+  model this agent runs on
+- [Code examples](/langchain/code-examples), a complete minimal tool-calling agent you can run

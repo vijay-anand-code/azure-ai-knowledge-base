@@ -1,0 +1,211 @@
+---
+title: Chains & runnables
+description: The Runnable interface and LCEL, how LangChain composes pipelines out of small pieces
+---
+
+import { Callout } from 'nextra/components'
+
+# Chains & runnables
+
+If [Core concepts](/langchain/concepts) is the vocabulary, this page is the grammar: how
+individual pieces, a prompt, a model, a parser, get glued together into a pipeline, and what your
+options are once a straight line from A to B to C isn't enough.
+
+---
+
+## The Runnable interface
+
+Every composable piece in LangChain, prompts, chat models, output parsers, retrievers, tools, and
+entire agents, implements the same `Runnable` interface. Concretely, that means every one of
+them exposes:
+
+| Method | What it does |
+|--------|-------------|
+| `invoke(input)` | Run once, synchronously, return the result |
+| `ainvoke(input)` | Same, but async |
+| `batch(inputs)` | Run a list of inputs, LangChain may parallelize this depending on the runnable |
+| `abatch(inputs)` | Async version of `batch` |
+| `stream(input)` | Yield partial output as it becomes available, token by token for a chat model |
+| `astream(input)` | Async version of `stream` |
+
+You almost never implement this interface directly. You get it for free from every built-in
+component, and you get it for free on anything you *compose* from those components, which is the
+entire point.
+
+---
+
+## LCEL: composing with `|`
+
+LCEL (LangChain Expression Language) is the name for composing `Runnable`s with the `|` operator,
+the same way you'd pipe commands together in a shell. The result of piping two runnables together
+is itself a runnable, so you can keep chaining:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import AzureChatOpenAI
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a terse assistant. Answer in one sentence."),
+    ("human", "{question}"),
+])
+model  = AzureChatOpenAI(azure_deployment="gpt-4o", api_version="2024-10-21")
+parser = StrOutputParser()
+
+chain = prompt | model | parser
+
+chain.invoke({"question": "What does LCEL stand for?"})
+# -> "LCEL stands for LangChain Expression Language."
+```
+
+Reading this left to right: the dict you pass to `invoke` renders the prompt into a list of
+messages, those messages go to the model, the model's `AIMessage` response goes to the parser,
+and the parser's plain string is what comes out. Nothing here is LangChain-specific magic beyond
+the `|` operator itself, `prompt | model` just returns a `RunnableSequence` under the hood, which
+is itself a `Runnable`.
+
+<Callout type="info">
+  `RunnableSequence` is what `|` actually builds. You can construct one directly with
+  `RunnableSequence(first=prompt, middle=[model], last=parser)`, but nobody does, the whole
+  point of the `|` syntax is that you don't have to.
+</Callout>
+
+---
+
+## The other Runnable primitives
+
+A straight pipeline covers a lot of cases, but not all of them. LCEL has a small set of other
+primitives for the cases where you need branching, parallelism, or to drop in a plain function.
+
+### RunnableParallel
+
+Runs multiple runnables against the *same* input, concurrently, and returns a dict of their
+results. Useful when you want to fetch several independent things and combine them, for example
+running a retrieval step and a classification step on the same user question at the same time:
+
+```python
+from langchain_core.runnables import RunnableParallel
+
+combined = RunnableParallel(
+    summary=summarize_chain,
+    sentiment=sentiment_chain,
+)
+result = combined.invoke({"text": "..."})
+# result == {"summary": "...", "sentiment": "..."}
+```
+
+### RunnableLambda
+
+Wraps a plain Python function so it can sit inside an LCEL pipeline as a first-class step,
+useful for a bit of custom logic, reshaping a dict, formatting a string, that doesn't need its
+own model call:
+
+```python
+from langchain_core.runnables import RunnableLambda
+
+uppercase = RunnableLambda(lambda x: x.upper())
+chain = prompt | model | parser | uppercase
+```
+
+### RunnablePassthrough
+
+Passes its input through unchanged. This shows up most often inside a `RunnableParallel` when
+you want to carry the *original* input alongside a derived value, for example keeping the raw
+question available downstream while also computing a retrieval result from it:
+
+```python
+from langchain_core.runnables import RunnablePassthrough
+
+chain = RunnableParallel(
+    question=RunnablePassthrough(),
+    context=retriever,
+) | prompt | model | parser
+```
+
+### RunnableBranch
+
+Picks between multiple sub-chains based on a condition evaluated against the input, a
+lightweight if/elif/else at the pipeline level, for cases simple enough not to need a full agent
+deciding the path:
+
+```python
+from langchain_core.runnables import RunnableBranch
+
+branch = RunnableBranch(
+    (lambda x: "refund" in x["question"].lower(), refund_chain),
+    (lambda x: "billing" in x["question"].lower(), billing_chain),
+    general_chain,  # default, if nothing above matched
+)
+```
+
+---
+
+## Streaming, batching, and async, for free
+
+Because `chain = prompt | model | parser` is a `Runnable`, you get streaming and batch execution
+across the *entire* pipeline without writing anything extra:
+
+```python
+# Token-by-token streaming of the final parsed output
+for chunk in chain.stream({"question": "Explain LCEL in three sentences."}):
+    print(chunk, end="", flush=True)
+
+# Run the same chain over many inputs
+results = chain.batch([
+    {"question": "What is LangChain?"},
+    {"question": "What is LCEL?"},
+])
+
+# Async versions of everything above
+result = await chain.ainvoke({"question": "..."})
+```
+
+This is one of the strongest practical arguments for LCEL over the older class-based chains:
+streaming, batching, and async all come from the same handful of primitives, instead of being
+bolted on per chain class with inconsistent support.
+
+---
+
+## The older Chain classes, and why this org doesn't use them for new code
+
+Before LCEL, LangChain shipped purpose-built classes for common patterns: `LLMChain` (prompt plus
+model, roughly what `prompt | model` gives you now), `SequentialChain` (run several chains in
+order, passing outputs forward), `ConversationChain` (`LLMChain` plus built-in memory handling).
+These still exist and still work, and you'll see them in older tutorials and some existing
+codebases.
+
+The reason new code in this org is written with LCEL instead:
+
+| | Old Chain classes | LCEL |
+|---|---|---|
+| Composition | One purpose-built class per pattern | Any combination of `Runnable`s, via `\|` |
+| Streaming | Inconsistent, varies by chain class | Uniform, every `Runnable` supports `.stream()` |
+| Async | Bolted on, varies by chain class | Uniform, every `Runnable` has an `a`-prefixed method |
+| Custom logic mid-pipeline | Awkward, usually requires subclassing | `RunnableLambda`, one line |
+| Debugging / tracing | Per-class | Uniform, LangSmith and callbacks trace any `Runnable` the same way |
+
+<Callout type="warning">
+  If you're reading an older tutorial or Stack Overflow answer that uses `LLMChain` or
+  `ConversationChain`, the LCEL equivalent is almost always a one-line `|` composition plus, for
+  memory, wrapping with `RunnableWithMessageHistory` (see [Memory & state](/langchain/memory)).
+  Don't port the old class-based pattern into new code here, translate it to LCEL first.
+</Callout>
+
+---
+
+## Chains vs. agents
+
+A chain, however it's composed, follows a fixed order of operations that you decided when you
+wrote the code. An agent decides its own order of operations, including whether to call a tool
+at all, at run time, based on the model's own reasoning. If you know the sequence of steps ahead
+of time, write a chain. If the model needs to decide which tool to reach for, and possibly loop
+several times before it has enough information to answer, that's an agent, covered next in
+[Agents & tools](/langchain/agents).
+
+---
+
+## Where to go next
+
+- [Agents & tools](/langchain/agents), for when a fixed pipeline isn't enough
+- [Memory & state](/langchain/memory), carrying conversation history across multiple `invoke` calls
+- [Code examples](/langchain/code-examples), complete versions of every pattern on this page

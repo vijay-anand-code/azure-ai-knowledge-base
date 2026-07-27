@@ -1,0 +1,176 @@
+---
+title: Azure OpenAI integration
+description: Wiring AzureChatOpenAI up correctly, credentials, deployments, and rate limits
+---
+
+import { Callout } from 'nextra/components'
+
+# Azure OpenAI integration
+
+LangChain talks to Azure OpenAI through `AzureChatOpenAI`, from the `langchain_openai` package.
+It implements the same `ChatModel` / `Runnable` interface as every other model integration (see
+[Core concepts](/langchain/concepts)), so once it's constructed, everything else in this section,
+chains, agents, memory, works with it identically to any other model. This page is specifically
+about getting that construction step right, since Azure OpenAI has a few configuration
+requirements plain OpenAI doesn't.
+
+---
+
+## AzureChatOpenAI vs. ChatOpenAI
+
+`langchain_openai` ships two separate classes:
+
+| Class | Talks to |
+|-------|---------|
+| `ChatOpenAI` | OpenAI's own public API |
+| `AzureChatOpenAI` | An Azure OpenAI resource, your own deployment, in your own Azure subscription |
+
+They aren't interchangeable, `AzureChatOpenAI` requires an Azure-specific set of parameters that
+`ChatOpenAI` doesn't have (and vice versa). If you're integrating with Azure OpenAI, you want
+`AzureChatOpenAI`, full stop, even though the two classes look superficially similar and a lot of
+generic LangChain tutorials online default to `ChatOpenAI`.
+
+---
+
+## Required configuration
+
+```python
+from langchain_openai import AzureChatOpenAI
+
+llm = AzureChatOpenAI(
+    azure_endpoint=AOAI_ENDPOINT,
+    api_key=AOAI_API_KEY,
+    azure_deployment=AOAI_DEPLOYMENT,
+    api_version="2024-10-21",
+    temperature=0,
+)
+```
+
+This is Container 1's actual construction, four parameters that are easy to mix up if you're new
+to Azure OpenAI specifically:
+
+| Parameter | What it actually is | Common mistake |
+|-----------|---------------------|----------------|
+| `azure_endpoint` | The Azure OpenAI **resource's** base URL, e.g. `https://<resource-name>.openai.azure.com` | Confusing this with the deployment-specific URL Azure Portal sometimes shows you, the base resource URL is what this parameter wants |
+| `api_key` | The Azure OpenAI resource's API key (from Key Vault in this org, never hardcoded) | Using an OpenAI.com API key here, they are not the same key or the same billing account |
+| `azure_deployment` | The **deployment name** you chose when you deployed a model in Azure OpenAI Studio, e.g. `gpt-4o` | Confusing this with the underlying model name; you name deployments yourself and could call a GPT-4o deployment anything |
+| `api_version` | The Azure OpenAI REST API version, e.g. `2024-10-21` | Leaving this out or using a stale version, features like tool calling depend on using an API version that actually supports them |
+
+<Callout type="warning">
+  `azure_deployment` is the single most common source of "model not found"-style errors when
+  integrating Azure OpenAI. It is not the model family name (`gpt-4o`, `gpt-4`), it's whatever
+  you personally named the deployment when you created it in Azure OpenAI Studio. If two people
+  set up deployments with different names for the same underlying model, code copied between
+  them will fail on this parameter alone.
+</Callout>
+
+---
+
+## Where the credentials actually come from
+
+In this org's containers, none of the four values above are hardcoded or passed as plain
+environment variables directly. They're read from Key Vault at startup, using a User-Assigned
+Managed Identity (UAMI):
+
+```python
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+
+_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+_kv         = SecretClient(vault_url=KV_URL, credential=_credential)
+
+AOAI_ENDPOINT   = _kv.get_secret("AZURE-OPENAI-ENDPOINT").value
+AOAI_API_KEY    = _kv.get_secret("AZURE-OPENAI-API-KEY").value
+AOAI_DEPLOYMENT = _kv.get_secret("AZURE-OPENAI-DEPLOYMENT-NAME").value
+
+llm = AzureChatOpenAI(azure_endpoint=AOAI_ENDPOINT, api_key=AOAI_API_KEY,
+                      azure_deployment=AOAI_DEPLOYMENT, api_version="2024-10-21")
+```
+
+<Callout type="info">
+  It's worth being precise about what the managed identity is actually doing here: the UAMI
+  authenticates to **Key Vault**, to read the Azure OpenAI API key as a secret value. The call
+  *to Azure OpenAI itself* still authenticates with that API key (`api_key=...`), not with an
+  Azure AD token. This is different from, and simpler than, using Azure AD/Entra ID auth
+  directly against the Azure OpenAI resource (which `AzureChatOpenAI` also supports, via
+  `azure_ad_token_provider`, if a project needs to eliminate API keys entirely). This org's
+  containers use the Key-Vault-plus-API-key pattern consistently, no client secrets or API keys
+  ever sit in code or plain environment variables, but the Azure OpenAI call itself is still a
+  key-based call under the hood.
+</Callout>
+
+---
+
+## Alternative: pure Azure AD authentication to Azure OpenAI
+
+For completeness, since you may see this pattern in other projects or in Microsoft's own
+documentation: `AzureChatOpenAI` can authenticate to the Azure OpenAI resource itself with an
+Azure AD token instead of an API key, removing the API key from the picture entirely:
+
+```python
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+from langchain_openai import AzureChatOpenAI
+
+token_provider = get_bearer_token_provider(
+    DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+)
+llm = AzureChatOpenAI(
+    azure_endpoint=AOAI_ENDPOINT,
+    azure_ad_token_provider=token_provider,
+    azure_deployment=AOAI_DEPLOYMENT,
+    api_version="2024-10-21",
+)
+```
+
+This requires granting the identity a Cognitive Services role (e.g. Cognitive Services OpenAI
+User) on the Azure OpenAI resource, rather than just reading a Key Vault secret. This org's
+current containers don't use this pattern, the Key-Vault-plus-API-key approach above is what's
+actually deployed, but it's a reasonable option to know about if a future project wants to remove
+API keys from the picture entirely.
+
+---
+
+## Temperature and determinism
+
+`temperature=0` is what Container 1 uses. For an agent whose job is deciding which tool to call
+and extracting structured information (ticket keys, dates, counts) rather than creative writing,
+lower temperature produces more consistent, more predictable behavior, run the same query twice
+and you're far more likely to get the same tool-calling decision both times. Save higher
+temperature values for use cases that actually want varied, creative output, that's not what a
+governance or automation agent needs.
+
+---
+
+## Rate limits: tokens per minute (TPM)
+
+Azure OpenAI enforces a tokens-per-minute quota per deployment, not just a requests-per-minute
+limit. A burst of calls in quick succession, several chat messages sent back to back, or a
+governance cycle that fires many tool-augmented model calls in a short window, can hit this quota
+and get back an HTTP 429.
+
+```
+openai.RateLimitError: Requests to the ChatCompletions_Create Operation under Azure OpenAI
+API have exceeded token rate limit of your current OpenAI S0 pricing tier.
+```
+
+If you see this:
+
+- Check **Azure OpenAI → Model deployments → your deployment → Edit → Tokens per minute**, and
+  increase the quota if your usage pattern genuinely needs more throughput
+- Consider whether the calling code should retry with backoff on a 429 rather than surfacing it
+  directly to the end user, LangChain's model wrapper does not automatically retry rate-limit
+  errors for you by default
+
+<Callout type="info">
+  This is exactly the failure mode behind the Teams bot's own documented "rate limit error"
+  troubleshooting entry: several quick queries in a row from the same channel can exhaust the
+  TPM quota for the shared deployment. The fix in that case was raising the deployment's TPM
+  quota in Azure Portal.
+</Callout>
+
+---
+
+## Where to go next
+
+- [Agents & tools](/langchain/agents), building an agent on top of the model configured here
+- [Code examples](/langchain/code-examples), a runnable snippet using `AzureChatOpenAI` end to end

@@ -1,0 +1,224 @@
+---
+title: Code examples
+description: Complete, runnable examples covering everything else in this section
+---
+
+import { Callout } from 'nextra/components'
+
+# Code examples
+
+Complete, self-contained examples for each pattern covered elsewhere in this section. Each one
+is runnable on its own (given valid Azure OpenAI configuration), building up in complexity from a
+minimal chain to the full agent-plus-memory pattern this org actually runs in production.
+
+```bash
+pip install langchain langchain-core langchain-openai
+```
+
+<Callout type="info">
+  Every example below reads Azure OpenAI configuration from environment variables for
+  simplicity. This org's actual containers load these same values from Key Vault via a managed
+  identity instead of plain environment variables, see [Azure OpenAI
+  integration](/langchain/azure-integration) for that pattern and why it's used.
+</Callout>
+
+```python
+import os
+from langchain_openai import AzureChatOpenAI
+
+def get_model(temperature: float = 0) -> AzureChatOpenAI:
+    return AzureChatOpenAI(
+        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        azure_deployment=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
+        api_version="2024-10-21",
+        temperature=temperature,
+    )
+```
+
+---
+
+## 1. A minimal LCEL chain
+
+The smallest useful example: a prompt, a model, and a parser, composed with `|`. See [Chains &
+runnables](/langchain/chains) for what each piece is doing.
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a terse assistant. Answer in one sentence."),
+    ("human", "{question}"),
+])
+model  = get_model()
+parser = StrOutputParser()
+
+chain = prompt | model | parser
+
+if __name__ == "__main__":
+    print(chain.invoke({"question": "What is LCEL?"}))
+```
+
+---
+
+## 2. Structured output with a Pydantic parser
+
+Useful whenever calling code needs a typed object back, not a free-form string, for example
+extracting fields from a support ticket description.
+
+```python
+from pydantic import BaseModel, Field
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+class TicketSummary(BaseModel):
+    severity: str = Field(description="One of: low, medium, high, critical")
+    one_line_summary: str
+
+parser = PydanticOutputParser(pydantic_object=TicketSummary)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Extract a structured summary from the ticket text.\n{format_instructions}"),
+    ("human", "{ticket_text}"),
+]).partial(format_instructions=parser.get_format_instructions())
+
+chain = prompt | get_model() | parser
+
+if __name__ == "__main__":
+    result = chain.invoke({"ticket_text": "Prod payments service down, customers can't check out."})
+    print(result)  # TicketSummary(severity='critical', one_line_summary='...')
+```
+
+---
+
+## 3. A tool-calling agent
+
+A minimal version of the pattern covered in [Agents & tools](/langchain/agents): one custom tool,
+one agent, run inside an `AgentExecutor`.
+
+```python
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+
+@tool
+def get_days_until(date_str: str) -> int:
+    """Returns the number of days from today until the given ISO date (YYYY-MM-DD)."""
+    from datetime import date
+    target = date.fromisoformat(date_str)
+    return (target - date.today()).days
+
+TOOLS = [get_days_until]
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful assistant with access to tools. Use them when relevant."),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+agent    = create_tool_calling_agent(get_model(), TOOLS, prompt)
+executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True, max_iterations=10)
+
+if __name__ == "__main__":
+    result = executor.invoke({
+        "input": "How many days until 2026-12-25?",
+        "chat_history": [],
+    })
+    print(result["output"])
+```
+
+Notice the prompt still needs both `MessagesPlaceholder`s, `chat_history` and
+`agent_scratchpad`, even in this minimal example, `create_tool_calling_agent` expects both slots
+to exist on the prompt it's given.
+
+---
+
+## 4. Adding memory with RunnableWithMessageHistory
+
+Wrapping the agent above so it remembers earlier turns in the same session, the pattern covered
+in [Memory & state](/langchain/memory).
+
+```python
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+_histories: dict[str, BaseChatMessageHistory] = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in _histories:
+        _histories[session_id] = InMemoryChatMessageHistory()
+    return _histories[session_id]
+
+agent_with_history = RunnableWithMessageHistory(
+    executor,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+)
+
+if __name__ == "__main__":
+    cfg = {"configurable": {"session_id": "demo-session"}}
+
+    r1 = agent_with_history.invoke({"input": "How many days until 2026-12-25?"}, config=cfg)
+    print(r1["output"])
+
+    # The model can resolve "that date" because chat_history now includes the previous turn
+    r2 = agent_with_history.invoke({"input": "Is that date a weekday?"}, config=cfg)
+    print(r2["output"])
+```
+
+---
+
+## 5. Async, streaming, and batch, for free
+
+Every example above works with `ainvoke`, `astream`, and `batch` without any extra code, this is
+the payoff of everything being a `Runnable`, covered in [Chains &
+runnables](/langchain/chains).
+
+```python
+import asyncio
+
+async def main():
+    # Async
+    result = await chain.ainvoke({"question": "What is a Runnable?"})
+
+    # Streaming
+    async for chunk in chain.astream({"question": "Explain LCEL briefly."}):
+        print(chunk, end="", flush=True)
+
+    # Batch, run several inputs
+    results = chain.batch([
+        {"question": "What is LangChain?"},
+        {"question": "What is an agent?"},
+    ])
+
+asyncio.run(main())
+```
+
+---
+
+## 6. The real pattern: Container 1's agent
+
+Everything above builds toward the actual agent running in this org's Azure Secret Governance
+system, Container 1's `main.py`: eight real tools calling out to a REST API, a system prompt with
+explicit operating guidelines, `max_iterations=30` for a cycle that can involve many tool calls,
+and three different session ID strategies depending on the entry point (`/run`, `/chat`,
+`/teams-webhook`).
+
+The full, real source, not a simplified version, is documented at [main.py (Container
+1)](/azure-secret-governance/source-code/container-1-langchain-agent/container1-main). Reading it
+side by side with the examples on this page is the fastest way to see how the individual pieces,
+tools, prompt, executor, memory, come together in a production agent handling scheduled triggers,
+ad hoc chat, and a Teams bot from the same underlying agent instance.
+
+---
+
+## Where to go next
+
+- [Core concepts](/langchain/concepts), if any term on this page was unfamiliar
+- [Agents & tools](/langchain/agents), the full explanation behind example 3
+- [Memory & state](/langchain/memory), the full explanation behind example 4
+- [Azure OpenAI integration](/langchain/azure-integration), configuring `get_model()` for real,
+  including where credentials should actually come from

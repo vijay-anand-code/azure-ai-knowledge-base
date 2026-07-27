@@ -1,0 +1,139 @@
+---
+title: Memory & state
+description: How conversation history persists across turns and sessions in a LangChain agent
+---
+
+import { Callout } from 'nextra/components'
+
+# Memory & state
+
+A chain or agent is stateless by default, `invoke` receives exactly the input you give it and
+nothing else. If a user asks a follow-up question that only makes sense in light of what they
+asked a moment ago, the model has no way to know that unless you explicitly hand it the prior
+conversation as part of the input. "Memory" is the umbrella term for the piece that stores that
+history and re-injects it on the next call.
+
+---
+
+## The current approach: RunnableWithMessageHistory
+
+The modern LCEL-era pattern wraps an existing chain or agent executor with
+`RunnableWithMessageHistory`. It doesn't change what the chain does, it wraps it so that, on
+every call, history for the given session is fetched, injected into the input, and the new
+turn's messages are appended back into that same history afterward.
+
+```python
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+_chat_histories: dict[str, BaseChatMessageHistory] = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in _chat_histories:
+        _chat_histories[session_id] = InMemoryChatMessageHistory()
+    return _chat_histories[session_id]
+
+agent_with_history = RunnableWithMessageHistory(
+    executor,                              # the AgentExecutor (or any Runnable) to wrap
+    get_session_history,                    # a function: session_id -> BaseChatMessageHistory
+    input_messages_key="input",             # which key in the input dict is the new human message
+    history_messages_key="chat_history",    # which prompt placeholder history gets injected into
+)
+```
+
+This is Container 1's actual memory setup. Three things to notice:
+
+- **`get_session_history` is just a dict lookup with lazy creation.** There's no database, no
+  external store, `_chat_histories` is a plain Python dict living in the process's memory. This
+  is deliberate for this use case, see the persistence caveat below.
+- **`input_messages_key` and `history_messages_key` connect this wrapper to the prompt.** Recall
+  from [Agents & tools](/langchain/agents) that the prompt has a `MessagesPlaceholder(variable_name="chat_history")`
+  and a `("human", "{input}")` slot, these two keys are how `RunnableWithMessageHistory` knows
+  where the new message and the injected history each go.
+- **The session ID is supplied per call, not baked into the chain.** You call the wrapped chain
+  with a `configurable.session_id`, not by constructing a new chain per user.
+
+```python
+result = await agent_with_history.ainvoke(
+    {"input": "What's the status of KAN-96?"},
+    config={"configurable": {"session_id": "runbook_trigger"}},
+)
+```
+
+---
+
+## Choosing session IDs
+
+The session ID is just a string key into whatever history store you're using, so its shape is
+entirely up to you, and how you construct it determines what "the same conversation" means for
+your application. Container 1 uses three different patterns depending on the entry point:
+
+| Entry point | Session ID pattern | Why |
+|-------------|--------------------|----|
+| `/run` (scheduled governance cycle) | the fixed string `"runbook_trigger"` | Every scheduled run is the same logical "conversation," there's no per-user distinction to make here |
+| `/chat` (general chat endpoint) | `req.session_id`, supplied by the caller, defaulting to `"default_user_session"` | Whoever's calling `/chat` decides what counts as one conversation, e.g. a web UI session ID |
+| `/teams-webhook` (Teams bot) | `f"teams_{from_id}_{conversation_id[:20]}"` | Combines the Teams user ID and conversation ID, so the same person messaging in two different Teams conversations gets two separate histories, not one shared one |
+
+<Callout type="info">
+  Get the session ID granularity wrong in either direction and you get a real bug: too coarse
+  (e.g. one shared session ID for every user) and users see each other's conversation history;
+  too fine (e.g. a new random ID every call) and memory never actually persists anything, every
+  call looks like the first message of a new conversation.
+</Callout>
+
+---
+
+## Persistence: in-memory means it doesn't survive a restart
+
+`InMemoryChatMessageHistory` stores messages in a Python list, held in the same dict as every
+other session, inside the running process. This is simple and has zero external dependencies,
+but it also means:
+
+- A container restart, redeploy, or crash wipes every in-flight conversation's history
+- If you ever run more than one replica of the container, each replica has its own separate
+  `_chat_histories` dict, a user's follow-up question could land on a different replica than
+  their first message and find no history at all
+
+For Container 1's actual usage, scheduled governance-cycle triggers that don't need cross-run
+memory, one-off chat questions, and Teams conversations that are naturally bounded and relatively
+short-lived, in-memory history is an acceptable, deliberate tradeoff, not an oversight. If a
+future use case needs history to survive restarts or to work correctly across multiple replicas,
+the fix is swapping the `BaseChatMessageHistory` implementation for one backed by an external
+store (LangChain has integrations for Redis, Postgres, and others), the rest of the
+`RunnableWithMessageHistory` wiring above doesn't need to change, `get_session_history` is the
+only function that would need to change what it returns.
+
+---
+
+## The older memory classes
+
+Pre-LCEL LangChain shipped standalone memory classes, `ConversationBufferMemory`,
+`ConversationSummaryMemory`, `ConversationBufferWindowMemory`, that plugged directly into the old
+`ConversationChain`. These are still importable but are considered legacy: `chat_history` (a
+plain list of messages managed by `RunnableWithMessageHistory`) covers the equivalent of
+`ConversationBufferMemory` in LCEL-native code. If you specifically need summarization (keeping a
+running summary instead of the full transcript, to bound token usage on very long conversations),
+that's the one case where you'd reach for something beyond a plain message list, but it's still
+implemented today as a custom `BaseChatMessageHistory` or a pre-processing step on the history,
+not the old standalone memory class.
+
+---
+
+## Agent scratchpad is not the same thing as chat history
+
+It's worth being explicit about a distinction that's easy to blur: `chat_history` (managed by
+`RunnableWithMessageHistory`, covered on this page) is the *visible, cross-turn* conversation, what
+the user asked and what the agent answered. `agent_scratchpad` (covered in [Agents &
+tools](/langchain/agents)) is the *internal, single-turn* record of which tools an agent called
+and what they returned, while it's still working out the answer to the current message. The
+scratchpad is rebuilt from scratch every turn and is never persisted; `chat_history` is what
+persists between turns. Both get injected into the same prompt via separate
+`MessagesPlaceholder`s, but they serve different purposes and have different lifetimes.
+
+---
+
+## Where to go next
+
+- [Agents & tools](/langchain/agents), how `agent_scratchpad` fits into the tool-calling loop
+- [Code examples](/langchain/code-examples), a complete memory-wrapped chain you can run and
+  inspect
