@@ -188,41 +188,68 @@ az ad app federated-credential create \
   Find it in Azure Portal, under Managed Identities, your UAMI, Overview, Object (principal) ID.
 </Callout>
 
-### Grant App Registration Microsoft Graph permissions
+### Add API permissions to the App Registration
 
-```powershell
-Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
+Before granting consent, add the three Graph application permissions the app registration
+needs. In Azure Portal, go to App Registrations, your cross-tenant app, API permissions, Add a
+permission, Microsoft Graph, Application permissions, and add these three:
 
-$appId      = "<CROSS_TENANT_APP_ID>"
-$appSp      = Get-MgServicePrincipal -Filter "appId eq '$appId'"
-$appSpId    = $appSp.Id
-$graphAppId = "00000003-0000-0000-c000-000000000000"
-$graphSp    = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
+- `Application.ReadWrite.OwnedBy`, so the app can read every App Registration and write secrets
+  only to apps it already owns
+- `Sites.Selected`, so the app can read and write the SharePoint lists it is granted against
+- `User.ReadBasic.All`, so the app can read the display name of user owners on an App
+  Registration. Without this, Graph still returns owner objects, but user owners come back with
+  only an id and no name at all, and there is no error to tell you why
 
-# Grant Application.ReadWrite.OwnedBy
-$role1 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.ReadWrite.OwnedBy" }
-New-MgServicePrincipalAppRoleAssignment `
-    -ServicePrincipalId $appSpId `
-    -PrincipalId        $appSpId `
-    -ResourceId         $graphSp.Id `
-    -AppRoleId          $role1.Id
+### Grant admin consent through the consent URL
 
-# Grant Sites.Selected
-$role2 = $graphSp.AppRoles | Where-Object { $_.Value -eq "Sites.Selected" }
-New-MgServicePrincipalAppRoleAssignment `
-    -ServicePrincipalId $appSpId `
-    -PrincipalId        $appSpId `
-    -ResourceId         $graphSp.Id `
-    -AppRoleId          $role2.Id
+The simplest way to both create the enterprise application in a tenant and grant consent for
+the permissions above is the standard Microsoft admin consent URL. Sign in as a Global
+Administrator or Privileged Role Administrator in the target tenant, then visit:
 
-Write-Host "Permissions granted"
+```
+https://login.microsoftonline.com/<TENANT_ID>/adminconsent?client_id=<CROSS_TENANT_APP_ID>
 ```
 
+This single URL creates the enterprise application for your app registration in that tenant if
+it does not already exist, and grants admin consent for whatever permissions are already
+configured on the app registration. You do not need to run a separate script for this.
+
 <Callout type="warning">
-  Grant admin consent after adding permissions, in Azure Portal under Enterprise Applications,
-  your cross-tenant App Registration, Permissions, Grant admin consent. If you are scanning more
-  than one tenant, this whole app registration and consent step has to be repeated in every
-  tenant it will scan, since consent does not carry over between tenants automatically.
+  If you are scanning more than one tenant, visit this URL once per tenant, signed in as an
+  admin of that specific tenant each time. Consent granted in one tenant does not carry over to
+  another.
+</Callout>
+
+<Callout type="info">
+  You can also grant permissions and consent through PowerShell instead of the portal and the
+  consent URL, if you prefer a scripted, repeatable setup:
+
+  ```powershell
+  Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
+
+  $appId      = "<CROSS_TENANT_APP_ID>"
+  $appSp      = Get-MgServicePrincipal -Filter "appId eq '$appId'"
+  $appSpId    = $appSp.Id
+  $graphAppId = "00000003-0000-0000-c000-000000000000"
+  $graphSp    = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
+
+  $rolesToGrant = @("Application.ReadWrite.OwnedBy", "Sites.Selected", "User.ReadBasic.All")
+
+  foreach ($roleName in $rolesToGrant) {
+      $role = $graphSp.AppRoles | Where-Object { $_.Value -eq $roleName }
+      New-MgServicePrincipalAppRoleAssignment `
+          -ServicePrincipalId $appSpId `
+          -PrincipalId        $appSpId `
+          -ResourceId         $graphSp.Id `
+          -AppRoleId          $role.Id
+  }
+
+  Write-Host "Permissions granted"
+  ```
+
+  This still needs a separate admin consent step afterward, in Azure Portal under Enterprise
+  Applications, your cross-tenant App Registration, Permissions, Grant admin consent.
 </Callout>
 
 ### Add App Registration as owner on App Registrations
@@ -317,6 +344,7 @@ The UAMI is only used to assert identity, it holds no direct Graph permissions o
 | Permission | Granted to | Purpose |
 |-----------|------------|---------|
 | `Application.ReadWrite.OwnedBy` | App Registration, consented in every tenant being scanned | Read all App Registrations in that tenant. Write secrets only on apps where the App Registration is listed as owner |
+| `User.ReadBasic.All` | App Registration, consented in every tenant being scanned | Read the display name of user owners on an App Registration. Without this, user owners come back with an id and no name, and Graph does not return an error to explain why |
 | `Sites.Selected` | App Registration, consented in the home tenant | Read and write all four SharePoint lists |
 | `Key Vault Secrets User` | UAMI | Read config secrets from Key Vault |
 | `Key Vault Secrets Officer` | UAMI | Write new secret values to the rotation Key Vault |
