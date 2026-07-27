@@ -1,51 +1,62 @@
 ---
 title: Jira Automation
-description: Auto-update SharePoint when Jira tickets are resolved or reopened — no manual updates needed
+description: Auto-update SharePoint whenever a Jira ticket changes status, no manual updates needed
 ---
 
 import { Callout, Steps, Tabs, Tab } from 'nextra/components'
 
 # Jira Automation
 
-When an engineer resolves a Jira ticket after deploying a rotated secret, SharePoint
-automatically updates to `Rotated` within seconds. If they accidentally close the wrong
-ticket and reopen it, SharePoint resets to `JiraRaised` so monitoring picks it up again.
-No one needs to manually update SharePoint.
+Whenever a Jira ticket moves to a different status, SharePoint updates within seconds, for
+every status in the real workflow, not only when a ticket is resolved. If an engineer moves a
+ticket to Done after deploying a rotated secret, the SharePoint row updates to `Rotated`. If
+someone reopens it, or moves it to Blocked, or Awaiting Reporter, SharePoint reflects that too.
+No one needs to manually update SharePoint for any of these transitions.
+
+<Callout type="warning">
+  This page describes the current, corrected setup. An earlier version of this integration
+  called a `/jira-webhook` endpoint on Container 1 that only recognized three status names and
+  silently did nothing for the other three. That endpoint has been retired. If your Jira
+  automation rule still points at `/jira-webhook`, update it to call Container 2 directly as
+  described below.
+</Callout>
 
 ---
 
 ## Real world example
 
-> **Tuesday 14:30** — Engineer deploys the new secret for `payments-service`.
-> They open Jira and resolve ticket `KAN-2127`.
+> Tuesday 14:30. An engineer deploys the new secret for a payments service and resolves the
+> Jira ticket by moving it to Done.
 >
-> **Tuesday 14:30:03** — Jira automation fires a webhook to the Container App.
+> Tuesday 14:30:03. The automation rule fires a web request to Container 2.
 >
-> **Tuesday 14:30:05** — SharePoint row for `KAN-2127` updates from
-> `RotatedPendingDeployment` → `Rotated`. Done in 2 seconds. No manual SharePoint update.
+> Tuesday 14:30:05. The SharePoint row updates from `RotatedPendingDeployment` to `Rotated`.
+> Done in a couple of seconds, no manual SharePoint update.
 
-> **Wednesday 09:00** — Engineer realises they resolved the wrong ticket and reopens `KAN-2127`.
+> Wednesday 09:00. The engineer realizes they closed the wrong ticket and moves it back to In
+> Progress.
 >
-> **Wednesday 09:00:02** — Webhook fires again. SharePoint resets from `Rotated` → `JiraRaised`.
-> Monitoring will pick it up on the next weekly run.
+> Wednesday 09:00:02. The rule fires again. SharePoint resets from `Rotated` to `JiraRaised`,
+> so monitoring picks it back up on its next run.
 
 ---
 
-## Why we bypass LangChain for this
+## Why this bypasses the chat agent entirely
 
 | Approach | Speed | Cost | Reliability |
 |----------|-------|------|-------------|
-| Via LangChain (old) | 30–60 seconds | ~$0.01 per webhook | Hit rate limits (429) |
-| Direct Container 2 call (current) | 2–3 seconds | $0 | Always works |
+| Through the chat agent | slow, tens of seconds | a small cost per call | can hit rate limits |
+| Direct call to Container 2 | a couple of seconds | no cost | consistently works |
 
-The webhook endpoint calls Container 2 directly — no GPT-4o reasoning needed to update
-a SharePoint field.
+The automation rule calls Container 2 directly. There is no reasoning step involved in
+updating one SharePoint field based on a status name, so there is nothing for a chat agent to
+add here.
 
 ---
 
 ## Get your Container App FQDN
 
-Before setting up Jira automation, get the Container App public URL:
+Before setting up the automation rule, get the Container App public URL:
 
 ```bash
 az containerapp show \
@@ -71,90 +82,93 @@ Use this as `<YOUR_CONTAINER_APP_FQDN>` in the steps below.
 
 In Jira, go to:
 
-**Project Settings → Automation → Create rule**
+**Project Settings, Automation, Create rule**
 
 ### Configure the trigger
 
-Set the trigger to fire on ticket transitions:
+Set the trigger to fire on ticket transitions, and watch every real status in your workflow,
+not a subset:
 
 | Field | Value |
 |-------|-------|
 | **Trigger** | Work item transitioned |
-| **To status** | `RESOLVED`, `IN PROGRESS`, `TO DO` |
+| **To status** | To Do, In Progress, Done, Canceled, Blocked, Awaiting Reporter: Needs more information |
 
-<Callout type="info">
-  Add all three statuses to a **single rule** — the endpoint handles all transitions
-  and decides what SharePoint update to make based on the destination status.
+<Callout type="warning">
+  Watch all six statuses in this one rule, not just the ones you expect to matter most. A rule
+  that only watches Done and In Progress will never fire at all for a ticket moving to Canceled
+  or Blocked, and that transition will simply never reach SharePoint. Missing this is the most
+  likely reason a status change appears to do nothing.
 </Callout>
 
-### Add the webhook action
+### Add the web request action
 
 Add an action: **Send web request**
 
 | Field | Value |
 |-------|-------|
-| **URL** | `https://<YOUR_CONTAINER_APP_FQDN>/jira-webhook` |
+| **URL** | `https://<YOUR_CONTAINER_APP_FQDN>/tools/jira-status-update` |
 | **HTTP method** | POST |
 | **Headers** | `Content-Type: application/json` |
 | **Body** | See below |
 
 ```json
 {
-  "issue": {
-    "key": "{{issue.key}}",
-    "fields": {
-      "status": {
-        "name": "{{issue.status.name}}"
-      }
-    }
-  }
+  "jira_key": "{{issue.key}}",
+  "to_status": "{{destinationStatus.name}}",
+  "today": "{{now.format('yyyy-MM-dd')}}"
 }
 ```
 
-<Callout type="warning">
-  Use `{{issue.status.name}}` — **not** `{{destinationStatus.name}}`.
-  The `destinationStatus` smart value does not resolve reliably in all Jira automation contexts
-  and will result in an empty status being sent, causing no SharePoint update.
+<Callout type="info">
+  This endpoint expects exactly these three fields, `jira_key`, `to_status`, and `today`, sent
+  flat in the request body, not nested inside an `issue` object. `{{destinationStatus.name}}` is
+  the correct smart value here, since the endpoint needs to know which status the ticket is
+  moving to, not simply that it changed.
 </Callout>
 
 ### Name and enable the rule
 
-- **Rule name:** `Trigger Secret Agent on Ticket Close`
+- **Rule name:** something like `Sync ticket status to SharePoint`
 - Click **Enable**
+- If an older rule already exists pointing at `/jira-webhook`, disable or delete it once the
+  new rule is confirmed working, so a single status change cannot fire two webhooks and update
+  the same row twice
 
 </Steps>
 
 ---
 
-## How the webhook endpoint works
+## How the endpoint works
 
 ```
-Jira resolves or reopens ticket
-      ↓
-POST /jira-webhook  (Container 1 — LangChain agent)
-      ↓
-Extract: jira_key, status from payload
-      ↓
-status = "resolved/done/closed"?     status = "in progress/to do/reopened"?
-      ↓                                        ↓
-POST /tools/update_on_jira_close      POST /tools/jira-status-update
-(Container 2 — no GPT-4o)            (Container 2 — no GPT-4o)
-      ↓                                        ↓
-AlertStatus → Rotated                 AlertStatus → JiraRaised
-SecretRotationDetectedDate → today    Monitoring picks it up next run
+Jira ticket moves to any of the six statuses
+      |
+      v
+POST /tools/jira-status-update   (Container 2, called directly)
+      |
+      v
+Match to_status against the six recognized statuses
+      |
+      v
+Update every SharePoint row whose JiraTicketKey matches jira_key
 ```
 
 ### Status mapping
 
-| Jira destination status | SharePoint AlertStatus | SharePoint field updated |
-|------------------------|----------------------|--------------------------|
-| `resolved`, `done`, `closed` | `Rotated` | `SecretRotationDetectedDate` = today |
-| `in progress`, `to do`, `reopened` | `JiraRaised` | `LastChecked` = today |
-| Anything else | No update | Logged only |
+| Jira destination status | SharePoint AlertStatus | Notes |
+|------------------------|----------------------|-------|
+| Done | `Rotated` | Also sets the rotation detected date to today |
+| Canceled | `Ignored` | The secret is no longer being tracked |
+| In Progress, To Do | `JiraRaised` | Monitoring treats the row as reopened and resumes on it |
+| Blocked | `Blocked` | Monitoring pauses alerts and escalation on this row until the status changes again |
+| Awaiting Reporter: Needs more information | `AwaitingReporter` | Same pause behavior as Blocked |
+| Anything else | No update | Logged, in case this is a typo in the rule or a workflow status this endpoint has not been told about yet |
 
 <Callout type="info">
-  `SecretRotationDetectedDate` is the SharePoint display name. The internal API name
-  is `RotationDetectedDate` — the system uses the internal name automatically.
+  Blocked and Awaiting Reporter are not a dead end. Once the ticket moves to a different status
+  again, the row resumes normal monitoring automatically, since these are treated as paused, not
+  finished.
 </Callout>
 
 ---
@@ -162,9 +176,11 @@ SecretRotationDetectedDate → today    Monitoring picks it up next run
 ## Verifying the automation works
 
 - Find a Jira ticket with a corresponding SharePoint row in `RotatedPendingDeployment`
-- Resolve the ticket in Jira
-- Check **Project Settings → Automation → Audit log** — should show SUCCESS
-- Check SharePoint — the row should show `AlertStatus: Rotated`
+- Move the ticket to Done
+- Check Project Settings, Automation, Audit log, it should show success
+- Check SharePoint, the row should show `AlertStatus: Rotated`
+- Repeat for at least one of Canceled, Blocked, or Awaiting Reporter, since these are the
+  statuses most likely to have been missed by an older rule's trigger list
 
 ### Check container logs if something goes wrong
 
@@ -172,22 +188,20 @@ SecretRotationDetectedDate → today    Monitoring picks it up next run
 az containerapp logs show \
   --name secret-governance-v2 \
   --resource-group <YOUR_RG> \
-  --container langchain-agent \
-  --tail 30
+  --container monitor-mcp \
+  --tail 100
 ```
 
-Look for these lines:
+Look for a line like this:
 
 ```
-INFO: Jira webhook received: KAN-2127 → 'resolved'
-INFO: Ticket KAN-2127 closed — updating SharePoint directly (no AI)
-INFO: SharePoint updated for KAN-2127: 1 rows marked Rotated
+INFO: jira-status-update: item=<id> jira=KAN-2127 -> AlertStatus=Rotated
 ```
 
 <Callout type="info">
-  If Jira shows the webhook fired successfully but SharePoint did not update,
-  the most common cause is the `JiraTicketKey` field in SharePoint not matching
-  exactly. Check for extra spaces or different casing.
+  If Jira shows the rule fired successfully but SharePoint did not update, the most common
+  cause is `JiraTicketKey` in SharePoint not matching the ticket key exactly. Check for extra
+  spaces or a different key format.
 </Callout>
 
 ---
@@ -198,18 +212,17 @@ Before automation can raise tickets, configure the following in Key Vault:
 
 | Key Vault secret | Example value | Notes |
 |-----------------|--------------|-------|
-| `JIRA-BASE-URL` | `https://yourcompany.atlassian.net` | No trailing slash |
-| `JIRA-PROJECT-KEY` | `KAN` | Project → Settings → Details → Key |
-| `JIRA-EPIC-KEY` | `KAN-161` | Create an epic named "Secret Governance" and copy its key |
-| `JIRA-ISSUE-TYPE` | `Incident` | Must match exactly — check your project's issue types |
-| `JIRA-API-TOKEN` | `ATATT3x...` | Atlassian account → Security → Create and manage API tokens |
-| `JIRA-USER-EMAIL` | `admin@contoso.com` | The account that owns the API token |
+| `JIRA-BASE-URL` | `https://example.atlassian.net` | No trailing slash |
+| `JIRA-PROJECT-KEY` | `KAN` | Project, Settings, Details, Key |
+| `JIRA-EPIC-KEY` | example ticket key | Optional. Create an epic and copy its key if you want tickets grouped under it |
+| `JIRA-ISSUE-TYPE` | `Incident` | Must match exactly, check your project's issue types |
+| `JIRA-API-TOKEN` | token value | Create and manage from your Atlassian account security settings |
+| `JIRA-USER-EMAIL` | the account that owns the API token | |
 
 <Callout type="warning">
-  **API tokens expire.** If Jira ticket creation starts failing with HTTP 400 or 403,
-  generate a new API token at `id.atlassian.com/manage-profile/security/api-tokens`
-  and update the `JIRA-API-TOKEN` Key Vault secret. Then restart Container 2 to pick
-  up the new value:
+  API tokens expire. If Jira ticket creation starts failing with HTTP 400 or 403, generate a
+  new API token from your Atlassian account's security settings and update the `JIRA-API-TOKEN`
+  Key Vault secret. Then restart Container 2 to pick up the new value:
 
   ```bash
   az containerapp revision restart \
@@ -222,6 +235,14 @@ Before automation can raise tickets, configure the following in Key Vault:
   ```
 </Callout>
 
+<Callout type="warning">
+  If ticket creation fails with HTTP 400 specifically for P1, P2, P3, or P4 severity secrets,
+  check whether those four priority names actually exist in your Jira project's priority
+  scheme. The system sets the ticket's priority field to the literal bucket name, and that
+  requires priorities named exactly `P1`, `P2`, `P3`, and `P4` to already exist there. Jira's
+  own default priorities, like Highest or Medium, do not satisfy this on their own.
+</Callout>
+
 ---
 
 ## Ticket format
@@ -229,11 +250,11 @@ Before automation can raise tickets, configure the following in Key Vault:
 Each ticket the system creates looks like this:
 
 ```
-[CRITICAL] Azure Secret Expiry - payments-service - 2 days remaining
+[CRITICAL] Azure Secret Expiry - example-service - 2 days remaining
 
-App Registration Name: payments-service
-App ID: 312c31c7-871f-4893-9c85-532aa28070f7
-Secret ID: d278da9c-d035-4f58-ba9a-fcf6cc336bc8
+App Registration Name: example-service
+App ID: <app-id>
+Secret ID: <secret-id>
 Secret Description: P2_15d
 Expiration: 2026-07-17T00:00:00Z
 Days Remaining: 2 days remaining
@@ -243,14 +264,14 @@ Severity: CRITICAL
 When the rotation runbook creates a new secret, it adds a comment:
 
 ```
-AUTO-ROTATION — 2026-07-15
-A new client secret has been generated for payments-service.
-New credential keyId: abc123...
+AUTO-ROTATION, 2026-07-15
+A new client secret has been generated for example-service.
+New credential keyId: <key-id>
 New credential expiry: 2027-07-15T00:00:00Z
-Stored in Key Vault under: payments-service-KAN-2127
+Stored in Key Vault under: example-service-KAN-2127
 
 Next steps:
-1. Retrieve the value from Key Vault (payments-service-KAN-2127)
+1. Retrieve the value from Key Vault (example-service-KAN-2127)
 2. Deploy to all dependent services
 3. Confirm authentication works
 4. Close this ticket to mark as Rotated in SharePoint.
@@ -262,8 +283,9 @@ Next steps:
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| Webhook fires but SharePoint not updated | `JiraTicketKey` mismatch in SharePoint | Check for extra spaces or different casing in the key |
-| HTTP 400 on ticket creation | Jira API token expired | Regenerate token and update Key Vault secret |
+| Rule fires but SharePoint not updated | `JiraTicketKey` mismatch in SharePoint | Check for extra spaces or a different key format |
+| A specific status never updates SharePoint | That status is missing from the rule's trigger list | Add it. All six statuses need to be in the trigger, not just the ones you expect to use most |
+| HTTP 400 on ticket creation | Jira API token expired, or a P1 to P4 priority name is missing from the project | Regenerate the token, or add the missing priority name to the Jira priority scheme |
 | HTTP 403 on ticket creation | Wrong `JIRA-USER-EMAIL` | Must match the account that owns the API token |
-| Webhook returns 404 | Wrong Container App FQDN | Verify FQDN using `az containerapp show` command above |
-| SharePoint not updating on reopen | Wrong status name in Jira body | Use `{{issue.status.name}}` not `{{destinationStatus.name}}` |
+| Web request returns 404 | Wrong Container App FQDN, or still pointing at the retired `/jira-webhook` path | Verify the FQDN with the `az containerapp show` command above, and confirm the URL ends in `/tools/jira-status-update` |
+| SharePoint not updating on any transition | Wrong smart value in the request body | Use `{{destinationStatus.name}}`, not `{{issue.status.name}}`, and send `jira_key`, `to_status`, and `today` as flat fields, not nested under an `issue` object |
