@@ -24,10 +24,40 @@ import { Callout } from 'nextra/components'
 | `ThreadPoolExecutor` for owner fetching | Azure Automation is synchronous Python — asyncio is not available. Threads drop owner-fetch time from ~4 min to under 1s for 255 apps |
 | Graph `$batch` for SharePoint writes | Bundles up to 20 POST/PATCH requests into a single HTTP call — avoids throttling on large tenants |
 | Never overwrites `AlertStatus` | Only monitoring changes `AlertStatus`. Discovery only stamps owners, severity, and expiry — safe to run anytime |
-| All buckets written including P4 | Owners are stamped on P4 (61+ days) so they're ready when the secret ages into P3 |
-| Ignore bucket skipped | Secrets expired 8+ days ago have no remediation value — not written to SharePoint |
+| P1 through P5 and ExpiredManualReview all written to SecretAlertRegistry | Owners are stamped on every bucket, including P5 (61+ days), so they're already in place when a secret ages down into P4, P3, and beyond. Only the "Ignore" bucket (expired 8+ days) is excluded from this list |
+| Ignore bucket routed to IgnoredSecretRegistry, not skipped | Secrets expired 8+ days ago have no remediation value in the active list, but are still upserted into IgnoredSecretRegistry (with owners and an IgnoreReason) rather than dropped entirely |
+| `ManualAppOwners` never written by discovery | This column is excluded from both the new-row fields and the existing-row diff/PATCH logic, on every run, so a human-entered value can never be overwritten by an Entra-derived one |
+| Backup: write new snapshot before purging the old one | Each run's backup of SecretAlertRegistry and IgnoredSecretRegistry is written first; only after that succeeds are the prior run's backup rows purged, so there's never a moment with zero backup for either list |
+| Ignored-to-active recovery | A secret sitting in IgnoredSecretRegistry whose `endDateTime` is later renewed in Entra gets a fresh SecretAlertRegistry row created and its stale Ignored row deleted |
+| Two credential scopes, not one | Entra scanning and SharePoint access are deliberately kept on separate federated credentials. See "Multi-tenant credentials" below |
+| `TenantID` stamped per scanned tenant | Each row's `TenantID`/`TenantName` reflects the tenant the app was actually fetched from, not a static home-tenant default |
+| Reconciliation totals in the run summary | End of run, discovery prints total apps scanned and total secrets seen in Graph, meant to be diffed directly against a manual Entra CLI count |
 | 404 PATCH → retry as POST | If a SharePoint item was deleted externally, discovery creates a fresh row instead of failing |
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
+
+---
+
+## Multi-tenant credentials
+
+Discovery scans App Registrations across multiple Entra ID tenants, but SharePoint itself only ever lives in one tenant. Those two facts need two separate credential scopes:
+
+| Credential | Tenant scope | Used for |
+|---|---|---|
+| Per-tenant scanning credential | One federated credential is built for every entry in `CROSS-TENANT-TENANT-IDS` (plural, comma-separated). Falls back to the older singular `CROSS-TENANT-TENANT-ID` if the plural secret isn't set | Fetching App Registrations and their owners |
+| Home-tenant SharePoint credential | Always `HOME-TENANT-ID`, falling back to `GRAPH-TENANT-ID` if not set | Reading and writing SecretAlertRegistry, IgnoredSecretRegistry, and both backup lists |
+
+Both credentials assert through the same UAMI and the same `CROSS-TENANT-APP-ID` App Registration, the split is about which tenant each credential is scoped to, not a second App Registration.
+
+<Callout type="warning">
+  An earlier version of this runbook used a single credential, scoped to whatever tenant was
+  currently being scanned, for both Entra and SharePoint calls. That worked only by coincidence
+  when the scanned tenant and the SharePoint tenant were the same. Once `CROSS-TENANT-TENANT-IDS`
+  started pointing at a genuinely different tenant for multi-tenant scanning, every SharePoint
+  call inherited that same tenant scope too, producing
+  `{"code":"BadRequest","message":"Tenant does not have a SPO license."}`. The fix keeps one
+  federated credential per scanned tenant for Entra calls, and a separate credential permanently
+  pinned to the home tenant for every SharePoint call.
+</Callout>
 
 ---
 
@@ -44,17 +74,22 @@ import { Callout } from 'nextra/components'
 
 | Secret | Purpose |
 |--------|---------|
-| `GRAPH-TENANT-ID` | Azure tenant ID |
+| `GRAPH-TENANT-ID` | Azure tenant ID. Also the fallback home tenant if `HOME-TENANT-ID` isn't set |
+| `HOME-TENANT-ID` | Tenant where SharePoint actually lives. Falls back to `GRAPH-TENANT-ID` if not set |
 | `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
 | `SHAREPOINT-LIST-ID` | SecretAlertRegistry list ID |
-| `CROSS-TENANT-APP-ID` | App Registration client ID for federated credential |
-| `CROSS-TENANT-TENANT-ID` | Tenant ID where App Registration lives |
+| `SHAREPOINT-IGNORED-LIST-ID` | IgnoredSecretRegistry list ID |
+| `SHAREPOINT-BACKUP-LIST-ID` | SecretAlertRegistryBackup list ID |
+| `SHAREPOINT-IGNORED-BACKUP-LIST-ID` | IgnoredSecretRegistryBackup list ID |
+| `CROSS-TENANT-APP-ID` | App Registration client ID for the federated credential, shared by both tenant scopes |
+| `CROSS-TENANT-TENANT-IDS` | Comma-separated list of tenant IDs to scan for App Registrations. Falls back to the older singular `CROSS-TENANT-TENANT-ID` if not set |
 
 <Callout type="info">
   Authentication uses a federated credential — the UAMI asserts its identity to the
   App Registration (`azure-secretgovernance-cross-tenant`) which then gets a Graph API
   token. The App Registration must have `Application.ReadWrite.OwnedBy` and
-  `Sites.Selected` permissions granted with admin consent.
+  `Sites.Selected` permissions granted with admin consent in every tenant listed in
+  `CROSS-TENANT-TENANT-IDS`.
 </Callout>
 
 ---
