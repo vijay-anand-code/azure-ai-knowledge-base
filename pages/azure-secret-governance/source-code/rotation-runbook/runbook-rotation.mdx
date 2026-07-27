@@ -324,8 +324,12 @@ ACTIONABLE_STATUSES        = {
     "ExpiredManualReview",
 }
 
-# CORRECTED (v3) — matches decision_engine.py's current bucket names.
-ROTATION_ELIGIBLE_BUCKETS  = {"P1", "P2", "P3", "P4"}
+# CORRECTED — matches decision_engine.py's current bucket names, after the
+# renumbering that merged the old P1/P2 into one P1 (0-7 days) and shifted
+# every bucket below it down by one. P4 is now the SAFE/61+ bucket (it used
+# to be P5) and must NEVER be rotation-eligible, same as P5 never was under
+# the old scheme.
+ROTATION_ELIGIBLE_BUCKETS  = {"P1", "P2", "P3"}
 DEFAULT_ROTATION_THRESHOLD = 60
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -436,12 +440,16 @@ def _sanitize_kv_name(name: str) -> str:
     return cleaned[:127]
 
 def _classify_bucket(days: int) -> str:
-    """CORRECTED (v3) — matches decision_engine.py's classify_bucket() exactly."""
-    if days >= 61:       return "P5"
-    if 31 <= days <= 60: return "P4"
-    if 8  <= days <= 30: return "P3"
-    if 4  <= days <= 7:  return "P2"
-    if 0  <= days <= 3:  return "P1"
+    """
+    CORRECTED — matches decision_engine.py's classify_bucket() exactly,
+    after the renumbering that merged the old P1 (0-3) and P2 (4-7) into a
+    single P1 (0-7), and shifted every bucket below it down by one:
+    P1 0-7 days, P2 8-30 days, P3 31-60 days, P4 61+ days (safe).
+    """
+    if days >= 61:       return "P4"
+    if 31 <= days <= 60: return "P3"
+    if 8  <= days <= 30: return "P2"
+    if 0  <= days <= 7:  return "P1"
     if -7 <= days <= -1: return "ExpiredManualReview"
     return "Ignore"
 
@@ -567,11 +575,38 @@ def create_azure_secret(application_object_id: str, display_name: str,
             return {"success": False, "error": str(e)}
     return {"success": False, "error": "Max retries exceeded"}
 
-def store_rotated_secret(secret_name: str, secret_value: str) -> dict:
+# Cache of SecretClient objects keyed by vault URL, so a product-specific
+# override Key Vault only gets one client built for it per run, not one per
+# secret rotated into it.
+_override_kv_clients: dict[str, SecretClient] = {}
+
+def store_rotated_secret(secret_name: str, secret_value: str,
+                         override_vault_url: str = "") -> dict:
+    """
+    Stores a rotated secret's value in Key Vault. By default, uses the
+    shared ROTATION_KV_URL every app rotates into. If override_vault_url is
+    given (non-empty), meaning the app's SharePoint row had
+    ProductTeamkeyVaultName filled in, uses that specific vault instead —
+    a product team gets its own rotated secrets landing in their own
+    Key Vault rather than the shared one.
+
+    A client for a given override URL is built once and reused for the rest
+    of this run, not rebuilt on every single secret rotated into it.
+    """
     try:
         clean_name = _sanitize_kv_name(secret_name)
-        result = _rotation_kv.set_secret(clean_name, secret_value,
-                                         content_type="azure-app-registration-secret")
+
+        if override_vault_url:
+            if override_vault_url not in _override_kv_clients:
+                _override_kv_clients[override_vault_url] = SecretClient(
+                    vault_url=override_vault_url, credential=_credential
+                )
+            target_kv = _override_kv_clients[override_vault_url]
+        else:
+            target_kv = _rotation_kv
+
+        result = target_kv.set_secret(clean_name, secret_value,
+                                      content_type="azure-app-registration-secret")
         return {"success": True, "vault_name": clean_name, "vault_url": result.id}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -764,9 +799,16 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
                 continue
             summary["newSecretsGenerated"] += 1
 
+            # ProductTeamkeyVaultName lets a specific product's team override
+            # where their rotated secret gets stored, instead of the shared
+            # ROTATION_KV_URL every app uses by default. Blank means "use the
+            # shared vault" — this is the normal case for most rows.
+            override_vault_url = (f.get("ProductTeamkeyVaultName") or "").strip()
+
             vault_result = store_rotated_secret(
                 secret_name=f"{app_name}-{jira_key}",
-                secret_value=new_secret["secretText"])
+                secret_value=new_secret["secretText"],
+                override_vault_url=override_vault_url)
             if not vault_result.get("success"):
                 summary["errors"].append(f"AppID={app_id}: store_rotated_secret failed: {vault_result}")
                 continue
