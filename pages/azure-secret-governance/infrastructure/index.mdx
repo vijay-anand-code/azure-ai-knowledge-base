@@ -188,6 +188,16 @@ az ad app federated-credential create \
   Find it in Azure Portal, under Managed Identities, your UAMI, Overview, Object (principal) ID.
 </Callout>
 
+<Callout type="warning">
+  Do this step once, and only against the tenant where the app registration itself was created,
+  the `<YOUR_TENANT_ID>` in the issuer field above. An app registration lives in exactly one
+  tenant, wherever you were signed into when you ran `az ad app create` in the previous step.
+  Do not repeat this step for additional tenants. When you later add more tenants for scanning,
+  they get an enterprise application, a service principal for this same app registration,
+  through the admin consent URL below, not a second federated credential or a second app
+  registration of their own.
+</Callout>
+
 ### Add API permissions to the App Registration
 
 Before granting consent, add the three Graph application permissions the app registration
@@ -220,6 +230,15 @@ configured on the app registration. You do not need to run a separate script for
   admin of that specific tenant each time. Consent granted in one tenant does not carry over to
   another.
 </Callout>
+
+### Verify consent actually landed
+
+Getting the admin consent prompt and clicking through it is a good sign, but worth confirming
+directly rather than assuming, especially in a tenant you visited the URL for a while ago. In
+that tenant's Azure Portal, go to Enterprise Applications, find your app, Permissions. All
+three permissions should show up with Admin consent in the Type column and Granted through
+showing Admin consent, not just listed as configured on the app registration. Do this check in
+every tenant separately, since each tenant's consent is independent.
 
 <Callout type="info">
   You can also grant permissions and consent through PowerShell instead of the portal and the
