@@ -168,47 +168,48 @@ run, provided the app's secret is also in a `P1`/`P2`/`P3` bucket.
 
 ```python
 """
-runbook_rotation.py — Azure Automation Runbook
-===============================================
+runbook_rotation.py — Azure Automation Runbook (v3 — Corrected Bucket Scheme)
+================================================================================
 Purpose : Run the secret rotation cycle directly — NO AI, NO LangChain
 Schedule: Every 7 days, 1 hour after runbook_monitoring.py
 Runtime : Python 3.10 (Azure Automation)
 
-Uses only built-in Python libraries (urllib, json, base64) for HTTP calls.
-No httpx dependency — avoids asyncio/httpcore issues in Automation runtime.
+Changes in v3 (this version):
+  1. MULTI-TENANT CREDENTIAL SPLIT (matches runbook_discovery.py's v7 fix,
+     and the same fix applied to main.py/container 2). Two credentials —
+     one for Entra scanning (follows whichever tenant is being scanned),
+     one for SharePoint (ALWAYS HOME_TENANT_ID).
 
-Authentication: Federated credential
-  UAMI asserts identity → App Registration → Graph API token
-  No client secrets or certificates needed anywhere.
+  2. MULTI-TENANT SCANNING — CROSS-TENANT-TENANT-IDS (plural), one
+     federated credential per tenant, each app tagged with its source
+     tenant.
+
+  3. FILTER CHANGED: AppOwners/OWNER-EMAILS → ManualAppOwners non-blank,
+     matching decision_engine.py's monitoring filter exactly.
+
+  4. CONFIGURABLE SECRET VALIDITY — SECRET-VALIDITY-DAYS from Key Vault,
+     default 365, replacing the old hardcoded 12-month calculation.
+
+  5. BUCKET SCHEME CORRECTED (NEW in v3) — this file previously had its
+     OWN, stale bucket classifier (P4=safe/61+, P3=31-60, P2=8-30,
+     P1=0-7 — the OLD pre-split scheme) that disagreed with
+     decision_engine.py's current P1=0-3/P2=4-7/P3=8-30/P4=31-60/P5=61+.
+     _classify_bucket() now matches exactly. ROTATION_ELIGIBLE_BUCKETS is
+     {"P1","P2","P3","P4"} — same 0-60 day range as before, re-expressed
+     under the current names. P5 is never rotation-eligible.
+
+  (v1 retained: "Discovered" in ACTIONABLE_STATUSES and the SharePoint
+   OData filter.)
 
 Required Automation Variables:
-  ROTATOR_KV_URL   — Key Vault URL holding rotation config secrets
-  ROTATION_KV_URL  — Key Vault URL where new secrets are stored
-  UAMI_CLIENT_ID   — User-assigned Managed Identity client ID
+  ROTATOR_KV_URL, ROTATION_KV_URL, UAMI_CLIENT_ID
 
-Required Key Vault secrets:
-  GRAPH-TENANT-ID        — Azure tenant ID
-  GRAPH-TENANT-NAME      — Tenant display name
-  SHAREPOINT-SITE-ID     — SharePoint site composite ID
-  SHAREPOINT-LIST-ID     — SecretAlertRegistry list ID
-  CROSS-TENANT-APP-ID    — App Registration client ID
-  CROSS-TENANT-TENANT-ID — Tenant ID for federated credential
-  JIRA-BASE-URL          — Jira instance URL
-  JIRA-API-TOKEN         — Jira API token
-  JIRA-USER-EMAIL        — Jira account email
-  OWNER-EMAIL            — App Registration display name filter
-
-Changes in this version:
-  - FRACTIONAL-SECONDS DATETIME FIX
-    Graph API's endDateTime can return arbitrary-precision fractional
-    seconds (5, 7+ digits observed in production). Python 3.10's
-    datetime.fromisoformat() only accepts 0, 3, or 6 digits and raises
-    ValueError on anything else. _days_remaining() previously caught
-    this and returned None (fail-safe — row gets skipped), which was
-    SAFE but silent: a row with a genuinely valid, parseable expiry
-    date would be skipped from rotation for no visible reason. Now
-    normalizes fractional seconds before parsing, so valid dates with
-    unusual precision are handled correctly instead of being skipped.
+Required Key Vault secrets (ROTATOR_KV_URL):
+  GRAPH-TENANT-ID, GRAPH-TENANT-NAME, JIRA-BASE-URL, JIRA-API-TOKEN,
+  JIRA-USER-EMAIL, SHAREPOINT-SITE-ID, SHAREPOINT-LIST-ID,
+  CROSS-TENANT-APP-ID, CROSS-TENANT-TENANT-IDS (or singular fallback),
+  HOME-TENANT-ID (falls back to GRAPH-TENANT-ID),
+  SECRET-VALIDITY-DAYS (falls back to 365)
 """
 
 from __future__ import annotations
@@ -246,6 +247,10 @@ ROTATOR_KV_URL  = _get_var("ROTATOR_KV_URL")
 ROTATION_KV_URL = _get_var("ROTATION_KV_URL")
 UAMI_CLIENT_ID  = _get_var("UAMI_CLIENT_ID")
 
+print(f"[DEBUG] ROTATOR_KV_URL  : {ROTATOR_KV_URL}")
+print(f"[DEBUG] ROTATION_KV_URL : {ROTATION_KV_URL}")
+print(f"[DEBUG] UAMI_CLIENT_ID  : {UAMI_CLIENT_ID[:8]}...")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AZURE CLIENTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,23 +283,44 @@ except Exception:
         _owner_emails_raw = ""
 
 OWNER_EMAILS = [e.strip().lower() for e in _owner_emails_raw.split(",") if e.strip()]
+MANUAL_OWNERS_ONLY = True
+
+try:
+    SECRET_VALIDITY_DAYS = int(_kv_get("SECRET-VALIDITY-DAYS").strip())
+except Exception:
+    SECRET_VALIDITY_DAYS = 365
+    log.info("SECRET-VALIDITY-DAYS not set (or not a valid integer) — "
+             "defaulting to %d days for newly rotated secrets.", SECRET_VALIDITY_DAYS)
+
 log.info("Config secrets loaded.")
-log.info("Owner filter (%d emails): %s", len(OWNER_EMAILS), OWNER_EMAILS)
+log.info("Owner filter (legacy, logged only — MANUAL_OWNERS_ONLY=%s): %d emails: %s",
+         MANUAL_OWNERS_ONLY, len(OWNER_EMAILS), OWNER_EMAILS)
+log.info("Secret validity period for new rotations: %d days", SECRET_VALIDITY_DAYS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
+# BATCH SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
 
-CLOSED_NAMES              = {"done", "closed", "resolved"}
-ACTIONABLE_STATUSES       = {
-    "Discovered", "JiraRaised", "TeamsAlerted",
-    "Escalated", "Expired", "ExpiredManualReview",
+SP_WRITE_BATCH             = 10
+JIRA_COMMENT_BATCH         = 5
+BATCH_PAUSE                = 0.5
+CLOSED_NAMES               = {"done", "closed", "resolved"}
+
+ACTIONABLE_STATUSES        = {
+    "Discovered",
+    "JiraRaised",
+    "TeamsAlerted",
+    "Escalated",
+    "Expired",
+    "ExpiredManualReview",
 }
-ROTATION_ELIGIBLE_BUCKETS = {"P1", "P2", "P3"}
+
+# CORRECTED (v3) — matches decision_engine.py's current bucket names.
+ROTATION_ELIGIBLE_BUCKETS  = {"P1", "P2", "P3", "P4"}
 DEFAULT_ROTATION_THRESHOLD = 60
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP HELPER
+# HTTP HELPER (synchronous urllib — no httpx needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _http(method: str, url: str, headers: dict, body: dict | None = None,
@@ -318,32 +344,76 @@ def _post(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
 def _patch(url: str, hdrs: dict, body: dict, timeout: int = 30) -> dict:
     return _http("PATCH", url, {**hdrs, "Content-Type": "application/json"}, body, timeout)
 
+def _delete(url: str, hdrs: dict, timeout: int = 30):
+    req = urllib.request.Request(url, headers=hdrs, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code not in (204, 404):
+            raise
+
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
+# GRAPH TOKEN — TWO CREDENTIALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
-CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+CROSS_TENANT_APP_ID = _kv_get("CROSS-TENANT-APP-ID")
+
+try:
+    _tenant_ids_raw = _kv_get("CROSS-TENANT-TENANT-IDS")
+except Exception:
+    _tenant_ids_raw = _kv_get("CROSS-TENANT-TENANT-ID")
+    log.info("CROSS-TENANT-TENANT-IDS not set — falling back to singular "
+             "CROSS-TENANT-TENANT-ID for backwards compatibility.")
+
+CROSS_TENANT_TENANT_IDS = [t.strip() for t in _tenant_ids_raw.split(",") if t.strip()]
+log.info("Configured to scan %d tenant(s): %s", len(CROSS_TENANT_TENANT_IDS), CROSS_TENANT_TENANT_IDS)
+
+try:
+    HOME_TENANT_ID = _kv_get("HOME-TENANT-ID")
+except Exception:
+    HOME_TENANT_ID = GRAPH_TENANT_ID
+    log.info("HOME-TENANT-ID not set — falling back to GRAPH-TENANT-ID (%s) "
+             "as the home tenant for SharePoint operations.", GRAPH_TENANT_ID)
 
 _uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
 
 def _get_uami_assertion() -> str:
-    """Returns a short-lived UAMI token used as assertion for federated auth."""
     token = _uami_credential.get_token("api://AzureADTokenExchange")
     return token.token
 
-_graph_credential = ClientAssertionCredential(
-    tenant_id = CROSS_TENANT_TENANT_ID,
+_graph_credentials_by_tenant: dict[str, ClientAssertionCredential] = {
+    tenant_id: ClientAssertionCredential(
+        tenant_id = tenant_id,
+        client_id = CROSS_TENANT_APP_ID,
+        func      = _get_uami_assertion,
+    )
+    for tenant_id in CROSS_TENANT_TENANT_IDS
+}
+
+_sp_graph_credential = ClientAssertionCredential(
+    tenant_id = HOME_TENANT_ID,
     client_id = CROSS_TENANT_APP_ID,
     func      = _get_uami_assertion,
 )
 
-def _graph_token() -> str:
-    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+def _graph_token_for_tenant(tenant_id: str) -> str:
+    credential = _graph_credentials_by_tenant[tenant_id]
+    token = credential.get_token("https://graph.microsoft.com/.default")
     return token.token
 
-def _auth_hdrs() -> dict:
-    return {"Authorization": f"Bearer {_graph_token()}"}
+def _sp_graph_token() -> str:
+    token = _sp_graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
+
+def _auth_hdrs_for_tenant(tenant_id: str) -> dict:
+    return {"Authorization": f"Bearer {_graph_token_for_tenant(tenant_id)}"}
+
+def _sp_auth_hdrs() -> dict:
+    return {"Authorization": f"Bearer {_sp_graph_token()}"}
+
+def _get_tenant_name() -> str:
+    return GRAPH_TENANT_NAME
 
 def _jira_auth() -> str:
     return "Basic " + _b64.b64encode(f"{JIRA_USER_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
@@ -357,44 +427,24 @@ def _sanitize_kv_name(name: str) -> str:
     return cleaned[:127]
 
 def _classify_bucket(days: int) -> str:
-    if days >= 61:       return "P4"
-    if 31 <= days <= 60: return "P3"
-    if 8  <= days <= 30: return "P2"
-    if 0  <= days <= 7:  return "P1"
+    """CORRECTED (v3) — matches decision_engine.py's classify_bucket() exactly."""
+    if days >= 61:       return "P5"
+    if 31 <= days <= 60: return "P4"
+    if 8  <= days <= 30: return "P3"
+    if 4  <= days <= 7:  return "P2"
+    if 0  <= days <= 3:  return "P1"
     if -7 <= days <= -1: return "ExpiredManualReview"
     return "Ignore"
-
-def _parse_graph_datetime(expiry_str: str) -> datetime:
-    """
-    Parses Graph API's endDateTime, normalizing fractional seconds first.
-
-    Python 3.10's datetime.fromisoformat() only accepts fractional seconds
-    with exactly 0, 3, or 6 digits. Graph API returns arbitrary precision
-    (5-digit and 7-digit fractional seconds observed in production) —
-    Python 3.10 raises ValueError on these. Fixed natively in Python 3.11+,
-    but this runbook targets 3.10 in Azure Automation, so we normalize
-    manually here instead of relying on a runtime upgrade.
-
-    Truncates fractional seconds to 6 digits if longer, pads with trailing
-    zeros if shorter. Sub-microsecond precision is irrelevant for day-level
-    expiry math, so this loses no meaningful information.
-    """
-    match = re.search(r'\.(\d+)', expiry_str)
-    if match:
-        frac = match.group(1)[:6].ljust(6, '0')
-        expiry_str = expiry_str[:match.start()] + '.' + frac + expiry_str[match.end():]
-    return datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
 
 def _days_remaining(expiration_iso: str, now: datetime) -> int | None:
     try:
         if len(expiration_iso) == 10:
             expiration_iso += "T00:00:00+00:00"
-        exp = _parse_graph_datetime(expiration_iso)
+        exp = datetime.fromisoformat(expiration_iso.replace("Z", "+00:00"))
         if exp.tzinfo is None:
             exp = exp.replace(tzinfo=timezone.utc)
         return (exp - now).days
-    except Exception as e:
-        log.warning("Failed to parse ExpirationDate=%r: %s — row will be skipped", expiration_iso, e)
+    except Exception:
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,34 +452,66 @@ def _days_remaining(expiration_iso: str, now: datetime) -> int | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_azure_applications() -> dict:
-    url  = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,appId,passwordCredentials"
-    apps: list[dict] = []
-    while url:
-        b = _get(url, _auth_hdrs(), timeout=30)
-        apps.extend(b.get("value", []))
-        url = b.get("@odata.nextLink")
-    return {"applications": apps, "total_apps": len(apps)}
+    all_apps: list[dict] = []
+    tenant_errors: list[str] = []
+
+    for tenant_id in CROSS_TENANT_TENANT_IDS:
+        try:
+            url = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,appId,passwordCredentials"
+            hdrs = _auth_hdrs_for_tenant(tenant_id)
+            tenant_apps: list[dict] = []
+            while url:
+                b = _get(url, hdrs, timeout=30)
+                tenant_apps.extend(b.get("value", []))
+                url = b.get("@odata.nextLink")
+            for app in tenant_apps:
+                app["_sourceTenantId"] = tenant_id
+            all_apps.extend(tenant_apps)
+            print(f"[DEBUG] fetch_azure_applications: {len(tenant_apps)} apps from tenant {tenant_id}")
+        except Exception as e:
+            tenant_errors.append(f"Tenant {tenant_id}: fetch_azure_applications failed: {e}")
+            log.error("Failed to fetch applications from tenant %s: %s", tenant_id, e)
+
+    print(f"[DEBUG] fetch_azure_applications: {len(all_apps)} total apps across "
+          f"{len(CROSS_TENANT_TENANT_IDS)} tenant(s)")
+    return {"applications": all_apps, "total_apps": len(all_apps), "tenantErrors": tenant_errors}
 
 def get_sharepoint_state() -> dict:
     status_filter = " or ".join([
         f"fields/AlertStatus eq '{s}'"
         for s in [
-            "Discovered", "RotatedPendingDeployment",
-            "JiraRaised", "TeamsAlerted", "Escalated",
-            "Expired", "ExpiredManualReview",
+            "Discovered",
+            "RotatedPendingDeployment",
+            "JiraRaised",
+            "TeamsAlerted",
+            "Escalated",
+            "Expired",
+            "ExpiredManualReview",
         ]
     ])
+
     url = (
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
         f"/lists/{SHAREPOINT_LIST_ID}/items"
         f"?$expand=fields"
         f"&$filter={urllib.parse.quote(status_filter)}"
     )
+
     items: list[dict] = []
+    hdrs = _sp_auth_hdrs()
     while url:
-        b = _get(url, _auth_hdrs(), timeout=30)
+        b = _get(url, hdrs, timeout=30)
         items.extend(b.get("value", []))
         url = b.get("@odata.nextLink")
+
+    print(f"[DEBUG] get_sharepoint_state (smart filter): {len(items)} actionable rows")
+
+    status_counts: dict[str, int] = {}
+    for item in items:
+        s = item.get("fields", {}).get("AlertStatus", "None")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    print(f"[DEBUG] AlertStatus distribution: {status_counts}")
+
     return {"items": items, "count": len(items)}
 
 _DATE_COLS = {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate"}
@@ -438,33 +520,40 @@ def write_sharepoint_row(item_id: str | None, fields: dict) -> dict:
     for col in _DATE_COLS:
         if col in fields and fields[col]:
             fields[col] = str(fields[col])[:10]
-    fields["TenantID"]   = GRAPH_TENANT_ID
-    fields["TenantName"] = GRAPH_TENANT_NAME
+    if not fields.get("TenantID"):
+        fields["TenantID"] = GRAPH_TENANT_ID
+    if not fields.get("TenantName"):
+        fields["TenantName"] = _get_tenant_name()
     base = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
             f"/lists/{SHAREPOINT_LIST_ID}/items")
+    hdrs = _sp_auth_hdrs()
     if item_id is None:
-        r = _post(base, _auth_hdrs(), {"fields": fields}, timeout=20)
+        r = _post(base, hdrs, {"fields": fields}, timeout=20)
         return {"action": "created", "item_id": r.get("id")}
     else:
-        _patch(f"{base}/{item_id}", _auth_hdrs(), {"fields": fields}, timeout=20)
+        _patch(f"{base}/{item_id}", hdrs, {"fields": fields}, timeout=20)
         return {"action": "updated", "item_id": item_id}
 
 def create_azure_secret(application_object_id: str, display_name: str,
-                        months_valid: int = 12) -> dict:
-    end_date = datetime.now(timezone.utc) + timedelta(days=30 * months_valid)
+                        tenant_id: str, days_valid: int = SECRET_VALIDITY_DAYS) -> dict:
+    end_date = datetime.now(timezone.utc) + timedelta(days=days_valid)
     payload  = {"passwordCredential": {
         "displayName": display_name,
         "endDateTime": end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
     }}
     url = f"https://graph.microsoft.com/v1.0/applications/{application_object_id}/addPassword"
+    hdrs = _auth_hdrs_for_tenant(tenant_id)
     for attempt in range(1, 6):
         try:
-            b = _post(url, _auth_hdrs(), payload, timeout=30)
+            b = _post(url, hdrs, payload, timeout=30)
+            log.info("create_azure_secret: new keyId %s (valid %d days)", b.get("keyId"), days_valid)
             return {"success": True, "keyId": b.get("keyId"),
                     "secretText": b.get("secretText"), "endDateTime": b.get("endDateTime")}
         except RuntimeError as e:
             if ("409" in str(e) or "412" in str(e)) and attempt < 5:
-                time.sleep(attempt * 5)
+                wait = attempt * 5
+                log.warning("Concurrency conflict — retry %d/5 in %ds", attempt, wait)
+                time.sleep(wait)
                 continue
             return {"success": False, "error": str(e)}
     return {"success": False, "error": "Max retries exceeded"}
@@ -508,17 +597,31 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
 
     summary: dict[str, Any] = {
         "runDate": today, "rotationThresholdDays": rotation_threshold_days,
-        "rowsScanned": 0, "rowsSkippedNoOwner": 0, "rowsSkippedRotated": 0,
+        "secretValidityDays": SECRET_VALIDITY_DAYS,
+        "tenantsScanned": len(CROSS_TENANT_TENANT_IDS),
+        "rowsScanned": 0,
+        "rowsSkippedNoManualOwner": 0,
+        "rowsSkippedRotated": 0,
         "rotationsCompleted": 0, "newSecretsGenerated": 0,
         "jiraComments": 0, "flaggedForManualReview": 0, "sharepointUpdated": 0,
         "errors": [],
     }
 
-    sp_data    = get_sharepoint_state()
-    azure_data = fetch_azure_applications()
+    try:
+        sp_data = get_sharepoint_state()
+    except Exception as e:
+        summary["errors"].append(f"get_sharepoint_state failed: {e}")
+        return summary
 
-    app_object_id_by_client_id: dict[str, str] = {
-        app["appId"]: app["id"]
+    try:
+        azure_data = fetch_azure_applications()
+        summary["errors"].extend(azure_data.get("tenantErrors", []))
+    except Exception as e:
+        summary["errors"].append(f"fetch_azure_applications failed: {e}")
+        return summary
+
+    app_info_by_client_id: dict[str, tuple[str, str]] = {
+        app["appId"]: (app["id"], app.get("_sourceTenantId", HOME_TENANT_ID))
         for app in azure_data.get("applications", [])
         if app.get("appId") and app.get("id")
     }
@@ -529,6 +632,7 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
     # ── PHASE A: Closure check ────────────────────────────────────────────────
     pending = [i for i in items
                if i.get("fields", {}).get("AlertStatus") == "RotatedPendingDeployment"]
+    print(f"[DEBUG] Phase A: {len(pending)} RotatedPendingDeployment rows")
 
     for item in pending:
         f        = item.get("fields", {})
@@ -544,12 +648,9 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
             issue       = get_jira_issue(jira_key)
             status_name = (issue.get("status") or "").strip().lower()
             if status_name in CLOSED_NAMES:
-                write_sharepoint_row(item_id, {
-                    "AlertStatus": "Rotated",
-                    "RotationDetectedDate": today,
-                    "ExpiryNotice": "Rotated — Completed",
-                    "LastChecked": today,
-                })
+                write_sharepoint_row(item_id, {"AlertStatus": "Rotated",
+                    "RotationDetectedDate": today, "ExpiryNotice": "Rotated — Completed",
+                    "LastChecked": today})
                 summary["rotationsCompleted"] += 1
                 summary["sharepointUpdated"]  += 1
             else:
@@ -567,15 +668,40 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
 
     candidates = []
     for item in all_candidates:
-        f          = item.get("fields", {})
-        app_owners = (f.get("AppOwners") or "").lower()
-        if not app_owners:
-            summary["rowsSkippedNoOwner"] += 1
-            continue
-        if OWNER_EMAILS and not any(email in app_owners for email in OWNER_EMAILS):
-            summary["rowsSkippedNoOwner"] += 1
-            continue
+        f      = item.get("fields", {})
+        app_id = f.get("Title", "")
+
+        if MANUAL_OWNERS_ONLY:
+            manual_owners = (f.get("ManualAppOwners") or "").strip()
+            if not manual_owners:
+                summary["rowsSkippedNoManualOwner"] += 1
+                log.debug("Skipping %s — ManualAppOwners is blank", app_id)
+                continue
+        else:
+            app_owners = (f.get("AppOwners") or "").lower()
+            if not app_owners:
+                summary["rowsSkippedNoManualOwner"] += 1
+                log.debug("Skipping %s — AppOwners is blank", app_id)
+                continue
+            if OWNER_EMAILS and not any(email in app_owners for email in OWNER_EMAILS):
+                summary["rowsSkippedNoManualOwner"] += 1
+                log.debug("Skipping %s — not owned by any of %s (owners: %s)",
+                          app_id, OWNER_EMAILS, app_owners)
+                continue
+
         candidates.append(item)
+
+    print(f"[DEBUG] Phase B: {len(all_candidates)} total candidates, {len(candidates)} "
+          f"after {'ManualAppOwners' if MANUAL_OWNERS_ONLY else 'AppOwners/OWNER_EMAILS'} filter")
+    print(f"[DEBUG] Phase B: {summary['rowsSkippedNoManualOwner']} skipped "
+          f"({'ManualAppOwners blank' if MANUAL_OWNERS_ONLY else f'not owned by any of {OWNER_EMAILS}'})")
+
+    for item in candidates[:5]:
+        f    = item.get("fields", {})
+        days = _days_remaining(f.get("ExpirationDate", ""), now)
+        bkt  = _classify_bucket(days) if days is not None else "unknown"
+        print(f"[DEBUG]   AppID={f.get('Title')} Status={f.get('AlertStatus')} "
+              f"Days={days} Bucket={bkt}")
 
     for item in candidates:
         f      = item.get("fields", {})
@@ -599,6 +725,7 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
 
         if f.get("NewSecretVaultName"):
             summary["rowsSkippedRotated"] += 1
+            log.debug("Skipping %s — already rotated (NewSecretVaultName set)", app_id)
             continue
 
         try:
@@ -611,14 +738,18 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
                 summary["sharepointUpdated"] += 1
                 continue
 
-            object_id = app_object_id_by_client_id.get(app_id)
-            if not object_id:
+            app_info = app_info_by_client_id.get(app_id)
+            if not app_info:
                 summary["errors"].append(f"AppID={app_id}: not found in Azure snapshot")
                 continue
+            object_id, app_tenant_id = app_info
 
+            print(f"[DEBUG] Rotating: {app_name} ({app_id}) jira={jira_key} days={days} "
+                  f"tenant={app_tenant_id} validity={SECRET_VALIDITY_DAYS}d")
             new_secret = create_azure_secret(
                 application_object_id=object_id,
-                display_name=f"AutoRotated-{jira_key}-{today}")
+                display_name=f"AutoRotated-{jira_key}-{today}",
+                tenant_id=app_tenant_id)
             if not new_secret.get("success"):
                 summary["errors"].append(f"AppID={app_id}: create_azure_secret failed: {new_secret}")
                 continue
@@ -635,7 +766,7 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
 
             try:
                 comment = (
-                    f"AUTO-ROTATION — {today}\n"
+                    f"🔐 AUTO-ROTATION — {today}\n"
                     f"A new client secret has been generated for {app_name} (App ID: {app_id}).\n"
                     f"New credential keyId: {new_secret['keyId']}\n"
                     f"New credential expiry: {new_secret['endDateTime']}\n"
@@ -657,6 +788,8 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
                 "NewSecretVaultName": vault_name,
                 "ExpiryNotice":       f"New secret ready — pending deployment ({jira_key})",
                 "LastChecked":        today,
+                "TenantID":           app_tenant_id,
+                "TenantName":         app_tenant_id,
             })
             summary["sharepointUpdated"] += 1
 
@@ -668,26 +801,33 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
     return summary
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    log.info("Rotation Runbook started")
+    started = datetime.now(timezone.utc).isoformat()
+    log.info("Rotation Runbook v3 started at %s (multi-tenant credential split, "
+             "ManualAppOwners filter, configurable SECRET-VALIDITY-DAYS, "
+             "bucket scheme corrected to match decision_engine.py)", started)
+
     summary = run_secret_rotation(rotation_threshold_days=60)
 
     print("=" * 60)
-    print("ROTATION RUNBOOK — SUMMARY")
+    print("ROTATION RUNBOOK v3 — SUMMARY")
     print("=" * 60)
-    print(f"  Run Date                : {summary.get('runDate')}")
-    print(f"  Owner Filter            : {OWNER_EMAILS}")
-    print(f"  SharePoint Rows Scanned : {summary.get('rowsScanned')}")
-    print(f"  Skipped (not owned)     : {summary.get('rowsSkippedNoOwner')}")
+    print(f"  Run Date                 : {summary.get('runDate')}")
+    print(f"  Threshold (days)         : {summary.get('rotationThresholdDays')}")
+    print(f"  Secret Validity (days)   : {summary.get('secretValidityDays')}")
+    print(f"  Tenants Scanned          : {summary.get('tenantsScanned')} ({', '.join(CROSS_TENANT_TENANT_IDS)})")
+    print(f"  SharePoint Rows Scanned  : {summary.get('rowsScanned')}")
+    print(f"  Skipped (ManualAppOwners blank): {summary.get('rowsSkippedNoManualOwner')}")
     print(f"  Skipped (already rotated): {summary.get('rowsSkippedRotated')}")
-    print(f"  New Secrets Generated   : {summary.get('newSecretsGenerated')}")
-    print(f"  Rotations Completed     : {summary.get('rotationsCompleted')}")
-    print(f"  Jira Comments Added     : {summary.get('jiraComments')}")
-    print(f"  Flagged for Manual Rev. : {summary.get('flaggedForManualReview')}")
-    print(f"  SharePoint Updated      : {summary.get('sharepointUpdated')}")
+    print(f"  New Secrets Generated    : {summary.get('newSecretsGenerated')}")
+    print(f"  Rotations Completed      : {summary.get('rotationsCompleted')}")
+    print(f"  Jira Comments Added      : {summary.get('jiraComments')}")
+    print(f"  Flagged for Manual Rev.  : {summary.get('flaggedForManualReview')}")
+    print(f"  SharePoint Updated       : {summary.get('sharepointUpdated')}")
+
     errors = summary.get("errors", [])
     if errors:
         print(f"\n  ERRORS ({len(errors)}):")
