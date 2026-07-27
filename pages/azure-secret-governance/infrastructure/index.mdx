@@ -8,12 +8,18 @@ import { Callout, Steps, FileTree, Tabs, Tab } from 'nextra/components'
 # Infrastructure Setup
 
 All Azure resources are created with a single Bicep deployment. You do not need to create
-anything manually in the portal — the template handles Resource Group, UAMI, Key Vaults,
+anything manually in the portal. The template handles Resource Group, UAMI, Key Vaults,
 Container Registry, Container App Environment, and Automation Account.
 
 <Callout type="info">
-  **You do not need Docker installed.** Container images are built directly in Azure using
-  `az acr build` — no local Docker daemon required.
+  You do not need Docker installed. Container images are built directly in Azure using
+  `az acr build`, so no local Docker daemon is required.
+</Callout>
+
+<Callout type="warning">
+  The Bicep templates and exact deployment commands in this page are being reviewed and may not
+  match the current version of the templates. Check the actual `infra` folder in the repository
+  before running any of the commands below against a real environment.
 </Callout>
 
 ---
@@ -23,9 +29,9 @@ Container Registry, Container App Environment, and Automation Account.
 | Resource | What it does |
 |----------|-------------|
 | **Resource Group** | Container for all project resources |
-| **User-Assigned Managed Identity (UAMI)** | The system's identity — authenticates to Key Vault and ACR with no passwords |
-| **Key Vault — config** | Stores Jira, Teams, SharePoint, and OpenAI credentials |
-| **Key Vault — rotation** | Stores newly generated secret values after rotation |
+| **User-Assigned Managed Identity (UAMI)** | The system's identity, authenticates to Key Vault and ACR with no passwords |
+| **Key Vault, config** | Stores Jira, Teams, SharePoint, and OpenAI credentials |
+| **Key Vault, rotation** | Stores newly generated secret values after rotation |
 | **Azure Container Registry** | Stores the Docker images for Container 1 and Container 2 |
 | **Container App Environment** | The runtime environment for both containers |
 | **Azure Automation Account** | Runs the weekly discovery, monitoring, and rotation runbooks |
@@ -53,10 +59,11 @@ az login
 | Service | What you need |
 |---------|--------------|
 | **Azure subscription** | Contributor or Owner role |
-| **Azure OpenAI** | Quota approval required — request via Azure portal if not already approved |
+| **Azure OpenAI** | Quota approval required, request via Azure portal if not already approved |
 | **Microsoft 365 / SharePoint** | Admin access to create a SharePoint team site |
 | **Microsoft Teams** | Ability to add connectors to a Teams channel |
 | **Jira (Atlassian)** | Admin access to create a project and API token |
+| **Second Entra ID tenant** | Only needed if you are scanning App Registrations across more than one tenant |
 
 ---
 
@@ -74,9 +81,13 @@ az login
     </FileTree.Folder>
     <FileTree.Folder name="runbooks">
       <FileTree.File name="runbook_discovery.py" />
+      <FileTree.File name="runbook_owner_sync.py" />
+      <FileTree.File name="owner_sync_local.py" />
       <FileTree.File name="runbook_monitoring.py" />
       <FileTree.File name="runbook_rotation.py" />
       <FileTree.File name="runbook_cleanup_sharepoint.py" />
+      <FileTree.File name="runbook_cleanup_sharepoint_ignored.py" />
+      <FileTree.File name="runbook_cleanup_sharepoint_all.py" />
     </FileTree.Folder>
   </FileTree.Folder>
   <FileTree.Folder name="secret-governance-app">
@@ -95,6 +106,13 @@ az login
   </FileTree.Folder>
 </FileTree>
 
+<Callout type="info">
+  `owner_sync_local.py` is not run by the Automation Account at all. It runs on a laptop under
+  the operator's own signed in session, so that granting Entra ownership is always tied to an
+  individual person rather than the shared automation identity. See the Ownership model section
+  on the main page for why this is deliberate, not an oversight.
+</Callout>
+
 ---
 
 ## Step-by-step deployment
@@ -105,7 +123,7 @@ az login
 
 ```bash
 az ad signed-in-user show --query id -o tsv
-# Example output: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+# Example output: 00000000-0000-0000-0000-000000000000
 ```
 
 ### Fill in foundation.parameters.json
@@ -114,9 +132,9 @@ az ad signed-in-user show --query id -o tsv
 {
   "parameters": {
     "location":          { "value": "eastasia" },
-    "resourceGroupName": { "value": "contoso-secret-governance-rg" },
+    "resourceGroupName": { "value": "example-secret-governance-rg" },
     "prefix":            { "value": "secgov" },
-    "adminObjectId":     { "value": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
+    "adminObjectId":     { "value": "00000000-0000-0000-0000-000000000000" }
   }
 }
 ```
@@ -139,13 +157,13 @@ directly to the UAMI. This enables cross-tenant access without storing any clien
 
 ```bash
 # Create the App Registration
-az ad app create --display-name "azure-secretgovernance-cross-tenant"
-# Copy the "appId" from the output — this is your CROSS_TENANT_APP_ID
+az ad app create --display-name "your-cross-tenant-app-name"
+# Copy the "appId" from the output, this is your CROSS_TENANT_APP_ID
 ```
 
 ### Add federated credential to App Registration
 
-This tells Azure: "Trust the UAMI to assert its identity to this App Registration."
+This tells Azure to trust the UAMI to assert its identity to this App Registration.
 
 ```bash
 APP_ID="<APP_ID_FROM_PREVIOUS_STEP>"
@@ -166,8 +184,8 @@ az ad app federated-credential create \
 ```
 
 <Callout type="info">
-  The `subject` field must be the **object ID** of the UAMI — not the client ID.
-  Get it from: Azure Portal → Managed Identities → your UAMI → Overview → Object (principal) ID
+  The `subject` field must be the object ID of the UAMI, not the client ID.
+  Find it in Azure Portal, under Managed Identities, your UAMI, Overview, Object (principal) ID.
 </Callout>
 
 ### Grant App Registration Microsoft Graph permissions
@@ -201,14 +219,18 @@ Write-Host "Permissions granted"
 ```
 
 <Callout type="warning">
-  Grant admin consent after adding permissions:
-  **Azure Portal → Enterprise Applications → azure-secretgovernance-cross-tenant → Permissions → Grant admin consent**
+  Grant admin consent after adding permissions, in Azure Portal under Enterprise Applications,
+  your cross-tenant App Registration, Permissions, Grant admin consent. If you are scanning more
+  than one tenant, this whole app registration and consent step has to be repeated in every
+  tenant it will scan, since consent does not carry over between tenants automatically.
 </Callout>
 
 ### Add App Registration as owner on App Registrations
 
 The App Registration must be listed as an owner on each App Registration it should manage.
-This is required for `addPassword` to work during rotation.
+This is required for `addPassword` to work during rotation. Because `OwnedBy` cannot grant new
+ownership on its own, this step always has to be done by a person with the right role, never by
+the automation itself.
 
 ```powershell
 Connect-MgGraph -Scopes "Application.ReadWrite.All"
@@ -226,18 +248,20 @@ New-MgApplicationOwnerByRef -ApplicationId $targetAppObjectId -BodyParameter @{
 ```
 
 <Callout type="info">
-  **Why OwnedBy instead of ReadWrite.All?**
-  `Application.ReadWrite.OwnedBy` allows reading ALL App Registrations but write
-  operations — creating new secrets during rotation — are limited to apps where the
-  App Registration is listed as an owner. This is least-privilege by design.
+  Why `OwnedBy` instead of `ReadWrite.All`? `Application.ReadWrite.OwnedBy` allows reading every
+  App Registration, but write operations, meaning creating new secrets during rotation, are
+  limited to apps where the App Registration is already listed as an owner. That is
+  least-privilege by design, and it is also why this project uses one App Registration rather
+  than a wider grant. See the owner_sync_local.py note above for how new ownership actually gets
+  added.
 </Callout>
 
 ### Grant App Registration SharePoint site access
 
-`Sites.Selected` restricts access to only your specific SharePoint site.
-Grant it via Graph Explorer — there is no Azure CLI command for this.
+`Sites.Selected` restricts access to only the specific SharePoint site you grant it against.
+Grant it through Graph Explorer, there is no Azure CLI command for this.
 
-- Go to [Graph Explorer](https://developer.microsoft.com/graph/graph-explorer)
+- Go to Graph Explorer at `developer.microsoft.com/graph/graph-explorer`
 - Sign in with your admin account
 - Get your site ID first:
 
@@ -245,7 +269,7 @@ Grant it via Graph Explorer — there is no Azure CLI command for this.
 GET https://graph.microsoft.com/v1.0/sites/<tenant>.sharepoint.com:/sites/<site-name>
 ```
 
-Copy the `id` field from the response (3-part format), then run:
+Copy the `id` field from the response, then run:
 
 ```
 POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
@@ -257,11 +281,17 @@ POST https://graph.microsoft.com/v1.0/sites/<YOUR_SITE_ID>/permissions
   "grantedToIdentities": [{
     "application": {
       "id": "<CROSS_TENANT_APP_ID>",
-      "displayName": "azure-secretgovernance-cross-tenant"
+      "displayName": "your-cross-tenant-app-name"
     }
   }]
 }
 ```
+
+<Callout type="info">
+  This grant applies at the site level, so it covers all four SharePoint lists the system uses:
+  `SecretAlertRegistry`, `SecretAlertRegistryBackup`, `IgnoredSecretRegistry`, and
+  `IgnoredSecretRegistryBackup`. You do not need to grant this separately per list.
+</Callout>
 
 ### Populate Key Vault secrets
 
@@ -272,47 +302,8 @@ az deployment group create \
   --parameters '@keyvault-secrets.parameters.json'
 ```
 
-Or set secrets manually via CLI:
-
-```bash
-KV="<YOUR_KV_NAME>"
-
-az keyvault secret set --vault-name $KV --name "GRAPH-TENANT-ID"       --value "<tenant-id>"
-az keyvault secret set --vault-name $KV --name "GRAPH-TENANT-NAME"     --value "<tenant.onmicrosoft.com>"
-az keyvault secret set --vault-name $KV --name "SHAREPOINT-SITE-ID"    --value "<site-composite-id>"
-az keyvault secret set --vault-name $KV --name "SHAREPOINT-LIST-ID"    --value "<list-id>"
-az keyvault secret set --vault-name $KV --name "CROSS-TENANT-APP-ID"   --value "<app-registration-client-id>"
-az keyvault secret set --vault-name $KV --name "CROSS-TENANT-TENANT-ID" --value "<tenant-id>"
-az keyvault secret set --vault-name $KV --name "JIRA-BASE-URL"         --value "https://yourcompany.atlassian.net"
-az keyvault secret set --vault-name $KV --name "JIRA-API-TOKEN"        --value "<token>"
-az keyvault secret set --vault-name $KV --name "JIRA-USER-EMAIL"       --value "<email>"
-az keyvault secret set --vault-name $KV --name "JIRA-PROJECT-KEY"      --value "KAN"
-az keyvault secret set --vault-name $KV --name "JIRA-EPIC-KEY"         --value "KAN-161"
-az keyvault secret set --vault-name $KV --name "JIRA-ISSUE-TYPE"       --value "Incident"
-az keyvault secret set --vault-name $KV --name "TEAMS-WEBHOOK-URL"     --value "<webhook-url>"
-az keyvault secret set --vault-name $KV --name "OWNER-EMAIL"           --value "azure-secretgovernance-cross-tenant"
-az keyvault secret set --vault-name $KV --name "AZURE-OPENAI-ENDPOINT" --value "<endpoint>"
-az keyvault secret set --vault-name $KV --name "AZURE-OPENAI-API-KEY"  --value "<key>"
-az keyvault secret set --vault-name $KV --name "AZURE-OPENAI-DEPLOYMENT-NAME" --value "<deployment>"
-```
-
-### Build and deploy the Container App
-
-```bash
-ACR="<YOUR_ACR_LOGIN_SERVER>"
-RG="<YOUR_RESOURCE_GROUP>"
-
-az acr build --registry $ACR --resource-group $RG \
-  --image secret-governance/monitor-mcp:latest ./container-2
-
-az acr build --registry $ACR --resource-group $RG \
-  --image secret-governance/langchain-agent:latest ./container-1
-
-az deployment group create \
-  --resource-group $RG \
-  --template-file deploy.bicep \
-  --parameters '@deploy.parameters.json'
-```
+Or set secrets manually through the CLI. See the full reference table below for every secret
+the system actually reads, including the ones this deployment step does not cover on its own.
 
 </Steps>
 
@@ -321,20 +312,20 @@ az deployment group create \
 ## Permission model
 
 The system uses a federated credential App Registration for all Graph API access.
-The UAMI is only used to assert identity — no direct Graph permissions on UAMI.
+The UAMI is only used to assert identity, it holds no direct Graph permissions of its own.
 
 | Permission | Granted to | Purpose |
 |-----------|------------|---------|
-| `Application.ReadWrite.OwnedBy` | App Registration | Read all App Registrations. Write secrets only on owned apps |
-| `Sites.Selected` | App Registration | Read/write SecretAlertRegistry SharePoint list only |
+| `Application.ReadWrite.OwnedBy` | App Registration, consented in every tenant being scanned | Read all App Registrations in that tenant. Write secrets only on apps where the App Registration is listed as owner |
+| `Sites.Selected` | App Registration, consented in the home tenant | Read and write all four SharePoint lists |
 | `Key Vault Secrets User` | UAMI | Read config secrets from Key Vault |
-| `Key Vault Secrets Officer` | UAMI | Write new secret values to rotation Key Vault |
+| `Key Vault Secrets Officer` | UAMI | Write new secret values to the rotation Key Vault |
 | `AcrPull` | UAMI | Pull container images from Azure Container Registry |
 
 <Callout type="warning">
-  **Do not grant `Application.ReadWrite.All` or `Sites.ReadWrite.All`.**
-  These are broader than needed. `Application.ReadWrite.OwnedBy` covers everything —
-  read all apps, write only owned apps.
+  Do not grant `Application.ReadWrite.All` or `Sites.ReadWrite.All`. These are broader than
+  needed. `Application.ReadWrite.OwnedBy` already covers everything the system does: read every
+  app, write only to apps it already owns.
 </Callout>
 
 ---
@@ -343,13 +334,15 @@ The UAMI is only used to assert identity — no direct Graph permissions on UAMI
 
 | Time | Runbook | What it does |
 |------|---------|-------------|
-| `00:00` | `runbook_discovery.py` | Scans all apps, stamps `AppOwners` to SharePoint |
-| `00:30` | `runbook_monitoring.py` | Triggers monitoring container — raises Jira tickets and Teams alerts |
-| `01:00` | `runbook_rotation.py` | Rotates P1/P2/P3 secrets, stores new values in Key Vault |
+| `00:00` | `runbook_discovery.py` | Scans every configured tenant, classifies every secret P1 through P5, backs up both SharePoint lists before writing |
+| Run manually | `owner_sync_local.py` | Reads `ManualAppOwners` and adds the named identity as an Entra owner. Runs on a laptop, not on the Automation Account, so this step is deliberately outside the schedule |
+| `00:30` | `runbook_monitoring.py` | Triggers the monitoring container, raises Jira tickets and Teams alerts, propagates `ManualAppOwners` to sibling rows |
+| `01:00` | `runbook_rotation.py` | Rotates P1 through P4 secrets, stores new values in Key Vault |
 
 <Callout type="info">
-  The 30-minute gap between discovery and monitoring ensures SharePoint rows have correct
-  `AppOwners` values before monitoring reads them.
+  The 30-minute gap between discovery and monitoring gives discovery time to finish writing
+  before monitoring reads the same SharePoint list. Owner sync is not on a fixed schedule at
+  all, since it needs a person present to run it, not just a trigger.
 </Callout>
 
 ---
@@ -358,27 +351,34 @@ The UAMI is only used to assert identity — no direct Graph permissions on UAMI
 
 | Secret name | Example value | Used by |
 |-------------|--------------|---------|
-| `GRAPH-TENANT-ID` | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | All runbooks |
-| `GRAPH-TENANT-NAME` | `contoso.onmicrosoft.com` | Monitoring container |
-| `SHAREPOINT-SITE-ID` | `contoso.sharepoint.com,abc...,def...` | All runbooks |
-| `SHAREPOINT-LIST-ID` | `25b457eb-cf85-4c11-b712-cfa882898c6b` | All runbooks |
-| `CROSS-TENANT-APP-ID` | `acc82978-f200-496f-9fe1-fd818dd9fd7d` | All runbooks |
-| `CROSS-TENANT-TENANT-ID` | `70afdd80-5f5b-4a09-a90d-383f126e8c33` | All runbooks |
-| `JIRA-BASE-URL` | `https://contoso.atlassian.net` | Monitoring + rotation |
-| `JIRA-API-TOKEN` | `ATATT3x...` | Monitoring + rotation |
-| `JIRA-USER-EMAIL` | `admin@contoso.com` | Monitoring + rotation |
+| `GRAPH-TENANT-ID` | `00000000-0000-0000-0000-000000000000` | All runbooks |
+| `GRAPH-TENANT-NAME` | `example.onmicrosoft.com` | Monitoring container |
+| `HOME-TENANT-ID` | `00000000-0000-0000-0000-000000000000` | All runbooks. The tenant where SharePoint actually lives. Falls back to `GRAPH-TENANT-ID` if not set |
+| `SHAREPOINT-SITE-ID` | `example.sharepoint.com,site-guid,web-guid` | All runbooks |
+| `SHAREPOINT-LIST-ID` | list GUID | All runbooks. `SecretAlertRegistry` |
+| `SHAREPOINT-BACKUP-LIST-ID` | list GUID | Discovery. `SecretAlertRegistryBackup` |
+| `SHAREPOINT-IGNORED-LIST-ID` | list GUID | Discovery and monitoring. `IgnoredSecretRegistry` |
+| `SHAREPOINT-IGNORED-BACKUP-LIST-ID` | list GUID | Discovery. `IgnoredSecretRegistryBackup` |
+| `CROSS-TENANT-APP-ID` | app registration client ID | All runbooks |
+| `CROSS-TENANT-TENANT-IDS` | comma separated tenant IDs | All runbooks. Plural, replaces the older singular `CROSS-TENANT-TENANT-ID`, which is still read as a fallback if this is not set |
+| `SECRET-VALIDITY-DAYS` | `365` | Rotation. How many days a newly rotated secret stays valid for. Falls back to 365 if not set |
+| `JIRA-BASE-URL` | `https://example.atlassian.net` | Monitoring and rotation |
+| `JIRA-API-TOKEN` | token value | Monitoring and rotation |
+| `JIRA-USER-EMAIL` | example account used to authenticate to Jira | Monitoring and rotation |
 | `JIRA-PROJECT-KEY` | `KAN` | Monitoring |
-| `JIRA-EPIC-KEY` | `KAN-161` | Monitoring |
+| `JIRA-EPIC-KEY` | example ticket key | Monitoring |
 | `JIRA-ISSUE-TYPE` | `Incident` | Monitoring |
-| `TEAMS-WEBHOOK-URL` | `https://...webhook.office.com/...` | Monitoring |
-| `OWNER-EMAIL` | `azure-secretgovernance-cross-tenant` | Monitoring + rotation |
-| `AZURE-OPENAI-ENDPOINT` | `https://...openai.azure.com` | Container 1 |
-| `AZURE-OPENAI-API-KEY` | `sk-...` | Container 1 |
+| `TEAMS-WEBHOOK-URL` | Teams incoming webhook URL | Monitoring |
+| `TEAMS-TAG-EMAIL` | example account to mention on P1 alerts | Monitoring |
+| `OWNER-EMAILS` | kept for backwards compatibility only, not used to gate anything by default | Monitoring and rotation |
+| `AZURE-OPENAI-ENDPOINT` | `https://example.openai.azure.com` | Container 1 |
+| `AZURE-OPENAI-API-KEY` | key value | Container 1 |
 | `AZURE-OPENAI-DEPLOYMENT-NAME` | `gpt-4o` | Container 1 |
 
 <Callout type="warning">
-  `OWNER-EMAIL` must be set to the **display name** of your App Registration
-  (e.g. `azure-secretgovernance-cross-tenant`). The monitoring and rotation runbooks
-  use this to filter SharePoint rows — only rows where `AppOwners` contains this value
-  are actioned.
+  `OWNER-EMAILS` and the older singular `OWNER-EMAIL` are no longer what decides which secrets
+  get monitored or rotated. That gate is now the `ManualAppOwners` column in SharePoint, filled
+  in by a person, per app. Discovery never writes to that column, and monitoring propagates it
+  to every other row belonging to the same app automatically. See the Ownership model section on
+  the main page for the full picture.
 </Callout>
