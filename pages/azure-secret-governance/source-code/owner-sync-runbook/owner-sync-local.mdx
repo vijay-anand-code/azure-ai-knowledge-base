@@ -143,14 +143,14 @@ Purpose : Reads the ManualAppOwners column in SharePoint SecretAlertRegistry and
           not a shared managed identity or app registration.
 
           THIS IS DELIBERATELY A LOCAL SCRIPT, NOT AN AZURE AUTOMATION RUNBOOK.
-          Prior versions (v1-v3) ran unattended on a schedule, using the UAMI
+          Prior versions (v1–v3) ran unattended on a schedule, using the UAMI
           federated to CROSS_TENANT_APP_ID. Granting that shared identity
           Application.ReadWrite.All to add owners meant EVERY runbook sharing
           that one app registration (discovery, rotation, owner_sync) gained
-          standing, tenant-wide write over App Registration ownership, a real
+          standing, tenant-wide write over App Registration ownership — a real
           permission-scope problem flagged before v3 was built.
 
-          v4 removed that entirely, no service principal, no federated
+          v4 removed that entirely — no service principal, no federated
           credential, no Application.ReadWrite.All grant on the shared app
           registration anywhere in this script. It authenticates as YOU, using
           whatever `az login` session is already active. Every Entra write this
@@ -168,26 +168,26 @@ Purpose : Reads the ManualAppOwners column in SharePoint SecretAlertRegistry and
               alone, not by adding a debug print and re-running.
             - If TenantID is BLANK on a row but exactly ONE tenant is
               configured in CROSS_TENANT_TENANT_IDS, v4.1 now falls back to
-              that single tenant rather than skipping the row outright, this
+              that single tenant rather than skipping the row outright — this
               matches how runbook_discovery.py itself falls back to
               GRAPH_TENANT_ID when a source tenant isn't recorded, and covers
               older/test rows created before TenantID was consistently
               stamped on every row. With MULTIPLE tenants configured, a blank
-              TenantID is still skipped, there's no safe single tenant to
+              TenantID is still skipped — there's no safe single tenant to
               assume, and guessing would risk resolving the identifier in the
               wrong directory entirely.
             - If TenantID is non-blank but does NOT match any tenant in
               CROSS_TENANT_TENANT_IDS, that is now reported as its own
               distinct reason ("tenant_not_configured") rather than being
-              folded into the same bucket as "blank", these mean different
+              folded into the same bucket as "blank" — these mean different
               things operationally (missing data vs. missing config) and
               should not look identical in the summary.
 
-          CROSS-TENANT SUPPORT, confirmed working as designed:
+          CROSS-TENANT SUPPORT — confirmed working as designed:
           This script fully supports the multi-tenant setup already used by
           runbook_discovery.py. It groups every app by its row's TenantID,
-          processes ONE TENANT'S apps at a time, and, since a single
-          `az login` session can only be scoped to one tenant at once, PAUSES
+          processes ONE TENANT'S apps at a time, and — since a single
+          `az login` session can only be scoped to one tenant at once — PAUSES
           before starting a new tenant's batch, printing the exact
           `az login --tenant <id>` command and waiting for you to confirm
           you've switched before making any write in that tenant. It never
@@ -196,21 +196,21 @@ Purpose : Reads the ManualAppOwners column in SharePoint SecretAlertRegistry and
           apps to be skipped and reported, not silently attempted in the
           wrong directory.
 
-          PREREQUISITE, before running this script:
-            1. `az login`, sign in as yourself
+          PREREQUISITE — before running this script:
+            1. `az login` — sign in as yourself
             2. Your account needs sufficient Entra permission to add owners to
                the specific App Registrations involved (e.g. you are already
                an owner of that app, or hold a role such as Application
-               Administrator, ideally PIM-activated for the duration of this
+               Administrator — ideally PIM-activated for the duration of this
                session, not held standing)
             3. `pip install azure-identity azure-keyvault-secrets tzdata`
-               (tzdata is required on Windows, zoneinfo has no OS-level tz
+               (tzdata is required on Windows — zoneinfo has no OS-level tz
                database to read there, unlike Linux/macOS)
 
           CONFIG:
           Set ROTATOR_KV_URL to read SHAREPOINT_SITE_ID / SHAREPOINT_LIST_ID /
           CROSS_TENANT_TENANT_IDS from Key Vault using your own az login
-          session (requires Key Vault secret read access on your account,
+          session (requires Key Vault secret read access on your account —
           read-only, a much smaller ask than any Entra write permission). Or
           set SHAREPOINT_SITE_ID / SHAREPOINT_LIST_ID / CROSS_TENANT_TENANT_IDS
           directly as environment variables and skip Key Vault entirely.
@@ -282,10 +282,11 @@ def _fail_config(name: str) -> None:
 
 
 def get_config_from_keyvault(vault_url: str) -> None:
-    global SHAREPOINT_SITE_ID, SHAREPOINT_LIST_ID, CROSS_TENANT_TENANT_IDS
+    global SHAREPOINT_SITE_ID, SHAREPOINT_LIST_ID, CROSS_TENANT_TENANT_IDS, _kv_client
     from azure.keyvault.secrets import SecretClient
     cred = AzureCliCredential()
     kv = SecretClient(vault_url=vault_url, credential=cred)
+    _kv_client = kv  # kept for the ProductName lookup below, reused rather than rebuilt per call
     SHAREPOINT_SITE_ID = kv.get_secret("SHAREPOINT-SITE-ID").value
     SHAREPOINT_LIST_ID = kv.get_secret("SHAREPOINT-LIST-ID").value
     try:
@@ -295,6 +296,8 @@ def get_config_from_keyvault(vault_url: str) -> None:
     CROSS_TENANT_TENANT_IDS = [t.strip() for t in raw.split(",") if t.strip()]
     log.info("Loaded config from Key Vault using your az login session.")
 
+
+_kv_client = None  # set inside get_config_from_keyvault() above, if ROTATOR_KV_URL was provided
 
 if ROTATOR_KV_URL:
     get_config_from_keyvault(ROTATOR_KV_URL)
@@ -307,6 +310,30 @@ if not CROSS_TENANT_TENANT_IDS:
     _fail_config("CROSS_TENANT_TENANT_IDS")
 
 print(f"Configured tenants: {CROSS_TENANT_TENANT_IDS}")
+
+def get_product_service_principal(product_name: str) -> str | None:
+    """
+    Mirrors main.py's get_product_service_principal() (container 2), so this
+    script can resolve a row's ProductName into a managed identity name on
+    its own, without depending on monitoring having already run and filled
+    in ManualAppOwners first. Looks up a Key Vault secret literally named
+    after product_name and returns its value, or None if no such secret
+    exists (or this script wasn't given ROTATOR_KV_URL at all, so no client
+    is available to look anything up with).
+
+    A missing secret is NOT an error — it's expected whenever ProductName
+    has a typo or names a product that hasn't been registered in Key Vault
+    yet, so this returns None rather than raising, letting the caller decide
+    what to do (leave ManualAppOwners as-is).
+    """
+    if _kv_client is None:
+        return None
+    try:
+        return _kv_client.get_secret(product_name).value
+    except Exception as e:
+        log.info("get_product_service_principal: no Key Vault secret found for "
+                 "product %r (or lookup failed): %s", product_name, e)
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH — YOUR az login session.
@@ -392,6 +419,27 @@ def _get(url: str, timeout: int = 30) -> dict:
 def _post_retry(url: str, body: dict, timeout: int = 30) -> dict:
     hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
     return _http_with_retry("POST", url, hdrs, body, timeout)
+
+def _patch_retry(url: str, body: dict, timeout: int = 30) -> dict:
+    hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
+    return _http_with_retry("PATCH", url, hdrs, body, timeout)
+
+def write_manual_app_owners(item_id: str, resolved_value: str) -> dict:
+    """
+    Writes a ProductName-resolved value back into ManualAppOwners on a
+    SharePoint row, permanently — so the next time this row is read (by
+    this script, by monitoring, by anything else), ManualAppOwners already
+    has the value, and the ProductName lookup doesn't need to happen again
+    for this row. This is the ONLY write this script makes to SharePoint —
+    everything else it does writes to Entra (adding owners), never here.
+    """
+    url = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+           f"/lists/{SHAREPOINT_LIST_ID}/items/{item_id}")
+    try:
+        _patch_retry(url, {"fields": {"ManualAppOwners": resolved_value}}, timeout=20)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Read active SharePoint rows
@@ -536,6 +584,7 @@ def run() -> dict:
         "skippedBlankTenant": 0, "skippedTenantNotConfigured": 0,
         "ownersAdded": 0, "ownersAlready": 0, "ownersFailed": 0,
         "unresolved": 0, "ambiguousCount": 0,
+        "productLookupsApplied": 0, "productLookupsNotFound": 0,
         "changes": [], "ambiguousDetail": [], "unresolvedDetail": [], "errors": [],
     }
 
@@ -559,10 +608,37 @@ def run() -> dict:
     apps: dict[str, dict] = {}
     for item in active_rows:
         f             = item.get("fields", {})
+        item_id       = item.get("id")
         object_id     = f.get("ObjectID", "")
         app_name      = f.get("AppName", "Unknown")
         tenant_id     = (f.get("TenantID") or "").strip()
         manual_owners = (f.get("ManualAppOwners") or "").strip()
+
+        # ProductName lookup — mirrors decision_engine.py's monitoring-side
+        # lookup, but runs independently here, so this script doesn't depend
+        # on monitoring having already run and filled ManualAppOwners in
+        # first. Only attempted if ManualAppOwners is currently blank — if
+        # it's already set (by a person directly, or by monitoring earlier),
+        # that value is left alone and ProductName is not consulted at all.
+        if not manual_owners:
+            product = (f.get("ProductName") or "").strip()
+            if product:
+                resolved = get_product_service_principal(product)
+                if resolved:
+                    write_result = write_manual_app_owners(item_id, resolved)
+                    if write_result.get("success"):
+                        manual_owners = resolved
+                        summary["productLookupsApplied"] = summary.get("productLookupsApplied", 0) + 1
+                        print(f"  Resolved ProductName {product!r} -> ManualAppOwners "
+                              f"{resolved!r} for {app_name}, written back to SharePoint")
+                    else:
+                        summary["errors"].append(
+                            f"Failed to write ManualAppOwners for {app_name} "
+                            f"(ProductName={product!r}): {write_result.get('error')}")
+                else:
+                    summary["productLookupsNotFound"] = summary.get("productLookupsNotFound", 0) + 1
+                    log.info("ProductName %r for %s has no matching Key Vault secret — "
+                            "ManualAppOwners left blank", product, app_name)
 
         if not manual_owners:
             continue  # not an error — most rows legitimately have no manual entry
@@ -644,6 +720,8 @@ def main():
     print(f"  Total Runtime      : {elapsed:.1f}s")
     print(f"  SP Rows Scanned    : {summary['rowsScanned']}")
     print(f"  Apps Checked       : {summary['appsChecked']}  (non-blank ManualAppOwners, usable)")
+    print(f"  ProductName Resolved : {summary.get('productLookupsApplied', 0)}  (ManualAppOwners filled in from a Key Vault product lookup)")
+    print(f"  ProductName Not Found: {summary.get('productLookupsNotFound', 0)}  (no matching Key Vault secret for that product name)")
     print(f"  Owners Added       : {summary['ownersAdded']}")
     print(f"  Already in Entra   : {summary['ownersAlready']}")
     print(f"  Failed             : {summary['ownersFailed']}")
@@ -686,4 +764,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 ```
