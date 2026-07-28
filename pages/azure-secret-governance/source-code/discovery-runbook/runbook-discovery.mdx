@@ -278,11 +278,12 @@ Changes in v8:
     Registration (CROSS_TENANT_APP_ID) must be a multitenant app,
     individually granted admin consent in each tenant listed. A separate
     ClientAssertionCredential is built per tenant; each app fetched is
-    tagged with a '_sourceTenantId' key so owner lookups and TenantID/
-    TenantName fields correctly reflect which tenant each app actually
-    lives in — not just the home tenant. A failure fetching one tenant
-    logs an error but does not abort scanning the remaining tenants.
-    SharePoint writes remain single-tenant (home tenant), unchanged.
+    tagged with a '_sourceTenantId' key so owner lookups and the TenantID
+    field correctly reflect which tenant each app actually lives in — not
+    just the home tenant. (TenantName has since been removed — the column
+    no longer exists in SharePoint.) A failure fetching one tenant logs an
+    error but does not abort scanning the remaining tenants. SharePoint
+    writes remain single-tenant (home tenant), unchanged.
 
 Changes in v7:
   - SEPARATE TOKEN SCOPING FOR ENTRA VS SHAREPOINT (critical fix)
@@ -1081,8 +1082,9 @@ _BACKUP_FIELD_ALLOWLIST = {
     "Title", "AppName", "SecretID", "SecretDescription", "ExpirationDate",
     "AlertStatus", "LastChecked", "AlertSentDate", "RotationDetectedDate",
     "JiraTicketKey", "ExpiryNotice", "NewSecretKeyId", "NewSecretVaultName",
-    "TenantID", "TenantName", "JiraTicketCreatedDate", "AlertHistory",
+    "TenantID", "JiraTicketCreatedDate", "AlertHistory",
     "ExpiryBucket", "AppOwners", "ObjectID", "ManualAppOwners",
+    "TeamName", "ProductName", "ProductTeamkeyVaultName",
 }
 
 # NEW in v10 — separate allowlist for IgnoredSecretRegistry's own schema
@@ -1090,7 +1092,7 @@ _BACKUP_FIELD_ALLOWLIST = {
 # like AlertStatus/ExpiryBucket, which don't exist on Ignored rows).
 _IGNORED_BACKUP_FIELD_ALLOWLIST = {
     "Title", "AppName", "SecretID", "SecretDescription", "ExpirationDate",
-    "DaysExpired", "TenantID", "TenantName", "LoggedDate", "IgnoreReason",
+    "DaysExpired", "TenantID", "LoggedDate", "IgnoreReason",
 }
 
 def build_backup_write_ops(raw_items: list[dict], backup_run_date: str,
@@ -1608,7 +1610,6 @@ def run_discovery() -> dict:
                             "ExpirationDate":    expiry_date,
                             "DaysExpired":       abs(days) if days != -9999 else None,
                             "TenantID":          source_tenant_id,
-                            "TenantName":        source_tenant_id,
                             "LoggedDate":        today,
                             "IgnoreReason":      ignore_reason,
                         },
@@ -1658,7 +1659,6 @@ def run_discovery() -> dict:
                         "AppOwners":         app_owners,
                         "ObjectID":          object_id,
                         "TenantID":          source_tenant_id,
-                        "TenantName":        source_tenant_id,
                         "LastChecked":       today,
                         "AlertStatus":       "Discovered",
                     },
@@ -1676,13 +1676,19 @@ def run_discovery() -> dict:
                 # (admin-filled, used by the LangChain/rotation runbooks) and
                 # must never be touched by discovery, whether or not Entra's
                 # own AppOwners value has changed. Do not add it here.
+                # TeamName, ProductName, and ProductTeamkeyVaultName follow
+                # the exact same rule — all three are filled in by the team
+                # by hand (or copied automatically by monitoring's lineage
+                # tracking when a secret rotates), and discovery must never
+                # overwrite them either. Do not add any of these three here.
                 #
-                # TenantID/TenantName ADDED in v10.1 — a bug in v10 wrote these
-                # to Ignore/P5 rows only, never to active-bucket rows on either
+                # TenantID ADDED in v10.1 — a bug in v10 wrote this to
+                # Ignore/P5 rows only, never to active-bucket rows on either
                 # create or update, leaving TenantID permanently blank on every
                 # SecretAlertRegistry row. Included here so existing rows with
                 # a blank/stale TenantID get corrected on the next discovery
-                # run, not just newly-created ones.
+                # run, not just newly-created ones. (TenantName was removed
+                # from this list — the column no longer exists in SharePoint.)
                 candidate_fields = {
                     "AppOwners":      app_owners,
                     "ExpiryBucket":   bucket,
@@ -1690,7 +1696,6 @@ def run_discovery() -> dict:
                     "ExpirationDate": expiry_date,
                     "ObjectID":       object_id,
                     "TenantID":       source_tenant_id,
-                    "TenantName":     source_tenant_id,
                 }
                 changed_fields = {
                     k: v for k, v in candidate_fields.items()
