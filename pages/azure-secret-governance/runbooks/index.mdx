@@ -160,19 +160,23 @@ the background and can take several minutes across a large tenant.
 3. For any row with `ProductName` filled in, looks up a Key Vault secret named exactly after
    that product and writes its value into `ManualAppOwners` for that row, always overwriting
    whatever was there. A `ProductName` with no matching secret just leaves the row as-is
-4. For any app where `ManualAppOwners` is filled in on at least one row (directly or from the
-   `ProductName` lookup above), copies that value onto every other row belonging to the same app
-   that does not have it yet
-5. Filters to only the secrets whose app has `ManualAppOwners` set. Everything else is skipped
+4. For any secret that's new to SharePoint and matches an existing row's `NewSecretKeyId` (meaning
+   it's the freshly-rotated replacement for that row), copies `TeamName`, `ProductName`, and
+   `ProductTeamkeyVaultName` from that parent row automatically, see "Lineage tracking" on the
+   `decision_engine.py` source page
+5. For any app where `ManualAppOwners` is filled in on at least one row (directly, from the
+   `ProductName` lookup, or from a lineage copy above), copies that value onto every other row
+   belonging to the same app that does not have it yet
+6. Filters to only the secrets whose app has `ManualAppOwners` set. Everything else is skipped
    entirely
-6. For P1, P2, and P3, and for ExpiredManualReview, raises a Jira ticket if one does not already
+7. For P1, P2, and P3, and for ExpiredManualReview, raises a Jira ticket if one does not already
    exist
-7. For P1 and P2, also sends a Teams alert. Within P1, the 0 to 3 day half tags a specific
+8. For P1 and P2, also sends a Teams alert. Within P1, the 0 to 3 day half tags a specific
    person, read from `TEAMS-TAG-EMAIL` in Key Vault, the 4 to 7 day half does not
-8. For secrets that have crossed 8 days expired, checks whether there is still a live Jira
+9. For secrets that have crossed 8 days expired, checks whether there is still a live Jira
    ticket before deciding what to do. See the abandonment check below
-9. Updates SharePoint with the current bucket, notice text, and last checked date for every
-   secret it processed
+10. Updates SharePoint with the current bucket, notice text, and last checked date for every
+    secret it processed
 
 ### The 8 day abandonment check
 
@@ -184,7 +188,7 @@ would risk hiding a secret someone is actively rotating right now. The actual de
 - Ticket is Done or Resolved, but the row was never marked Rotated: flagged as a possible sync
   gap between Jira and SharePoint, left visible for a person to check
 - Ticket is In Progress, To Do, Blocked, or Awaiting Reporter: someone is actively engaged, so
-  the row stays visible in `SecretAlertRegistry`, marked clearly as overdue
+  the row stays visible in `SecretAlertRegistry`, `AlertStatus` set to `OverdueManualReview`
 
 ### Required Key Vault secrets
 
@@ -216,11 +220,14 @@ days, safe) is never rotation eligible.
 4. For each remaining candidate in P1 through P3 within the rotation threshold, calls
    `addPassword` on the App Registration, using the credential for whichever tenant that app
    actually lives in
-5. Stores the new secret value in the rotation Key Vault, unless the row's
-   `ProductTeamkeyVaultName` is filled in, in which case the new value goes into that specific
-   Key Vault instead
-6. Adds a Jira comment with the new key ID, expiry date, and Key Vault reference
-7. Marks the row `RotatedPendingDeployment`, waiting for a person to deploy the new value and
+5. Reuses the row's `NewSecretVaultName` as the Key Vault secret name if one is already set (so it
+   lands as a new version of the same entry), otherwise generates one from
+   `ProductName-TeamName-AppName` and writes it back for future rotations to reuse
+6. Stores the new secret value in the rotation Key Vault, unless the row's
+   `ProductTeamkeyVaultName` is filled in, in which case the value goes into that specifically
+   named vault instead (the URL is derived by appending the standard Key Vault suffix)
+7. Adds a Jira comment with the new key ID, expiry date, and Key Vault reference
+8. Marks the row `RotatedPendingDeployment`, waiting for a person to deploy the new value and
    close the ticket
 
 <Callout type="info">

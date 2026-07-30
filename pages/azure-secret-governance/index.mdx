@@ -129,7 +129,8 @@ depends on whether there's still a live, open Jira ticket for it:
 - Ticket is Done or Resolved but the row was never marked Rotated: flagged as a possible sync
   gap and left visible for someone to look into, rather than quietly disappearing
 - Ticket is In Progress, To Do, Blocked, or Awaiting Reporter: someone's actively working it, so
-  the row stays in `SecretAlertRegistry`, marked clearly as overdue but not auto ignored
+  the row stays in `SecretAlertRegistry`, `AlertStatus` set to `OverdueManualReview`, not auto
+  ignored
 
 <Callout type="warning">
   P1, P2, and P3 all raise a Jira ticket, and so does ExpiredManualReview. An earlier version of

@@ -13,7 +13,7 @@ import { Callout } from 'nextra/components'
 
 **Schedule:** Weekly at `01:00`, 1 hour after monitoring.
 
-**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P3 secrets whose SharePoint row has `ManualAppOwners` filled in by a human (Phase B). P4 (61+ days, safe) is never rotation eligible. New secret values are stored in the rotation Key Vault, or in a row's `ProductTeamkeyVaultName` Key Vault instead if that column is filled in, and a comment is posted to the Jira ticket with retrieval instructions.
+**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P3 secrets whose SharePoint row has `ManualAppOwners` filled in by a human (Phase B). P4 (61+ days, safe) is never rotation eligible. The new secret value reuses whatever name is already in `NewSecretVaultName` if one is set (so it lands as a new *version* of the same Key Vault entry, not a new one), or generates one from `ProductName`/`TeamName`/`AppName` if it's genuinely the first rotation for that app. It's stored in the rotation Key Vault by default, or in the vault named by that row's `ProductTeamkeyVaultName` instead if that column is filled in, and a comment is posted to the Jira ticket with retrieval instructions.
 
 ---
 
@@ -22,14 +22,42 @@ import { Callout } from 'nextra/components'
 | Decision | Reason |
 |----------|--------|
 | Two-phase design | Phase A closes the loop on already-rotated secrets before Phase B generates new ones — avoids double-rotation |
-| `NewSecretVaultName` guard | If this field is already set on a row, the secret is skipped — idempotent even if the runbook runs twice |
+| `AlertStatus`, not `NewSecretVaultName`, gates "already rotated this cycle" | A row moves to `RotatedPendingDeployment` once rotated, which is what excludes it from the next candidate list. `NewSecretVaultName` no longer serves this purpose, see "Secret naming" below for why |
 | Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
 | 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
-| `ManualAppOwners` gate | Rotation is gated on `ManualAppOwners` in SharePoint, filled in by a human or resolved from `ProductName` by monitoring — not the auto-stamped `AppOwners` column, which is informational only |
-| `ProductTeamkeyVaultName` override | If a row has this column filled in, `store_rotated_secret()` writes the newly rotated value into that specific Key Vault instead of the shared rotation Key Vault. A `SecretClient` for a given override vault is built once and reused for the rest of the run |
+| `ManualAppOwners` gate | Rotation is gated on `ManualAppOwners` in SharePoint, filled in by a human or resolved from `ProductName` by monitoring or owner sync — not the auto-stamped `AppOwners` column, which is informational only |
+| `ProductTeamkeyVaultName` derives a URL, doesn't store one | The row's value (e.g. `kv-product-a`) has the standard `https://<name>.vault.azure.net/` suffix appended directly, rather than being looked up against a separately maintained list. Blank means the shared rotation vault. A `SecretClient` for a given derived URL is built once and reused for the rest of the run |
+| Secret naming reuses `NewSecretVaultName` if set, else generates one | Reusing the same name every rotation is what makes Key Vault's own versioning do the work, `set_secret()` on an existing name creates a new version automatically. See "Secret naming" below |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
 | Fractional-seconds normalization | Graph's `endDateTime` can return 5 or 7-digit fractional seconds. Python 3.10's `fromisoformat()` only accepts 0, 3, or 6 digits and raises on anything else — normalized before parsing so valid expiry dates aren't silently skipped |
+
+---
+
+## Secret naming
+
+Many applications hardcode the Key Vault secret name they expect their client secret under, so
+rotation can't just invent a new name every cycle without breaking them. `store_rotated_secret()`
+resolves the name to use in one of two ways, checked in this order:
+
+1. **`NewSecretVaultName` is already filled in on the row.** Use that exact name. Since Key
+   Vault's own `set_secret()` call creates a new *version* under an existing name rather than a
+   new secret, this is what makes "same name, new version every rotation" work automatically,
+   there's no separate versioning logic anywhere in this file.
+2. **`NewSecretVaultName` is genuinely blank** (first rotation ever for this app). Generate one
+   from `ProductName-TeamName-AppName`, falling back to whatever pieces are actually available if
+   `ProductName` or `TeamName` haven't been filled in yet, so a secret can still rotate even with
+   incomplete metadata. The generated name is then written back into `NewSecretVaultName` on this
+   same row, so every rotation after this first one finds it already set and reuses it as a new
+   version, instead of generating a fresh name every single cycle.
+
+<Callout type="warning">
+  This only holds together if a row's `ProductTeamkeyVaultName` also stays stable once it's set.
+  If it changes between rotations, a rotation will still reuse the same `NewSecretVaultName`, but
+  against a *different* vault, which Key Vault sees as a name it's never encountered before, so
+  it creates a fresh secret there rather than a new version, not a continuation of whatever
+  version history exists in the old vault.
+</Callout>
 
 ---
 

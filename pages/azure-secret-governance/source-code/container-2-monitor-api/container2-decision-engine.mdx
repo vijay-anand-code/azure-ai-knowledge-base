@@ -68,15 +68,33 @@ a ticket.
 
 ## Bucket and status mapping
 
-| Bucket | Days | Alert status set | Teams alert |
-|--------|------|-----------------|-------------|
-| P1, 0 to 3 days | 0–3 | `CriticalTagged` | Yes — CRITICAL, tags a specific person |
-| P1, 4 to 7 days | 4–7 | `Escalated` | Yes — CRITICAL, no tagging |
-| P2 | 8–30 | `TeamsAlerted` | Yes — WARNING |
-| P3 | 31–60 | `JiraRaised` | No |
-| P4 | 61+ | Written to SharePoint, owners stamped, refreshed every run | No |
-| ExpiredManualReview | -7 to -1 | `ExpiredManualReview` | Yes — EXPIRED |
-| Ignore, subject to abandonment check | -8 and older | Stays visible and marked overdue if the Jira ticket is still open, otherwise moved to `IgnoredSecretRegistry` | No |
+| Bucket | Days | Alert status set | Jira priority | Teams alert |
+|--------|------|-----------------|--------------|-------------|
+| P1, 0 to 3 days | 0–3 | `CriticalTagged` | `P1` | Yes — CRITICAL, tags a specific person |
+| P1, 4 to 7 days | 4–7 | `Escalated` | `P1` | Yes — CRITICAL, no tagging |
+| P2 | 8–30 | `TeamsAlerted` | `P2` | Yes — WARNING |
+| P3 | 31–60 | `JiraRaised` | `P3` | No |
+| P4 | 61+ | Written to SharePoint, owners stamped, refreshed every run | none, never ticketed | No |
+| ExpiredManualReview | -7 to -1 | `ExpiredManualReview` | `P1` | Yes — EXPIRED |
+| Ignore, subject to abandonment check | -8 and older | `OverdueManualReview` if the Jira ticket is still open, otherwise moved to `IgnoredSecretRegistry` | none | No |
+
+<Callout type="info">
+  `ExpiredManualReview`'s Jira priority is the literal `"P1"`, the same tier as the most urgent
+  active bucket, since an already-expired secret is at least as urgent as one about to expire.
+  This is the only thing that changed for `ExpiredManualReview`: its `AlertStatus` in SharePoint
+  still reads `ExpiredManualReview`, not `P1`, its severity wording is still `EXPIRED`, not
+  `CRITICAL`, and it is still never auto-rotated.
+</Callout>
+
+<Callout type="info">
+  `OverdueManualReview` is the `AlertStatus` set on a secret past -8 days expired whose Jira
+  ticket is still open (In Progress, To Do, Blocked, or Awaiting Reporter). It stays visible in
+  `SecretAlertRegistry` rather than moving to `IgnoredSecretRegistry`, since someone is already
+  engaged, and it is never auto-rotated, same reasoning as `ExpiredManualReview`, automated
+  rotation must not collide with whatever a human is already doing manually on that ticket. No
+  separate Jira ticket priority handling is needed for it, the ticket already received `P1`
+  priority back when the row was still `ExpiredManualReview`.
+</Callout>
 
 ---
 
@@ -104,6 +122,34 @@ name within a single run, so a product used across many rows only costs one Key 
 
 ---
 
+## Lineage tracking
+
+`TeamName`, `ProductName`, and `ProductTeamkeyVaultName` are filled in by hand, once, the first
+time an app is onboarded. When that secret later rotates, rotation creates a brand-new Entra
+secret (a new `SecretID`) and records that new ID in the *old* row's `NewSecretKeyId` column.
+Without anything else happening, the new secret would show up here as a completely fresh row
+with all three of those columns blank again, forcing the team to retype them every single
+rotation cycle.
+
+Lineage tracking closes that gap. Before processing new secrets, this builds a lookup of every
+existing row's `NewSecretKeyId`, keyed by that ID. Any secret that's new to this run (not yet in
+`SecretAlertRegistry`) has its own `SecretID` checked against that lookup, if it matches, the new
+row copies `TeamName`, `ProductName`, and `ProductTeamkeyVaultName` straight from the matching
+parent row, so the team never has to fill them in again for the same app.
+
+<Callout type="info">
+  The parent row's own `NewSecretKeyId` is left untouched afterward, it stays as history, not
+  cleared once the match is made. Only `runbook_discovery.py` ever creates a row for a genuinely
+  new secret ahead of monitoring seeing it, and discovery deliberately never writes to
+  `TeamName`/`ProductName`/`ProductTeamkeyVaultName` on any row, new or existing, so this lineage
+  copy is the only mechanism that ever fills them in automatically. If discovery creates a new
+  secret's row before monitoring's own scan runs, monitoring will see it as an existing row
+  instead of a new one, and this lineage match won't fire for it, the fields stay blank until a
+  human fills them in directly on that row.
+</Callout>
+
+---
+
 ## Key design decisions
 
 | Decision | Reason |
@@ -116,6 +162,8 @@ name within a single run, so a product used across many rows only costs one Key 
 | `ManualAppOwners` gate | Monitoring is gated on `ManualAppOwners` in SharePoint, filled in by a human or resolved from `ProductName`, and propagated app-wide before filtering. Legacy `owner_emails` matching against `AppOwners` is still accepted as a parameter but ignored by default |
 | `should_tag_p1()` | Whether a P1 Teams alert tags someone is a day-count decision within the bucket, not a separate bucket membership check |
 | `ProductName` lookup, cached per run | Resolves `ManualAppOwners` from a Key Vault secret named after the product, so onboarding a new product is one Key Vault secret, no code change |
+| Lineage tracking via `NewSecretKeyId` | A rotated secret's brand-new row automatically inherits `TeamName`/`ProductName`/`ProductTeamkeyVaultName` from its parent row, so the team fills these in once per app, not once per rotation cycle |
+| `OverdueManualReview`, distinct from `ExpiredManualReview` | A secret past -8 days with a still-open Jira ticket needs its own status, someone is actively engaged, so it must stay visible and never auto-rotate, but it's a different state from a freshly-expired secret |
 
 <Callout type="info">
   Monitoring gates on `ManualAppOwners` in SharePoint being non-blank, not `AppOwners`
