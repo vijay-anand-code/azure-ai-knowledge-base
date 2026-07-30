@@ -202,21 +202,12 @@ Changes in v3 (this version):
      default 365, replacing the old hardcoded 12-month calculation.
 
   5. BUCKET SCHEME CORRECTED (NEW in v3) — this file previously had its
-     OWN, stale bucket classifier that disagreed with decision_engine.py's
-     bucket names AT THE TIME (v3 shipped under the five-bucket scheme:
-     P1=0-3, P2=4-7, P3=8-30, P4=31-60, P5=61+ safe). _classify_bucket()
-     was brought in line with decision_engine.py's names as of v3.
-     ROTATION_ELIGIBLE_BUCKETS at the time was {"P1","P2","P3","P4"} — the
-     same 0-60 day range as before, re-expressed under v3's names. P5 was
-     never rotation-eligible under that scheme.
-
-     SUPERSEDED since v3: decision_engine.py later merged the old P1/P2
-     into one P1 (0-7 days) and renumbered everything below it down by
-     one — see the ROTATION_ELIGIBLE_BUCKETS definition and
-     _classify_bucket() further down in this file for the four-bucket
-     names actually in effect now. Under the current names,
-     ROTATION_ELIGIBLE_BUCKETS is {"P1","P2","P3"}, and P4 (now the safe,
-     61+ day bucket) is never rotation-eligible.
+     OWN, stale bucket classifier (P4=safe/61+, P3=31-60, P2=8-30,
+     P1=0-7 — the OLD pre-split scheme) that disagreed with
+     decision_engine.py's current P1=0-3/P2=4-7/P3=8-30/P4=31-60/P5=61+.
+     _classify_bucket() now matches exactly. ROTATION_ELIGIBLE_BUCKETS is
+     {"P1","P2","P3","P4"} — same 0-60 day range as before, re-expressed
+     under the current names. P5 is never rotation-eligible.
 
   (v1 retained: "Discovered" in ACTIONABLE_STATUSES and the SharePoint
    OData filter.)
@@ -333,6 +324,12 @@ ACTIONABLE_STATUSES        = {
     "Escalated",
     "Expired",
     "ExpiredManualReview",
+    # NOTE: OverdueManualReview is DELIBERATELY not in this set. It marks a
+    # secret past -8 days expired whose Jira ticket is still open (In
+    # Progress/To Do/Blocked/etc) — a human is already engaged, so automated
+    # rotation must never fire on it, same reasoning as ExpiredManualReview.
+    # Adding it here would make rotation try to act on rows it should leave
+    # entirely alone.
 }
 
 # CORRECTED — matches decision_engine.py's current bucket names, after the
@@ -550,8 +547,6 @@ def write_sharepoint_row(item_id: str | None, fields: dict) -> dict:
             fields[col] = str(fields[col])[:10]
     if not fields.get("TenantID"):
         fields["TenantID"] = GRAPH_TENANT_ID
-    if not fields.get("TenantName"):
-        fields["TenantName"] = _get_tenant_name()
     base = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
             f"/lists/{SHAREPOINT_LIST_ID}/items")
     hdrs = _sp_auth_hdrs()
@@ -597,9 +592,9 @@ def store_rotated_secret(secret_name: str, secret_value: str,
     Stores a rotated secret's value in Key Vault. By default, uses the
     shared ROTATION_KV_URL every app rotates into. If override_vault_url is
     given (non-empty), meaning the app's SharePoint row had
-    ProductTeamkeyVaultName filled in, uses that specific vault instead —
-    a product team gets its own rotated secrets landing in their own
-    Key Vault rather than the shared one.
+    ProductTeamkeyVaultName set, uses that specific vault instead — a
+    product team gets its own rotated secrets landing in their own Key
+    Vault rather than the shared one.
 
     A client for a given override URL is built once and reused for the rest
     of this run, not rebuilt on every single secret rotated into it.
@@ -715,10 +710,18 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
             summary["errors"].append(f"Phase A error SecretID={f.get('SecretID')}: {e}")
 
     # ── PHASE B: Proactive rotation ───────────────────────────────────────────
+    # NOTE: NewSecretVaultName is now filled in BY THE TEAM, by hand, before
+    # any rotation has ever happened — it holds the exact vault entry name
+    # their application already expects, since many apps hardcode a secret
+    # name and can't easily be changed. This means NewSecretVaultName being
+    # present no longer signals "this row was already rotated" the way it
+    # used to. AlertStatus == RotatedPendingDeployment is the replacement
+    # signal — rotation itself sets that status only after it has actually
+    # run for a given cycle, so a row already in that status is correctly
+    # skipped here rather than rotated a second time.
     all_candidates = [
         item for item in items
-        if (item.get("fields", {}).get("AlertStatus") in ACTIONABLE_STATUSES
-            and not item.get("fields", {}).get("NewSecretVaultName"))
+        if item.get("fields", {}).get("AlertStatus") in ACTIONABLE_STATUSES
     ]
 
     candidates = []
@@ -778,10 +781,11 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
             summary["errors"].append(f"AppID={app_id}: no JiraTicketKey, cannot rotate")
             continue
 
-        if f.get("NewSecretVaultName"):
-            summary["rowsSkippedRotated"] += 1
-            log.debug("Skipping %s — already rotated (NewSecretVaultName set)", app_id)
-            continue
+        # NOTE: rows with AlertStatus == RotatedPendingDeployment are already
+        # excluded at the all_candidates stage above (that status is not in
+        # ACTIONABLE_STATUSES), so no separate "already rotated" check is
+        # needed here — a row reaching this point genuinely has not been
+        # rotated yet this cycle.
 
         try:
             issue       = get_jira_issue(jira_key)
@@ -813,11 +817,55 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
             # ProductTeamkeyVaultName lets a specific product's team override
             # where their rotated secret gets stored, instead of the shared
             # ROTATION_KV_URL every app uses by default. Blank means "use the
-            # shared vault" — this is the normal case for most rows.
-            override_vault_url = (f.get("ProductTeamkeyVaultName") or "").strip()
+            # shared vault" — this is the normal case for most rows. Every
+            # Key Vault in this environment follows the same
+            # https://<name>.vault.azure.net/ pattern, so the full URL is
+            # derived directly from whatever short name is in the column,
+            # rather than looked up against a separately maintained list.
+            raw_vault_key = (f.get("ProductTeamkeyVaultName") or "").strip()
+            override_vault_url = f"https://{raw_vault_key.lower()}.vault.azure.net/" if raw_vault_key else ""
+
+            # SECRET NAMING — this is what makes "same name, new version every
+            # rotation" actually work, since Key Vault's own set_secret() call
+            # automatically creates a NEW VERSION under an existing name, or
+            # creates fresh if the name doesn't exist yet, with no special
+            # versioning logic needed here at all.
+            #
+            # If NewSecretVaultName is already filled in (by the team, or by
+            # a PRIOR rotation cycle having written one back — see below),
+            # use that EXACT name every time. This is what lets an
+            # application's hardcoded config, which points at one fixed
+            # secret name, keep working release after release without ever
+            # needing to change.
+            #
+            # If NewSecretVaultName is genuinely blank (brand-new app, never
+            # rotated before, team hasn't assigned a fixed name), generate
+            # one: "ProductName-TeamName-AppDisplayName", so the Entra secret
+            # description, the SharePoint NewSecretVaultName value, and the
+            # actual Key Vault secret name all end up identical. This
+            # generated name is then WRITTEN BACK into NewSecretVaultName on
+            # this same row (below), so every rotation AFTER this first one
+            # finds it already filled in and reuses it as a new version,
+            # rather than generating a fresh name every single cycle forever.
+            existing_vault_name = (f.get("NewSecretVaultName") or "").strip()
+            generated_name_this_run = None
+
+            if existing_vault_name:
+                secret_name_to_use = existing_vault_name
+            else:
+                product_name = (f.get("ProductName") or "").strip()
+                team_name    = (f.get("TeamName") or "").strip()
+                # Falls back to whatever piece is actually available rather
+                # than failing outright if ProductName or TeamName is blank
+                # too — an app can still be rotated even if the team hasn't
+                # filled in every one of these three columns yet, it just
+                # gets a less complete generated name.
+                name_parts = [p for p in (product_name, team_name, app_name) if p]
+                secret_name_to_use = "-".join(name_parts) if name_parts else f"{app_name}-{jira_key}"
+                generated_name_this_run = secret_name_to_use
 
             vault_result = store_rotated_secret(
-                secret_name=f"{app_name}-{jira_key}",
+                secret_name=secret_name_to_use,
                 secret_value=new_secret["secretText"],
                 override_vault_url=override_vault_url)
             if not vault_result.get("success"):
@@ -851,7 +899,6 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
                 "ExpiryNotice":       f"New secret ready — pending deployment ({jira_key})",
                 "LastChecked":        today,
                 "TenantID":           app_tenant_id,
-                "TenantName":         app_tenant_id,
             })
             summary["sharepointUpdated"] += 1
 
