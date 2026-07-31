@@ -164,12 +164,26 @@ parent row, so the team never has to fill them in again for the same app.
 | `ProductName` lookup, cached per run | Resolves `ManualAppOwners` from a Key Vault secret named after the product, so onboarding a new product is one Key Vault secret, no code change |
 | Lineage tracking via `NewSecretKeyId` | A rotated secret's brand-new row automatically inherits `TeamName`/`ProductName`/`ProductTeamkeyVaultName` from its parent row, so the team fills these in once per app, not once per rotation cycle |
 | `OverdueManualReview`, distinct from `ExpiredManualReview` | A secret past -8 days with a still-open Jira ticket needs its own status, someone is actively engaged, so it must stay visible and never auto-rotate, but it's a different state from a freshly-expired secret |
+| `sp_index` keyed by `SecretID` alone, never gated by ownership | `SecretID` (Entra's `keyId`) is already a globally unique GUID, no need for a composite key. Indexing every existing row regardless of `ManualAppOwners` fixed a real duplication bug, see the callout below |
+| `LastChecked`/`AlertSentDate`/`RotationDetectedDate`/`JiraTicketCreatedDate`/`ExpirationDate` as EST strings | All five now go through `_format_datetime_est()`/`_now_est_string()`, matching `runbook_discovery.py`'s format exactly, instead of a bare UTC date or a raw Entra ISO string |
 
 <Callout type="info">
   Monitoring gates on `ManualAppOwners` in SharePoint being non-blank, not `AppOwners`
   (auto-stamped from Entra, informational only) and not a fixed `OWNER-EMAILS` list from
   Key Vault. If `ManualAppOwners` is filled in on any one secret row for an app,
   monitoring copies that value onto every other row for the same app automatically.
+</Callout>
+
+<Callout type="warning">
+  An earlier version of `sp_index` (the lookup that answers "does a row already exist for this
+  secret") only included rows where `ManualAppOwners` was already set, excluding any unowned
+  row entirely. For P1-P3 that mistake was harmless, a genuinely new secret still can't get a
+  row created without passing its own separate ownership check first. P4 has no equivalent check
+  on its create path, so an app that only ever has P4 secrets, with nobody having filled in
+  `ManualAppOwners` for it, had its existing P4 row invisible to `sp_index` every run, looked
+  "new" every run, and got a duplicate row created every single run, forever. `sp_index` now
+  includes every row unconditionally, ownership only affects the `skippedNotOwned` count, not
+  whether a row is indexed.
 </Callout>
 
 ---
@@ -279,6 +293,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Awaitable
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +303,27 @@ from typing import Any, Callable, Awaitable
 SP_WRITE_BATCH    = 10   # SharePoint writes in parallel
 JIRA_CREATE_BATCH = 5    # Jira ticket creations in parallel
 BATCH_PAUSE       = 0.5  # seconds between batches — avoids throttling
+
+# ─────────────────────────────────────────────────────────────────────────────
+# US EASTERN TIME, matches runbook_discovery.py's _format_datetime_est /
+# _now_est_string exactly, so LastChecked and every other "as of now" field
+# carry the same timezone and format no matter which of discovery, monitoring,
+# or rotation wrote them most recently. Auto-handles EST/EDT transitions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EASTERN_TZ = ZoneInfo("America/New_York")
+
+def _format_datetime_est(dt: datetime) -> str:
+    """12-hour EST/EDT clock string, no ISO letters. Example: "2026-07-22 07:50:53 AM"."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    eastern_dt = dt.astimezone(_EASTERN_TZ)
+    return eastern_dt.strftime("%Y-%m-%d %I:%M:%S %p")
+
+def _now_est_string() -> str:
+    """Current moment, formatted per _format_datetime_est, used for
+    LastChecked, AlertSentDate, RotationDetectedDate, JiraTicketCreatedDate."""
+    return _format_datetime_est(datetime.now(timezone.utc))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUCKET CLASSIFICATION
@@ -529,7 +565,7 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
                 "app_name":    app_name,
                 "secret_id":   cred.get("keyId"),
                 "secret_desc": cred.get("displayName") or "N/A",
-                "expiration":  end_dt_str,
+                "expiration":  _format_datetime_est(exp),  # EST 12hr string, matches discovery
                 "days":        days,
                 "bucket":      classify_bucket(days),
                 "tenant_id":   source_tenant_id,
@@ -585,7 +621,7 @@ async def run_secret_monitoring(
                                                          # AppOwners/OWNER_EMAILS matching.
 ) -> dict:
     now   = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
+    today = _now_est_string()  # full EST timestamp, matches runbook_discovery.py
 
     summary: dict[str, Any] = {
         "runDate": today,
@@ -734,24 +770,35 @@ async def run_secret_monitoring(
     else:
         effective_owners = []   # no filter — process all rows
 
-    sp_index: dict[tuple[str, str], dict] = {}
+    # FIX: sp_index's only job is answering "does a row already exist for this
+    # secret", it must include EVERY row, owned or not. It previously excluded
+    # any row whose ManualAppOwners/AppOwners didn't pass the filter below,
+    # which meant an existing row for an app with no owner set was invisible
+    # to this lookup and looked "new" on every run. For P1-P3 that mistake was
+    # harmless, actionable_new has its own separate ownership check
+    # (_is_owned_new/sp_app_owners) that blocks a row from ever being created.
+    # P4 has no equivalent check on its create path (see Phase 3 below), so an
+    # unowned app that only ever has P4 secrets got a duplicate row created
+    # every single run, forever, since sp_index could never see its existing
+    # row to match against. The ownership check now only affects the
+    # skippedNotOwned count below, not whether a row goes into the index.
+    sp_index: dict[str, dict] = {}
     skipped_not_owned = 0
     for item in sp_data.get("items", []):
         f = item.get("fields", {})
 
         if manual_owners_only:
-            manual_owners = (f.get("ManualAppOwners") or "").strip()
-            if not manual_owners:
+            if not (f.get("ManualAppOwners") or "").strip():
                 skipped_not_owned += 1
-                continue
         elif effective_owners:
             app_owners = (f.get("AppOwners") or "").lower()
             # Row passes if ANY of the owner emails appears in AppOwners
             if not any(email in app_owners for email in effective_owners):
                 skipped_not_owned += 1
-                continue
 
-        sp_index[(f.get("Title"), f.get("SecretID"))] = item
+        secret_id = f.get("SecretID")
+        if secret_id:
+            sp_index[secret_id] = item
 
     summary["skippedNotOwned"] = skipped_not_owned
     if skipped_not_owned:
@@ -790,7 +837,7 @@ async def run_secret_monitoring(
     existing_secrets = []
 
     for c in candidates:
-        existing = sp_index.get((c["app_id"], c["secret_id"]))
+        existing = sp_index.get(c["secret_id"])  # SecretID alone, already globally unique
         if existing is None:
             new_secrets.append(c)
         else:

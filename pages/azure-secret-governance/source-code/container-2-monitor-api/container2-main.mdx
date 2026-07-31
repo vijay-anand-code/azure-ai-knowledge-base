@@ -41,7 +41,7 @@ import { Callout } from 'nextra/components'
 | `ManualAppOwners` gate | Monitoring is gated on `ManualAppOwners` in SharePoint, filled in by a human. Legacy `OWNER-EMAILS`/`OWNER-EMAIL` matching against `AppOwners` is still read but ignored by default |
 | Jira webhook handled directly | Status transitions don't need AI reasoning — direct SharePoint update is faster (2–3s vs 30–60s) and avoids OpenAI rate limits |
 | `httpx.AsyncClient` | All tool implementations are async for compatibility with FastAPI's async event loop |
-| Date columns truncated to 10 chars | SharePoint date-only fields reject ISO timestamps — all date writes are sliced to `YYYY-MM-DD` |
+| Date/time columns carry full EST timestamps, not truncated | `LastChecked`, `AlertSentDate`, `RotationDetectedDate`, `JiraTicketCreatedDate`, and `ExpirationDate` now arrive pre-formatted (via `decision_engine.py`'s `_format_datetime_est`/`_now_est_string`, matching `runbook_discovery.py`'s format exactly) rather than as raw ISO strings, so `write_sharepoint_row` no longer slices any of them to 10 characters. An earlier version truncated all five to `YYYY-MM-DD`, which is what made the time portion disappear whenever monitoring wrote to a row after discovery had already stamped a full timestamp on it |
 | Two credential scopes, not one | Entra scanning and SharePoint access are deliberately kept on separate federated credentials. See "Multi-tenant credentials" below |
 | `get_product_service_principal()` | Looks up a Key Vault secret named exactly after a row's `ProductName` and returns its value, or `None` if no such secret exists. A missing secret is expected, not an error, so one unrecognized product doesn't fail the whole run. Passed into `decision_engine.py` as `get_product_service_principal`, see its ProductName lookup section for how it's used |
 
@@ -423,8 +423,15 @@ async def get_sharepoint_state() -> dict:
     return {"items": items, "count": len(items)}
 
 async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> dict:
-    for col in {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate", "JiraTicketCreatedDate"}:
-        if col in fields and fields[col]: fields[col] = str(fields[col])[:10]
+    # FIX: no more 10-char truncation here. LastChecked, AlertSentDate,
+    # RotationDetectedDate, and JiraTicketCreatedDate now arrive as full EST
+    # timestamps from decision_engine.py's _now_est_string() (matching
+    # runbook_discovery.py's format exactly), and ExpirationDate now arrives
+    # pre-formatted via _format_datetime_est() instead of a raw Entra ISO
+    # string. Slicing any of these to 10 characters would destroy the time
+    # portion right back down to a bare date, undoing that fix at the last
+    # possible step. Nothing passed into this function needs date-only
+    # truncation anymore.
     # CHANGED: only default TenantID to the home tenant if the caller hasn't
     # already set it. decision_engine.py now stamps the ACTUAL tenant a
     # given app was scanned from (see _build_candidates' tenant_id field) —

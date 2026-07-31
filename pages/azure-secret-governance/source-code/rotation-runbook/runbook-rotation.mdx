@@ -31,6 +31,7 @@ import { Callout } from 'nextra/components'
 | Secret naming reuses `NewSecretVaultName` if set, else generates one | Reusing the same name every rotation is what makes Key Vault's own versioning do the work, `set_secret()` on an existing name creates a new version automatically. See "Secret naming" below |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
 | Fractional-seconds normalization | Graph's `endDateTime` can return 5 or 7-digit fractional seconds. Python 3.10's `fromisoformat()` only accepts 0, 3, or 6 digits and raises on anything else — normalized before parsing so valid expiry dates aren't silently skipped |
+| `LastChecked`/`RotationDetectedDate` as full EST timestamps | `_now_est_string()` matches `runbook_discovery.py`'s format exactly, no longer a bare UTC date. `write_sharepoint_row` no longer truncates these to 10 characters, that used to destroy the time portion whenever this runbook wrote to a row after discovery had already stamped a full timestamp on it |
 
 ---
 
@@ -263,6 +264,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 import automationassets
@@ -271,6 +273,27 @@ from azure.keyvault.secrets import SecretClient
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("rotation-runbook")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# US EASTERN TIME, identical to runbook_discovery.py's and decision_engine.py's
+# _format_datetime_est / _now_est_string, so LastChecked and every other "as of
+# now" field carry the same timezone and format no matter which of the three
+# scripts wrote them most recently. Auto-handles EST/EDT transitions.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EASTERN_TZ = ZoneInfo("America/New_York")
+
+def _format_datetime_est(dt: datetime) -> str:
+    """12-hour EST/EDT clock string, no ISO letters. Example: "2026-07-22 07:50:53 AM"."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    eastern_dt = dt.astimezone(_EASTERN_TZ)
+    return eastern_dt.strftime("%Y-%m-%d %I:%M:%S %p")
+
+def _now_est_string() -> str:
+    """Current moment, formatted per _format_datetime_est, used for
+    LastChecked and RotationDetectedDate."""
+    return _format_datetime_est(datetime.now(timezone.utc))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTOMATION VARIABLES
@@ -567,7 +590,14 @@ def get_sharepoint_state() -> dict:
 
     return {"items": items, "count": len(items)}
 
-_DATE_COLS = {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate"}
+# FIX: the old 10-char truncation is gone. LastChecked and RotationDetectedDate
+# now arrive as full EST timestamps from _now_est_string() (matching
+# runbook_discovery.py's format exactly), slicing them to 10 characters would
+# destroy the time portion right back down to a bare date. AlertSentDate and
+# ExpirationDate were never actually written by this file's own write calls in
+# the first place, so this loop is left empty rather than removed outright, in
+# case a future field needs the same date-only treatment later.
+_DATE_COLS: set[str] = set()
 
 def write_sharepoint_row(item_id: str | None, fields: dict) -> dict:
     for col in _DATE_COLS:
@@ -671,7 +701,7 @@ def add_jira_comment(issue_key: str, comment_text: str) -> dict:
 
 def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOLD) -> dict:
     now   = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
+    today = _now_est_string()  # full EST timestamp, matches runbook_discovery.py
 
     summary: dict[str, Any] = {
         "runDate": today, "rotationThresholdDays": rotation_threshold_days,
