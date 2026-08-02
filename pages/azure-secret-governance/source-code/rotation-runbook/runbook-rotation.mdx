@@ -23,6 +23,7 @@ import { Callout } from 'nextra/components'
 |----------|--------|
 | Two-phase design | Phase A closes the loop on already-rotated secrets before Phase B generates new ones — avoids double-rotation |
 | `AlertStatus`, not `NewSecretVaultName`, gates "already rotated this cycle" | A row moves to `RotatedPendingDeployment` once rotated, which is what excludes it from the next candidate list. `NewSecretVaultName` no longer serves this purpose, see "Secret naming" below for why |
+| `NewSecretKeyId` presence is a second, independent "already rotated" guard | Rotation writes `NewSecretKeyId` on the same row it flips to `RotatedPendingDeployment`. If someone manually resets `AlertStatus` back to an actionable value without also clearing `NewSecretKeyId`, this row-level check still skips it, so re-rotation now requires resetting both fields, not just the status |
 | Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
 | 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
@@ -833,6 +834,14 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
         item_id  = item.get("id")
         app_id   = f.get("Title")
         app_name = f.get("AppName", "Unknown")
+
+        existing_new_key_id = (f.get("NewSecretKeyId") or "").strip()
+        if existing_new_key_id:
+            summary["rowsSkippedRotated"] += 1
+            log.debug("Skipping %s — NewSecretKeyId already present (%s), row was already rotated",
+                      app_id, existing_new_key_id)
+            continue
+
         jira_key = f.get("JiraTicketKey", "")
 
         if not jira_key:
