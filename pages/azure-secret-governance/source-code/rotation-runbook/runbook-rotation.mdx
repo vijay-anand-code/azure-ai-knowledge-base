@@ -36,6 +36,36 @@ import { Callout } from 'nextra/components'
 
 ---
 
+## Rotation eligibility
+
+A row must pass every one of these gates in Phase B, in order, or it's skipped for that cycle:
+
+| # | Gate | Field checked | Skipped if... |
+|---|------|----------------|----------------|
+| 1 | Actionable status | `AlertStatus` | Not one of `Discovered`, `JiraRaised`, `TeamsAlerted`, `Escalated`, `Expired`, `ExpiredManualReview`. `RotatedPendingDeployment`, `Rotated`, `OverdueManualReview`, and `JiraClosed-Unverified` are all excluded here |
+| 2 | Owned by a human | `ManualAppOwners` | Blank — must be filled by a person directly, or resolved earlier by monitoring/owner sync from `ProductName` |
+| 3 | Rotation-eligible bucket | `ExpirationDate` → computed bucket | Bucket is P4 (61+ days, safe) — only P1/P2/P3 are eligible |
+| 4 | Within threshold | `ExpirationDate` → days remaining | More than 60 days remain (`DEFAULT_ROTATION_THRESHOLD = 60`, hardcoded at the call site) |
+| 5 | Not already rotated | `NewSecretKeyId` | Already has a value — this exact row was already rotated once. Re-rotating it requires clearing this field, resetting `AlertStatus` alone is no longer enough |
+| 6 | Has a Jira ticket | `JiraTicketKey` | Blank — logged as an error (`"no JiraTicketKey, cannot rotate"`), never silently allowed through |
+| 7 | Jira ticket still open | Live status via `get_jira_issue()` | Status is `done`/`closed`/`resolved` — row instead flips to `JiraClosed-Unverified` for manual review, no rotation happens |
+| 8 | App still exists in Azure | `app_info_by_client_id` lookup | The app registration's `appId` isn't found across the scanned tenants |
+
+If a row clears all eight, `store_rotated_secret()` resolves the target vault (`ProductTeamkeyVaultName`
+if set, else the shared rotation vault) and secret name (reuse `NewSecretVaultName` if set, else
+generate and write one back — see "Secret naming" below), creates a new Key Vault secret version,
+posts a Jira comment with retrieval instructions, and writes `AlertStatus = RotatedPendingDeployment`
+plus `NewSecretKeyId`/`NewSecretVaultName`/`RotationDetectedDate` back to the row.
+
+<Callout type="info">
+  Phase A runs first, separately, every cycle: any row already in `RotatedPendingDeployment` has its
+  Jira ticket re-checked. Closed → the row finalizes to `Rotated`. Still open → just `LastChecked`
+  refreshes. No ticket key at all → flips to `JiraClosed-Unverified`. None of this is gated by the
+  eligibility table above, since these rows aren't in `ACTIONABLE_STATUSES` in the first place.
+</Callout>
+
+---
+
 ## Secret naming
 
 Many applications hardcode the Key Vault secret name they expect their client secret under, so
