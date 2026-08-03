@@ -18,4 +18,4 @@ SecretAlertRegistry SharePoint list.
 | [runbook_discovery.py](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery) | Main discovery runbook — scans all apps and writes to SharePoint |
 | [runbook_cleanup_sharepoint.py](/azure-secret-governance/source-code/discovery-runbook/cleanup-sharepoint) | Utility — deletes all SharePoint rows for a fresh test run |
 | [count.mdx](/azure-secret-governance/source-code/discovery-runbook/count) | Utility — CLI command to count total App Registrations and secrets via Graph, for cross-checking against runbook output |
-| [Excel Bulk Sync](/azure-secret-governance/source-code/discovery-runbook/excel-bulk-sync) | Utility — PowerShell scripts to export the SharePoint list to CSV, edit offline in Excel, and sync changes back (update existing rows or bulk-import into an empty list) |
+| [Excel Bulk Sync](/azure-secret-governance/source-code/discovery-runbook/excel-bulk-sync) | Utility — bulk-imports a corrected CSV into SecretAlertRegistry after the list has been emptied (e.g. after `cleanup_sharepoint.py`) |
