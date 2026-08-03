@@ -2,5 +2,6 @@
   "index": "Overview",
   "runbook-discovery": "runbook_discovery.py",
   "cleanup-sharepoint": "cleanup_sharepoint.py",
-  "count": "Secret Count Check"
+  "count": "Secret Count Check",
+  "excel-bulk-sync": "Excel Bulk Sync"
 }

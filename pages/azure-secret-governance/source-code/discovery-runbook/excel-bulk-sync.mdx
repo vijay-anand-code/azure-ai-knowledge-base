@@ -1,0 +1,301 @@
+---
+title: Excel Bulk Sync
+description: Manual PowerShell scripts for exporting SecretAlertRegistry to Excel, editing offline, and syncing changes back
+---
+
+import { Callout } from 'nextra/components'
+
+# Excel Bulk Sync
+
+**Runtime:** PowerShell 7+ (Microsoft Graph PowerShell SDK) — run manually from Cloud Shell or a local terminal, not an Azure Automation runbook.
+
+Three ad-hoc scripts for the common maintenance pattern: export the full `SecretAlertRegistry` list to
+a CSV, hand it to someone to review/correct in Excel, then push their edits back. Used for cleaning up
+the mass P4-duplicate rows (see the [monitoring runbook](/azure-secret-governance/source-code/container-2-monitor-api/container2-decision-engine)'s
+`sp_index` fix) and for bulk-correcting `ManualAppOwners`/`ProductName`/`TeamName` values a client edits offline.
+
+<Callout type="warning">
+  All three connect via `Connect-MgGraph` using your own signed-in account (delegated permissions),
+  not the automation's Managed Identity. If your tenant has a SharePoint access-control policy
+  restricting API/app access for unmanaged devices or untrusted networks, every Graph call here can
+  return an empty result set with no error, even though the exact same account works fine in a
+  browser. If that happens, sign in app-only instead using the same App Registration the automation
+  runbooks already use (see "App-only auth" below).
+</Callout>
+
+---
+
+## Export to CSV
+
+Pulls every row and every field from the list into a CSV, plus a `DuplicateGroupCount` helper column
+(grouped by `SecretID`) for spotting duplicates visually in Excel. `ID` and `Created` are included for
+reference but are never meant to be edited.
+
+```powershell
+# --- CONFIG ---
+$siteHost   = "copilot365demooutlook.sharepoint.com"
+$sitePath   = "/sites/ContosoIT"
+$listName   = "SecretAlertRegistry"
+$exportCsv  = "$HOME/SecretAlertRegistry_Export.csv"
+
+$columnsToExport = @(
+    "Title","AppName","SecretID","SecretDescription","TeamName","ProductName",
+    "ProductTeamkeyVaultName","NewSecretKeyId","NewSecretVaultName","ExpirationDate",
+    "AlertStatus","JiraTicketCreatedDate","LastChecked","RotationDetectedDate",
+    "JiraTicketKey","AlertSentDate","ExpiryNotice","TenantID","AlertHistory",
+    "ExpiryBucket","AppOwners","ManualAppOwners","ObjectID"
+)
+# --- end config ---
+
+Connect-MgGraph -Scopes "Sites.Read.All"
+
+$site = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/${siteHost}:${sitePath}"
+$list = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$listName"
+
+$allItems = @()
+$uri = "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$($list.id)/items?expand=fields&`$top=200"
+while ($uri) {
+    $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+    $allItems += $resp.value
+    $uri = $resp.'@odata.nextLink'
+}
+
+Write-Host "Fetched $($allItems.Count) total items."
+
+$dupCounts = $allItems | Group-Object { $_.fields.SecretID } | Where-Object { $_.Count -gt 1 }
+$dupIds = @{}
+foreach ($g in $dupCounts) { $dupIds[$g.Name] = $g.Count }
+
+$rows = $allItems | ForEach-Object {
+    $obj = [ordered]@{
+        ID                  = $_.id
+        Created             = $_.createdDateTime
+        DuplicateGroupCount = if ($dupIds.ContainsKey($_.fields.SecretID)) { $dupIds[$_.fields.SecretID] } else { 1 }
+    }
+    foreach ($col in $columnsToExport) {
+        $obj[$col] = $_.fields.$col
+    }
+    [PSCustomObject]$obj
+}
+
+$rows | Export-Csv -Path $exportCsv -NoTypeInformation
+Write-Host "Exported $($rows.Count) rows to $exportCsv"
+```
+
+---
+
+## Update existing rows
+
+Reads an edited CSV and `PATCH`es only the rows that already have an `ID` and whose values actually
+changed versus the live list. Rows with no `ID` are reported and skipped, never created. Validates
+every CSV header against the list's real internal column names up front, and errors out loudly on any
+mismatch instead of silently ignoring an unrecognized column.
+
+```powershell
+# --- CONFIG ---
+$siteHost   = "copilot365demooutlook.sharepoint.com"
+$sitePath   = "/sites/ContosoIT"
+$listName   = "SecretAlertRegistry"
+$editedCsv  = "$HOME/SecretAlertRegistry_Export.csv"   # the edited file
+$dryRun     = $true   # set to $false only after reviewing the printed changes below
+
+# Columns that can never be pushed, regardless of what's in the file: ID is the lookup
+# key (not a writable field), Created is read-only system metadata, DuplicateGroupCount
+# isn't a real SharePoint column at all (export-only helper).
+$excludedColumns = @("ID", "Created", "DuplicateGroupCount")
+# --- end config ---
+
+Connect-MgGraph -Scopes "Sites.ReadWrite.All"
+
+$site = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/${siteHost}:${sitePath}"
+$list = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$listName"
+
+$spColumns = (Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$($list.id)/columns").value.name
+$spColumns = $spColumns | ForEach-Object { $_.Trim() }
+
+$rows = Import-Csv $editedCsv
+if ($rows.Count -eq 0) {
+    Write-Host "ERROR: CSV is empty."
+    return
+}
+
+$csvColumns = $rows[0].PSObject.Properties.Name |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -notin $excludedColumns }
+
+$unknownColumns = $csvColumns | Where-Object { $_ -notin $spColumns }
+if ($unknownColumns.Count -gt 0) {
+    Write-Host "ERROR: these CSV columns don't match any SharePoint field name — fix headers before continuing:"
+    $unknownColumns | ForEach-Object { Write-Host "  $_" }
+    return
+}
+
+Write-Host "Header validation passed. Columns to sync: $($csvColumns -join ', ')"
+
+$noIdRows = $rows | Where-Object { [string]::IsNullOrWhiteSpace($_.ID) }
+$idRows   = $rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ID) }
+
+if ($noIdRows.Count -gt 0) {
+    Write-Host "`nSkipping $($noIdRows.Count) row(s) with no ID (not created):"
+    $noIdRows | ForEach-Object { Write-Host "  SecretID=$($_.SecretID) Title=$($_.Title)" }
+}
+
+$updates = @()
+
+foreach ($row in $idRows) {
+    $itemId = $row.ID
+    $live = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$($list.id)/items/$itemId?expand=fields"
+
+    $changedFields = @{}
+    foreach ($col in $csvColumns) {
+        $newVal = $row.$col
+        $curVal = $live.fields.$col
+        if ($newVal -ne $curVal) {
+            $changedFields[$col] = $newVal
+        }
+    }
+
+    if ($changedFields.Count -gt 0) {
+        $updates += [PSCustomObject]@{ ItemId = $itemId; Changes = $changedFields }
+    }
+}
+
+Write-Host "`n$($updates.Count) row(s) have changes to push:"
+foreach ($u in $updates) {
+    Write-Host "  ItemId=$($u.ItemId)"
+    foreach ($key in $u.Changes.Keys) {
+        Write-Host "    $key -> '$($u.Changes[$key])'"
+    }
+}
+
+if (-not $dryRun) {
+    foreach ($u in $updates) {
+        $body = @{ fields = $u.Changes } | ConvertTo-Json -Depth 5
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$($list.id)/items/$($u.ItemId)/fields" `
+            -Body $body -ContentType "application/json"
+        Write-Host "Updated ItemId=$($u.ItemId)"
+    }
+} else {
+    Write-Host "`nDry run only — no writes performed. Set `$dryRun = `$false` to actually push these changes."
+}
+```
+
+<Callout type="warning">
+  `ProductName`, `TeamName`, and `ProductTeamkeyVaultName` are single-select Choice columns. A value
+  that doesn't exactly match an existing choice option will either error or silently create a new
+  orphan option, depending on the list's "allow fill-in" setting — check the diff output for those
+  three columns before flipping `$dryRun` to `$false`.
+</Callout>
+
+---
+
+## Bulk import (empty list only)
+
+Creates a brand-new item (`POST`) for every row in the CSV — there is no `ID` matching here at all, so
+this is only safe to run against a genuinely **empty** list (e.g. right after running
+`runbook_cleanup_sharepoint.py`). Running it against a populated list will create duplicates of every
+row, since it has no way to know an item already exists.
+
+<Callout type="warning">
+  Excel's `Delete` key only clears cell content — it does not remove the row itself. A CSV saved after
+  clearing (rather than actually deleting) unwanted rows still contains those rows, just blank, and this
+  script will happily create an empty SharePoint item for each one. This script refuses to run if it
+  finds any row with no `SecretID`, specifically to catch that mistake before it recreates it.
+</Callout>
+
+```powershell
+# --- CONFIG ---
+$siteHost   = "copilot365demooutlook.sharepoint.com"
+$sitePath   = "/sites/ContosoIT"
+$listName   = "SecretAlertRegistry"
+$importCsv  = "$HOME/SecretAlertRegistry_Export.csv"   # your full, corrected dataset
+
+$columnsToImport = @(
+    "Title","AppName","SecretID","SecretDescription","TeamName","ProductName",
+    "ProductTeamkeyVaultName","NewSecretKeyId","NewSecretVaultName","ExpirationDate",
+    "AlertStatus","JiraTicketCreatedDate","LastChecked","RotationDetectedDate",
+    "JiraTicketKey","AlertSentDate","ExpiryNotice","TenantID","AlertHistory",
+    "ExpiryBucket","AppOwners","ManualAppOwners","ObjectID"
+)
+# --- end config ---
+
+Connect-MgGraph -Scopes "Sites.ReadWrite.All"
+
+$site = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/${siteHost}:${sitePath}"
+$list = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$listName"
+
+if (-not (Test-Path $importCsv)) {
+    Write-Error "CSV file not found at $importCsv"
+    return
+}
+$csvRows = Import-Csv -Path $importCsv
+
+# Refuse to run if any row is blank — the cause of accidentally recreated empty items.
+$blankRows = $csvRows | Where-Object { -not $_.SecretID }
+if ($blankRows.Count -gt 0) {
+    Write-Host "ABORTING: found $($blankRows.Count) row(s) with no SecretID — these are almost certainly leftover blank rows from Excel (content cleared, row not actually deleted)." -ForegroundColor Red
+    Write-Host "Fix by selecting those rows in Excel and right-click -> Delete (not just pressing Delete key), then re-save and re-run." -ForegroundColor Red
+    return
+}
+
+Write-Host "Loaded $($csvRows.Count) rows from CSV, no blank rows found. Starting import..." -ForegroundColor Cyan
+
+$targetUri = "https://graph.microsoft.com/v1.0/sites/$($site.id)/lists/$($list.id)/items"
+
+$counter = 0
+$errors = @()
+foreach ($row in $csvRows) {
+    $counter++
+
+    $fieldsPayload = @{}
+    foreach ($col in $columnsToImport) {
+        if ($row.$col) {
+            $fieldsPayload[$col] = $row.$col
+        }
+    }
+
+    $body = @{ fields = $fieldsPayload } | ConvertTo-Json -Depth 10
+
+    try {
+        $progress = [Math]::Round(($counter / $csvRows.Count) * 100, 1)
+        Write-Host "[$progress%] ($counter/$($csvRows.Count)) Importing SecretID: $($row.SecretID)..." -ForegroundColor Yellow
+        $null = Invoke-MgGraphRequest -Method POST -Uri $targetUri -Body $body -ContentType "application/json"
+    }
+    catch {
+        Write-Host "Error importing row $counter (SecretID: $($row.SecretID)): $_" -ForegroundColor Red
+        $errors += $row.SecretID
+    }
+}
+
+Write-Host "Import process finished! $($csvRows.Count - $errors.Count) succeeded, $($errors.Count) failed." -ForegroundColor Green
+if ($errors.Count -gt 0) {
+    Write-Host "Failed SecretIDs: $($errors -join ', ')" -ForegroundColor Red
+}
+```
+
+---
+
+## App-only auth
+
+If `Connect-MgGraph -Scopes "..."` returns empty results despite correct scopes, correct site/list IDs,
+and working browser access — a SharePoint access-control policy restricting API access for unmanaged
+devices/untrusted networks is the likely cause. Application-permission auth is typically exempt from
+that restriction, since it's the same access model the automation runbooks already use successfully.
+Swap the `Connect-MgGraph -Scopes "..."` line in any script above for this, using the same App
+Registration referenced by `CROSS-TENANT-APP-ID` in the rotation Key Vault (a client secret must be
+added to that App Registration first, and stored back in the same vault):
+
+```powershell
+$vaultName = "<your-rotator-kv-name>"   # just the vault name, from ROTATOR_KV_URL
+
+$clientId     = Get-AzKeyVaultSecret -VaultName $vaultName -Name "CROSS-TENANT-APP-ID" -AsPlainText
+$tenantId     = Get-AzKeyVaultSecret -VaultName $vaultName -Name "GRAPH-TENANT-ID" -AsPlainText
+$clientSecret = Get-AzKeyVaultSecret -VaultName $vaultName -Name "EXCEL-SYNC-CLIENT-SECRET" -AsPlainText
+
+$secureSecret = ConvertTo-SecureString $clientSecret -AsPlainText -Force
+$clientSecretCredential = New-Object System.Management.Automation.PSCredential($clientId, $secureSecret)
+
+Connect-MgGraph -TenantId $tenantId -ClientSecretCredential $clientSecretCredential
+```
