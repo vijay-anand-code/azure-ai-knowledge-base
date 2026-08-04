@@ -1,3 +1,10 @@
+---
+title: GitHub Actions — the big picture
+description: A built-in automation engine inside every GitHub repo
+---
+
+import { Callout } from 'nextra/components'
+
 # GitHub Actions — the big picture
 
 A built-in automation engine inside every GitHub repo. No third-party tools, no separate setup — just YAML files in your codebase.
@@ -28,7 +35,9 @@ Workflows are YAML files in your repo — version controlled, visible to your te
 
 The GitHub Marketplace has ready-made actions for almost everything — checkout, deploy, notify Slack, run tests, and more. Before writing custom scripts, always check there first.
 
-> Think of it like: every time something happens in your repo (a push, a PR, a schedule) — GitHub Actions can automatically respond and run tasks for you.
+<Callout type="info">
+  Think of it like: every time something happens in your repo (a push, a PR, a schedule) — GitHub Actions can automatically respond and run tasks for you.
+</Callout>
 
 ---
 
@@ -56,8 +65,14 @@ I went through this in stages — concepts first, then hands-on. Each page here 
 
 ## Read this before anything else
 
-**The `needs` keyword is everything.** Without it, all your jobs run at the same time. A failed test won't stop a deploy. Always chain your jobs explicitly.
+<Callout type="warning">
+  **The `needs` keyword is everything.** Without it, all your jobs run at the same time. A failed test won't stop a deploy. Always chain your jobs explicitly.
+</Callout>
 
-**Pin your action versions.** Use `@v4` not `@latest`. If someone releases a breaking update, your workflow breaks silently on the next run.
+<Callout type="warning">
+  **Pin your action versions.** Use `@v4` not `@latest`. If someone releases a breaking update, your workflow breaks silently on the next run.
+</Callout>
 
-**YAML indentation is your biggest enemy.** Two spaces per level. No tabs. Ever. The GitHub editor highlights errors in real time — use it.
+<Callout type="warning">
+  **YAML indentation is your biggest enemy.** Two spaces per level. No tabs. Ever. The GitHub editor highlights errors in real time — use it.
+</Callout>

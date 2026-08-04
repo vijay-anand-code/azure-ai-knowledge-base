@@ -1,3 +1,10 @@
+---
+title: Use cases
+description: What our team actually uses GitHub Actions for
+---
+
+import { Callout } from 'nextra/components'
+
 # Use cases
 
 What our team actually uses GitHub Actions for, plus patterns worth knowing for future reference.
@@ -31,7 +38,9 @@ When someone changes an agent's system prompt or tools, a workflow automatically
 
 ### Controlled prod deployments
 
-Pushes to `main` deploy to nonprod automatically. For production, we use `workflow_dispatch` — someone has to manually click "run" in the Actions tab. That manual step is the human gate before anything hits production.
+<Callout type="warning">
+  Pushes to `main` deploy to nonprod automatically. For production, we use `workflow_dispatch` — someone has to manually click "run" in the Actions tab. That manual step is the human gate before anything hits production.
+</Callout>
 
 ```yaml
 on:

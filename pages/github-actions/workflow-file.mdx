@@ -1,3 +1,10 @@
+---
+title: My first workflow file
+description: Checking out repo code and printing a file — the smallest complete workflow
+---
+
+import { Callout, Steps } from 'nextra/components'
+
 # My first workflow file
 
 This was my first hands-on workflow. It checks out the repo code and prints the contents of a text file. Simple — but it's enough to understand how every part connects.
@@ -92,13 +99,37 @@ This runs a shell command directly on the runner — same as typing it in your t
 
 ## What happens end to end
 
-1. You commit this file to `.github/workflows/hello-world.yml`
-2. That commit is a push — so the workflow triggers immediately
-3. GitHub spins up a fresh Ubuntu VM
-4. Step 1: `checkout` downloads your repo code onto the VM
-5. Step 2: `echo "$(cat hello_world.txt)"` prints the file contents
-6. Job completes with a green checkmark
-7. VM is thrown away — nothing persists to the next run
+<Steps>
+
+### Commit the file
+
+You commit this file to `.github/workflows/hello-world.yml`
+
+### Push triggers the workflow
+
+That commit is a push — so the workflow triggers immediately
+
+### GitHub spins up a runner
+
+A fresh Ubuntu VM, with nothing on it
+
+### Step 1 runs
+
+`checkout` downloads your repo code onto the VM
+
+### Step 2 runs
+
+`echo "$(cat hello_world.txt)"` prints the file contents
+
+### Job completes
+
+Green checkmark in the Actions tab
+
+### VM is thrown away
+
+Nothing persists to the next run
+
+</Steps>
 
 You can watch every step live in the **Actions tab** of your repo.
 
@@ -106,31 +137,33 @@ You can watch every step live in the **Actions tab** of your repo.
 
 ## Common mistakes at this stage
 
-**Forgetting `checkout`**
+<Callout type="warning">
+  **Forgetting `checkout`** — If you skip the checkout step and try to read a file, you'll get a "file not found" error. The runner starts blank — your code isn't there until you explicitly check it out.
+</Callout>
 
-If you skip the checkout step and try to read a file, you'll get a "file not found" error. The runner starts blank — your code isn't there until you explicitly check it out.
+<Callout type="warning">
+  **Wrong indentation** — YAML is whitespace-sensitive. Two spaces per level, no tabs.
 
-**Wrong indentation**
+  This is wrong:
+  ```yaml
+  steps:
+  - name: Check out    # ← needs to be indented 2 spaces under steps
+  ```
 
-YAML is whitespace-sensitive. Two spaces per level, no tabs.
+  This is correct:
+  ```yaml
+  steps:
+    - name: Check out  # ← 2 spaces in
+  ```
+</Callout>
 
-This is wrong:
-```yaml
-steps:
-- name: Check out    # ← needs to be indented 2 spaces under steps
-```
+<Callout type="warning">
+  **Using `@latest` instead of a pinned version**
 
-This is correct:
-```yaml
-steps:
-  - name: Check out  # ← 2 spaces in
-```
+  ```yaml
+  uses: actions/checkout@latest   # ❌ don't do this
+  uses: actions/checkout@v4       # ✅ pin to a specific version
+  ```
 
-**Using `@latest` instead of a pinned version**
-
-```yaml
-uses: actions/checkout@latest   # ❌ don't do this
-uses: actions/checkout@v4       # ✅ pin to a specific version
-```
-
-If the action releases a breaking change and you're on `@latest`, your workflow silently breaks on the next run.
+  If the action releases a breaking change and you're on `@latest`, your workflow silently breaks on the next run.
+</Callout>

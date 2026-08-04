@@ -1,3 +1,10 @@
+---
+title: What is GitHub Actions?
+description: Automates the way you build, test, and deploy your code, directly from your repo
+---
+
+import { Callout } from 'nextra/components'
+
 # What is GitHub Actions?
 
 GitHub Actions automates the way you build, test, and deploy your code — directly from your GitHub repository. It's not a separate product. It's built into every repo, zero setup required.
@@ -53,7 +60,9 @@ Common ones you'll use on every project:
 | `actions/upload-pages-artifact@v3` | Packages your build for GitHub Pages |
 | `actions/deploy-pages@v4` | Deploys the artifact to GitHub Pages |
 
-> **Important:** Always pin to a specific version like `@v4`. Never use `@latest`. If the action author releases a breaking change, your unpinned workflow breaks on the next run — and you won't know why until you check the logs.
+<Callout type="warning">
+  Always pin to a specific version like `@v4`. Never use `@latest`. If the action author releases a breaking change, your unpinned workflow breaks on the next run — and you won't know why until you check the logs.
+</Callout>
 
 ---
 

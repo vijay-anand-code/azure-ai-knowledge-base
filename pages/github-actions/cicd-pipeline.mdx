@@ -1,3 +1,10 @@
+---
+title: CI/CD pipeline — build, test, deploy
+description: Three jobs, wired together with needs, so each only runs if the last succeeded
+---
+
+import { Callout, Steps } from 'nextra/components'
+
 # CI/CD pipeline — build, test, deploy
 
 After hello world, I built a real pipeline. Three jobs: build the app, test it, then deploy it. Each job only runs if the previous one succeeded.
@@ -79,7 +86,9 @@ Without `needs`, build and test start at exactly the same time. The test job mig
 
 With `needs: build`, the test job waits. If build fails, test never runs. If build succeeds, test starts.
 
-**Real world:** You wouldn't test a car before the engine is installed. `needs` is that common sense rule, enforced automatically.
+<Callout type="info">
+  **Real world:** You wouldn't test a car before the engine is installed. `needs` is that common sense rule, enforced automatically.
+</Callout>
 
 ---
 
@@ -213,14 +222,20 @@ The build generates static files in an `out/` folder. The `upload-pages-artifact
 
 ## Before deploying — two things to set up in GitHub
 
-**1. Create a Production environment**
+<Steps>
+
+### Create a Production environment
 
 Go to your repo → Settings → Environments → New environment → name it `Production`.
 
 You can add approval rules here (require someone to approve before deploy runs). Leave default for now.
 
-**2. Enable GitHub Pages**
+### Enable GitHub Pages
 
 Go to Settings → Pages → under Build and deployment → set Source to **GitHub Actions**.
 
-After both are set up, your next push runs the full pipeline and deploys automatically.
+</Steps>
+
+<Callout type="info">
+  After both are set up, your next push runs the full pipeline and deploys automatically.
+</Callout>

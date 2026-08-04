@@ -1,10 +1,17 @@
+---
+title: Core concepts
+description: Five things to understand before writing any workflow
+---
+
+import { Callout, Steps } from 'nextra/components'
+
 # Core concepts
 
 Five things to understand before writing any workflow. Everything in GitHub Actions is built from these.
 
----
+<Steps>
 
-## 1. Workflow
+### Workflow
 
 A workflow is a YAML file that defines an automated process. It lives in a specific folder in your repo:
 
@@ -18,13 +25,13 @@ your-repo/
 
 You can have as many workflow files as you want. Each one is independent. One for CI, one for deployment, one for scheduled cleanup — whatever makes sense.
 
-**🍽 Restaurant analogy:** Think of a workflow like an SOP (Standard Operating Procedure) document. It says "when X happens, do Y, then Z." The difference is that this SOP actually runs itself.
+<Callout type="info">
+  **🍽 Restaurant analogy:** Think of a workflow like an SOP (Standard Operating Procedure) document. It says "when X happens, do Y, then Z." The difference is that this SOP actually runs itself.
 
-**💻 Software analogy:** Think of a workflow like an event listener in JavaScript. When you write `button.addEventListener('click', handleClick)`, you're saying "when this event happens, run this function automatically." A GitHub Actions workflow does the same thing — "when a push happens, run these jobs automatically."
+  **💻 Software analogy:** Think of a workflow like an event listener in JavaScript. When you write `button.addEventListener('click', handleClick)`, you're saying "when this event happens, run this function automatically." A GitHub Actions workflow does the same thing — "when a push happens, run these jobs automatically."
+</Callout>
 
----
-
-## 2. Event (trigger)
+### Event (trigger)
 
 Every workflow needs at least one event that starts it. Without a trigger, the workflow never runs.
 
@@ -50,13 +57,13 @@ on:
     branches: [main]   # only fires on pushes to main, not other branches
 ```
 
-**🍽 Restaurant analogy:** The event is like a doorbell. You don't run to the door all day — you wait for the bell to ring. The `on` keyword defines what rings the bell.
+<Callout type="info">
+  **🍽 Restaurant analogy:** The event is like a doorbell. You don't run to the door all day — you wait for the bell to ring. The `on` keyword defines what rings the bell.
 
-**💻 Software analogy:** Think of it like a webhook. When Stripe processes a payment, it sends a POST request to your endpoint — that's the event. Your server wakes up and handles it. GitHub Actions works the same way — a push to your repo fires the trigger, and your workflow wakes up and handles it.
+  **💻 Software analogy:** Think of it like a webhook. When Stripe processes a payment, it sends a POST request to your endpoint — that's the event. Your server wakes up and handles it. GitHub Actions works the same way — a push to your repo fires the trigger, and your workflow wakes up and handles it.
+</Callout>
 
----
-
-## 3. Jobs
+### Jobs
 
 A job is a group of steps that run on the same machine. By default, jobs run in **parallel** — they all start at the same time.
 
@@ -82,15 +89,17 @@ jobs:
     ...
 ```
 
-**🍽 Restaurant analogy:** Imagine building a house. You can't install the roof before the walls are up. `needs` is the rule that says "walls first, then roof." Without it, the roof crew shows up on day one and has nothing to work with.
+<Callout type="info">
+  **🍽 Restaurant analogy:** Imagine building a house. You can't install the roof before the walls are up. `needs` is the rule that says "walls first, then roof." Without it, the roof crew shows up on day one and has nothing to work with.
 
-**💻 Software analogy:** Think of it like database migrations. You can't seed data before the tables exist. You can't run your app before the database is seeded. Each step depends on the previous one succeeding — same as `needs` in GitHub Actions. If the migration fails, nothing after it runs.
+  **💻 Software analogy:** Think of it like database migrations. You can't seed data before the tables exist. You can't run your app before the database is seeded. Each step depends on the previous one succeeding — same as `needs` in GitHub Actions. If the migration fails, nothing after it runs.
+</Callout>
 
-> **Critical:** Jobs are completely independent. Each job gets a fresh machine with nothing on it. If your test job needs the code, it has to check it out again. If it needs Node, it has to install it again. This feels repetitive but it's intentional — each job can use different tools and versions.
+<Callout type="warning">
+  **Critical:** Jobs are completely independent. Each job gets a fresh machine with nothing on it. If your test job needs the code, it has to check it out again. If it needs Node, it has to install it again. This feels repetitive but it's intentional — each job can use different tools and versions.
+</Callout>
 
----
-
-## 4. Runners
+### Runners
 
 A runner is the machine that actually executes your job. Every job needs one.
 
@@ -112,13 +121,13 @@ runs-on: macos-latest     # macOS
 
 For most things, use `ubuntu-latest`. It's free for public repos, fast, and almost every CLI tool works on Linux.
 
-**🍽 Restaurant analogy:** The runner is like a contractor. GitHub sends them the job description (your workflow), they show up with their own tools (the VM), do the work, and leave. Next time, a fresh contractor shows up — no memory of what happened before.
+<Callout type="info">
+  **🍽 Restaurant analogy:** The runner is like a contractor. GitHub sends them the job description (your workflow), they show up with their own tools (the VM), do the work, and leave. Next time, a fresh contractor shows up — no memory of what happened before.
 
-**💻 Software analogy:** Think of it like a serverless function (Azure Functions or AWS Lambda). Every time it's invoked, it spins up a fresh isolated environment, runs your code, and shuts down. No shared state between runs. The runner works exactly the same way — a clean VM for every job, thrown away when done.
+  **💻 Software analogy:** Think of it like a serverless function (Azure Functions or AWS Lambda). Every time it's invoked, it spins up a fresh isolated environment, runs your code, and shuts down. No shared state between runs. The runner works exactly the same way — a clean VM for every job, thrown away when done.
+</Callout>
 
----
-
-## 5. Steps
+### Steps
 
 Steps are the individual tasks inside a job. They run one after another, in the order you write them.
 
@@ -156,9 +165,13 @@ Two types of steps:
 
 If any step fails, the job stops. Steps after the failed one don't run.
 
-**🍽 Restaurant analogy:** Steps are like a recipe. You can't frost the cake before it's baked. You can't run tests before installing the packages. Order matters, and if you mess up a step, you stop and fix it before moving on.
+<Callout type="info">
+  **🍽 Restaurant analogy:** Steps are like a recipe. You can't frost the cake before it's baked. You can't run tests before installing the packages. Order matters, and if you mess up a step, you stop and fix it before moving on.
 
-**💻 Software analogy:** Think of it like a Docker build. Each line in a `Dockerfile` is a step — `FROM`, `RUN apt-get install`, `COPY`, `RUN npm install`. They execute in order, and if one fails, the build stops. GitHub Actions steps work exactly the same way — sequential, ordered, and fail-fast.
+  **💻 Software analogy:** Think of it like a Docker build. Each line in a `Dockerfile` is a step — `FROM`, `RUN apt-get install`, `COPY`, `RUN npm install`. They execute in order, and if one fails, the build stops. GitHub Actions steps work exactly the same way — sequential, ordered, and fail-fast.
+</Callout>
+
+</Steps>
 
 ---
 
