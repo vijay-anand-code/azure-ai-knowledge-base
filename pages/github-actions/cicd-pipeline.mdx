@@ -4,6 +4,7 @@ description: Three jobs, wired together with needs, so each only runs if the las
 ---
 
 import { Callout, Steps } from 'nextra/components'
+import FlowTracker from '../../components/FlowTracker'
 
 # CI/CD pipeline — build, test, deploy
 
@@ -195,6 +196,32 @@ push to repo
 ```
 
 This is continuous delivery. Every push that passes all checks gets deployed automatically. You never manually deploy.
+
+---
+
+## The chain, stage by stage
+
+<FlowTracker steps={[
+  { icon: '🔨', label: 'Build' },
+  { icon: '🧪', label: 'Test' },
+  { icon: '🚀', label: 'Deploy' },
+]} />
+
+<Steps>
+
+### Build
+
+Checks out the repo, installs Node 20, and runs `npm run build` on a fresh `ubuntu-latest` VM.
+
+### Test
+
+Waits for `build` via `needs: build`. Fresh VM again — checks out the repo, installs Node, and runs `npm test`.
+
+### Deploy
+
+Waits for `test` via `needs: test`. Builds again, uploads the `out/` folder as a Pages artifact, and deploys it to GitHub Pages.
+
+</Steps>
 
 ---
 

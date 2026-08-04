@@ -4,6 +4,7 @@ description: Checking out repo code and printing a file — the smallest complet
 ---
 
 import { Callout, Steps } from 'nextra/components'
+import FlowTracker from '../../components/FlowTracker'
 
 # My first workflow file
 
@@ -98,6 +99,16 @@ This runs a shell command directly on the runner — same as typing it in your t
 ---
 
 ## What happens end to end
+
+<FlowTracker steps={[
+  { icon: '📝', label: 'Commit' },
+  { icon: '🚀', label: 'Push triggers' },
+  { icon: '💻', label: 'Runner spins up' },
+  { icon: '📥', label: 'Checkout' },
+  { icon: '🖨️', label: 'Print file' },
+  { icon: '🏁', label: 'Complete' },
+  { icon: '🗑️', label: 'Cleanup' },
+]} />
 
 <Steps>
 
