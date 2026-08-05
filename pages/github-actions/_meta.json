@@ -4,5 +4,6 @@
   "core-concepts": "Core concepts",
   "workflow-file": "Workflow file",
   "cicd-pipeline": "CI/CD pipeline",
+  "runners": "Runners",
   "use-cases": "Use cases"
 }

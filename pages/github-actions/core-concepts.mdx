@@ -32,12 +32,12 @@ your-repo/
         └── build-test-deploy.yml # your CI/CD pipeline
 ```
 
-You can have as many workflow files as you want. Each one is independent. One for CI, one for deployment, one for scheduled cleanup — whatever makes sense.
+You can have as many workflow files as you want. Each one is independent. One for CI, one for deployment, one for scheduled cleanup, whatever makes sense.
 
 <Callout type="info">
   **🍽 Restaurant analogy:** Think of a workflow like an SOP (Standard Operating Procedure) document. It says "when X happens, do Y, then Z." The difference is that this SOP actually runs itself.
 
-  **💻 Software analogy:** Think of a workflow like an event listener in JavaScript. When you write `button.addEventListener('click', handleClick)`, you're saying "when this event happens, run this function automatically." A GitHub Actions workflow does the same thing — "when a push happens, run these jobs automatically."
+  **💻 Software analogy:** Think of a workflow like an event listener in JavaScript. When you write `button.addEventListener('click', handleClick)`, you're saying "when this event happens, run this function automatically." A GitHub Actions workflow does the same thing: "when a push happens, run these jobs automatically."
 </Callout>
 
 ### Event (trigger)
@@ -67,14 +67,14 @@ on:
 ```
 
 <Callout type="info">
-  **🍽 Restaurant analogy:** The event is like a doorbell. You don't run to the door all day — you wait for the bell to ring. The `on` keyword defines what rings the bell.
+  **🍽 Restaurant analogy:** The event is like a doorbell. You don't run to the door all day, you wait for the bell to ring. The `on` keyword defines what rings the bell.
 
-  **💻 Software analogy:** Think of it like a webhook. When Stripe processes a payment, it sends a POST request to your endpoint — that's the event. Your server wakes up and handles it. GitHub Actions works the same way — a push to your repo fires the trigger, and your workflow wakes up and handles it.
+  **💻 Software analogy:** Think of it like a webhook. When Stripe processes a payment, it sends a POST request to your endpoint, that's the event. Your server wakes up and handles it. GitHub Actions works the same way: a push to your repo fires the trigger, and your workflow wakes up and handles it.
 </Callout>
 
 ### Jobs
 
-A job is a group of steps that run on the same machine. By default, jobs run in **parallel** — they all start at the same time.
+A job is a group of steps that run on the same machine. By default, jobs run in **parallel**, they all start at the same time.
 
 ```yaml
 jobs:
@@ -101,11 +101,11 @@ jobs:
 <Callout type="info">
   **🍽 Restaurant analogy:** Imagine building a house. You can't install the roof before the walls are up. `needs` is the rule that says "walls first, then roof." Without it, the roof crew shows up on day one and has nothing to work with.
 
-  **💻 Software analogy:** Think of it like database migrations. You can't seed data before the tables exist. You can't run your app before the database is seeded. Each step depends on the previous one succeeding — same as `needs` in GitHub Actions. If the migration fails, nothing after it runs.
+  **💻 Software analogy:** Think of it like database migrations. You can't seed data before the tables exist. You can't run your app before the database is seeded. Each step depends on the previous one succeeding, same as `needs` in GitHub Actions. If the migration fails, nothing after it runs.
 </Callout>
 
 <Callout type="warning">
-  **Critical:** Jobs are completely independent. Each job gets a fresh machine with nothing on it. If your test job needs the code, it has to check it out again. If it needs Node, it has to install it again. This feels repetitive but it's intentional — each job can use different tools and versions.
+  **Critical:** Jobs are completely independent. Each job gets a fresh machine with nothing on it. If your test job needs the code, it has to check it out again. If it needs Node, it has to install it again. This feels repetitive but it's intentional: each job can use different tools and versions.
 </Callout>
 
 ### Runners
@@ -118,7 +118,7 @@ runs-on: ubuntu-latest   # use GitHub's Ubuntu Linux VM
 
 Two types:
 
-**GitHub-hosted runners** — GitHub spins up a brand new virtual machine for your job, runs it, then throws the machine away. You never manage it.
+**GitHub-hosted runners**: GitHub spins up a brand new virtual machine for your job, runs it, then throws the machine away. You never manage it.
 
 ```yaml
 runs-on: ubuntu-latest    # Linux (most common)
@@ -126,14 +126,14 @@ runs-on: windows-latest   # Windows
 runs-on: macos-latest     # macOS
 ```
 
-**Self-hosted runners** — A machine you own and manage. GitHub Actions connects to it and runs jobs there. Useful when you need specific hardware or network access that GitHub's machines don't have.
+**Self-hosted runners**: a machine you own and manage. GitHub Actions connects to it and runs jobs there. Useful when you need specific hardware or network access that GitHub's machines don't have. More on setting one up in the [Runners](/github-actions/runners) page.
 
 For most things, use `ubuntu-latest`. It's free for public repos, fast, and almost every CLI tool works on Linux.
 
 <Callout type="info">
-  **🍽 Restaurant analogy:** The runner is like a contractor. GitHub sends them the job description (your workflow), they show up with their own tools (the VM), do the work, and leave. Next time, a fresh contractor shows up — no memory of what happened before.
+  **🍽 Restaurant analogy:** The runner is like a contractor. GitHub sends them the job description (your workflow), they show up with their own tools (the VM), do the work, and leave. Next time, a fresh contractor shows up with no memory of what happened before.
 
-  **💻 Software analogy:** Think of it like a serverless function (Azure Functions or AWS Lambda). Every time it's invoked, it spins up a fresh isolated environment, runs your code, and shuts down. No shared state between runs. The runner works exactly the same way — a clean VM for every job, thrown away when done.
+  **💻 Software analogy:** Think of it like a serverless function (Azure Functions or AWS Lambda). Every time it's invoked, it spins up a fresh isolated environment, runs your code, and shuts down. No shared state between runs. The runner works exactly the same way: a clean VM for every job, thrown away when done.
 </Callout>
 
 ### Steps
@@ -159,13 +159,13 @@ steps:
 
 Two types of steps:
 
-**`uses`** — runs a prebuilt action from the marketplace
+**`uses`**: runs a prebuilt action from the marketplace
 
 ```yaml
 - uses: actions/checkout@v4   # downloads your repo code onto the runner
 ```
 
-**`run`** — runs any shell command you'd type in a terminal
+**`run`**: runs any shell command you'd type in a terminal
 
 ```yaml
 - run: npm install            # same as typing this in your terminal
@@ -177,7 +177,7 @@ If any step fails, the job stops. Steps after the failed one don't run.
 <Callout type="info">
   **🍽 Restaurant analogy:** Steps are like a recipe. You can't frost the cake before it's baked. You can't run tests before installing the packages. Order matters, and if you mess up a step, you stop and fix it before moving on.
 
-  **💻 Software analogy:** Think of it like a Docker build. Each line in a `Dockerfile` is a step — `FROM`, `RUN apt-get install`, `COPY`, `RUN npm install`. They execute in order, and if one fails, the build stops. GitHub Actions steps work exactly the same way — sequential, ordered, and fail-fast.
+  **💻 Software analogy:** Think of it like a Docker build. Each line in a `Dockerfile` is a step: `FROM`, `RUN apt-get install`, `COPY`, `RUN npm install`. They execute in order, and if one fails, the build stops. GitHub Actions steps work exactly the same way, sequential, ordered, and fail-fast.
 </Callout>
 
 </Steps>
@@ -200,7 +200,7 @@ Workflow file (.yml)
     │
     └── test          ← Job 2: needs build to pass first
         └── steps:
-            ├── checkout code    ← Step 1 (repeated — fresh machine)
+            ├── checkout code    ← Step 1 (repeated, fresh machine)
             ├── install node     ← Step 2 (repeated)
             └── npm test         ← Step 3
 ```

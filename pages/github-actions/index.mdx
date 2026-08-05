@@ -1,13 +1,13 @@
 ---
-title: GitHub Actions — the big picture
+title: GitHub Actions - the big picture
 description: A built-in automation engine inside every GitHub repo
 ---
 
 import { Callout } from 'nextra/components'
 
-# GitHub Actions — the big picture
+# GitHub Actions - the big picture
 
-A built-in automation engine inside every GitHub repo. No third-party tools, no separate setup — just YAML files in your codebase.
+A built-in automation engine inside every GitHub repo. No third-party tools, no separate setup, just YAML files in your codebase.
 
 ---
 
@@ -15,7 +15,7 @@ A built-in automation engine inside every GitHub repo. No third-party tools, no 
 
 Think of GitHub Actions like a personal assistant sitting inside your GitHub repo.
 
-Every time something happens — you push code, open a PR, merge a branch — GitHub Actions wakes up and asks: *"Is there a workflow for this?"* If yes, it runs it automatically.
+Every time something happens, you push code, open a PR, merge a branch, GitHub Actions wakes up and asks: *"Is there a workflow for this?"* If yes, it runs it automatically.
 
 No manual steps. No forgetting to run tests. No "it works on my machine" deploys.
 
@@ -29,14 +29,14 @@ Stop manually running tests, building code, or deploying apps. Actions handles a
 
 **Lives inside GitHub**
 
-Workflows are YAML files in your repo — version controlled, visible to your team, and no third-party CI dashboard to manage. Same repo, same PR process, same access controls.
+Workflows are YAML files in your repo. Version controlled, visible to your team, and no third-party CI dashboard to manage. Same repo, same PR process, same access controls.
 
 **10,000+ prebuilt actions**
 
-The GitHub Marketplace has ready-made actions for almost everything — checkout, deploy, notify Slack, run tests, and more. Before writing custom scripts, always check there first.
+The GitHub Marketplace has ready-made actions for almost everything: checkout, deploy, notify Slack, run tests, and more. Before writing custom scripts, always check there first.
 
 <Callout type="info">
-  Think of it like: every time something happens in your repo (a push, a PR, a schedule) — GitHub Actions can automatically respond and run tasks for you.
+  Think of it like this: every time something happens in your repo (a push, a PR, a schedule), GitHub Actions can automatically respond and run tasks for you.
 </Callout>
 
 ---
@@ -51,14 +51,15 @@ Jenkins is powerful but needs a dedicated server and a lot of config overhead. C
 
 ## What's in this section
 
-I went through this in stages — concepts first, then hands-on. Each page here matches one stage:
+I went through this in stages, concepts first, then hands-on. Each page here matches one stage:
 
 | Page | What it covers |
 |---|---|
 | [What is it?](/github-actions/what-is-it) | The concepts before touching any code |
 | [Core concepts](/github-actions/core-concepts) | Workflows, jobs, steps, runners explained plainly |
-| [Workflow file](/github-actions/workflow-file) | My first real workflow — hello world, line by line |
+| [Workflow file](/github-actions/workflow-file) | My first real workflow, hello world, line by line |
 | [CI/CD pipeline](/github-actions/cicd-pipeline) | Build, test, and deploy wired together with real code |
+| [Runners](/github-actions/runners) | GitHub-hosted vs self-hosted, and setting one up on Azure |
 | [Use cases](/github-actions/use-cases) | What our team actually uses it for |
 
 ---
@@ -74,5 +75,5 @@ I went through this in stages — concepts first, then hands-on. Each page here 
 </Callout>
 
 <Callout type="warning">
-  **YAML indentation is your biggest enemy.** Two spaces per level. No tabs. Ever. The GitHub editor highlights errors in real time — use it.
+  **YAML indentation is your biggest enemy.** Two spaces per level. No tabs. Ever. The GitHub editor highlights errors in real time, use it.
 </Callout>

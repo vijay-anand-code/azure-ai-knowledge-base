@@ -1,0 +1,393 @@
+---
+title: GitHub Self Hosted Runner using Azure Virtual Machine Scale Set
+description: Deploying and registering a self-hosted GitHub Actions runner on an Azure VMSS
+---
+
+# GitHub Self Hosted Runner using Azure Virtual Machine Scale Set
+
+## Introduction
+
+GitHub Actions gives every repository free access to GitHub-hosted runners: short-lived virtual machines that GitHub provisions, runs a single job on, and destroys afterward. For most projects that is enough. But there are situations where a GitHub-hosted runner cannot do the job, and that is where self-hosted runners come in.
+
+A self-hosted runner is a machine you provision and register yourself. GitHub Actions treats it the same way it treats a hosted runner: it dispatches jobs to it based on labels, and the runner reports back status and logs. The difference is that you own the machine, which brings a set of advantages that GitHub-hosted runners cannot offer.
+
+**Security and compliance.** Some workloads need to run inside a private network, behind a firewall, or in a specific Azure region for data residency reasons. A GitHub-hosted runner cannot satisfy that requirement because it lives outside your infrastructure entirely.
+
+**Network access.** If a workflow needs to reach an internal service, a private database, or a resource behind a VPN, a GitHub-hosted runner simply has no route to it. A self-hosted runner deployed inside the same virtual network does.
+
+**Custom software and hardware.** GitHub-hosted images come with a fixed set of preinstalled tools. If a workflow depends on a specific driver, a licensed tool, a particular CPU architecture, or GPU access, a self-hosted runner is the only option.
+
+**Performance.** A self-hosted runner can be sized to the workload. A build that needs eight cores and sixteen gigabytes of memory does not have to be squeezed into the fixed specification of a GitHub-hosted runner.
+
+**Cost optimization.** GitHub-hosted runner minutes are billed per minute for private repositories beyond the free tier. For teams running many workflows a day, a right-sized self-hosted runner running on infrastructure the team already pays for can be considerably cheaper.
+
+This document walks through standing up a self-hosted runner on an Azure Virtual Machine Scale Set, registering it against a repository, and pointing a workflow at it.
+
+## Architecture Overview
+
+```
+Developer
+   |
+   v
+GitHub Repository (vijay-anand-code/project1)
+   |
+   v
+GitHub Actions Workflow  (runs-on: self-hosted, vmss, ubuntu)
+   |
+   v
+Azure Virtual Machine Scale Set (github-runner-vmss)
+   |
+   +---- Ubuntu VM instance 1  (runner agent, listening)
+   |
+   +---- Ubuntu VM instance 2  (runner agent, listening)
+   |
+   v
+Job assigned to a matching instance, workflow executes there
+```
+
+The workflow does not talk to Azure directly. It is GitHub Actions that keeps track of every registered runner and its labels, and hands a job to whichever runner in the scale set is idle and matches the labels the workflow asks for.
+
+## Environment
+
+| Item | Value |
+|---|---|
+| Cloud provider | Microsoft Azure |
+| Repository | vijay-anand-code/project1 |
+| Operating system | Ubuntu Server 24.04 LTS |
+| Virtual machine scale set | github-runner-vmss |
+| Virtual machine size | Standard D2s_v3 |
+| Authentication | SSH public key |
+| Orchestration mode | Uniform |
+| Scaling mode | Manual |
+| Instance count | 2 |
+| Runner name | vmss-runner-01 |
+| Runner labels | self-hosted, Linux, X64, vmss, ubuntu |
+
+## Prerequisites
+
+Before starting, the following need to be in place.
+
+- An active Azure subscription with permission to create virtual machine scale sets
+- A GitHub repository to register the runner against
+- An SSH key pair for authenticating to the virtual machines
+- Azure CLI installed locally, or access to the Azure Portal
+- Familiarity with basic Ubuntu server administration
+- Admin permissions on the GitHub repository, required to generate a runner registration token
+
+## Creating the Azure Virtual Machine Scale Set
+
+The scale set was created through the Azure Portal wizard. The values used for each section are recorded below so the setup can be reproduced exactly.
+
+### Basics
+
+| Setting | Value |
+|---|---|
+| Subscription | Team Azure subscription |
+| Resource group | github-runner-rg |
+| Virtual machine scale set name | github-runner-vmss |
+| Region | South Central US |
+| Availability zone | None |
+| Orchestration mode | Uniform |
+| Security type | Trusted Launch |
+| Scaling | Manual |
+| Instance count | 2 |
+| Spot instances | Disabled |
+
+Uniform orchestration was chosen over Flexible because every instance in this scale set runs identical software, there is no need for per-instance customization, and Uniform mode is the simpler model to reason about for a small fixed pool of runners.
+
+### Compute Configuration
+
+| Setting | Value |
+|---|---|
+| Image | Ubuntu Server 24.04 LTS |
+| Size | Standard D2s_v3 |
+| Architecture | x64 |
+
+Standard D2s_v3 gives two vCPUs and eight gigabytes of memory, enough headroom for a typical build and test job without paying for capacity that sits idle.
+
+### Authentication
+
+| Setting | Value |
+|---|---|
+| Authentication type | SSH public key |
+| Username | vijayanand |
+| Key type | RSA |
+
+SSH key authentication was used instead of a password. The public key is uploaded during provisioning and the matching private key is what is used to connect later.
+
+### Storage Configuration
+
+| Setting | Value |
+|---|---|
+| Disk type | Premium SSD |
+| Disk size | 30 GB |
+| Encryption | Platform managed keys |
+
+Thirty gigabytes is enough for the operating system, the runner agent, and the working directory for typical build jobs. Platform managed keys were used since there was no requirement at this stage for customer managed encryption keys.
+
+### Networking Configuration
+
+The scale set was initially deployed with private IP addresses only. That is the default the wizard steers you toward, and it is the right default for a runner that never needs to be reached directly. But during setup, direct SSH access to each instance was needed to install and register the runner software by hand, and a private IP has no route from a workstation outside the virtual network.
+
+To make that possible during initial setup, a public IP address was assigned to each instance. This is called out explicitly here because it is a decision that should be revisited once the runner is fully automated. See Best Practices and Production Improvements below for how to avoid keeping public IPs in place long term.
+
+With a public IP assigned, the next requirement was a Network Security Group rule allowing inbound SSH.
+
+| Priority | Protocol | Port | Action |
+|---|---|---|---|
+| 1000 | TCP | 22 | Allow |
+
+Without this rule, the connection attempt to port 22 does not get actively rejected, it simply never receives a response, and the SSH client sits waiting until it eventually times out. That is exactly what happened on the first connection attempt: the public IP was reachable, but there was no rule permitting inbound traffic on port 22, so every SSH attempt hung and then failed with a connection timeout. Adding the NSG rule above resolved it immediately.
+
+## Deployment Validation
+
+Before moving on to software installation, three things were checked.
+
+**Provisioning succeeded.** In the Azure Portal, the scale set's Overview page shows a provisioning state. It needs to read Succeeded before continuing.
+
+**Instances are running.** Under the Instances blade, both instances should show a power state of Running and a provisioning state of Succeeded. If an instance is stuck in Creating or Failed, it needs to be investigated before proceeding.
+
+**Outbound internet connectivity.** From inside a VM, running a simple request against GitHub confirms the machine can reach the internet, which is required for downloading the runner package and for the runner to communicate with GitHub once it is running.
+
+```bash
+curl -I https://github.com
+```
+
+A response starting with `HTTP/2 200` confirms outbound connectivity is working.
+
+## SSH Access
+
+With the NSG rule in place, connecting to an instance is a standard SSH connection using the username configured during provisioning and the instance's public IP address.
+
+```bash
+ssh vijayanand@<public-ip>
+```
+
+On the first connection to any new host, SSH shows a message similar to this:
+
+```
+The authenticity of host '<public-ip> (<public-ip>)' can't be established.
+ED25519 key fingerprint is SHA256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+This is expected and is not an error. SSH keeps a local record of every host it has previously connected to, in `~/.ssh/known_hosts`, along with that host's cryptographic key fingerprint. Since this is the first connection ever made to this particular public IP, there is no matching entry yet, so SSH asks for explicit confirmation before trusting the host. Typing `yes` accepts the fingerprint and adds it to `known_hosts`, so future connections to the same IP will not prompt again unless the host key changes, which would indicate something worth investigating.
+
+## System Preparation
+
+Once connected, the base image was updated and a small set of tools installed that the runner setup and later workflow steps depend on.
+
+```bash
+sudo apt update
+sudo apt upgrade -y
+sudo apt install curl unzip git jq -y
+```
+
+`curl` downloads the runner package from GitHub. `git` is required because workflow steps that check out a repository depend on it being present on the runner. `unzip` and `jq` cover extracting archives and parsing JSON output, both of which come up frequently in workflow steps and in scripting against GitHub's REST API.
+
+## GitHub Runner Installation
+
+A dedicated directory keeps the runner's files separate from everything else on the machine.
+
+```bash
+mkdir actions-runner && cd actions-runner
+```
+
+The runner package for version 2.336.0 was downloaded directly from GitHub's releases.
+
+```bash
+curl -o actions-runner-linux-x64-2.336.0.tar.gz -L \
+  https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz
+```
+
+Pinning to a specific version here matters for the same reason it matters in a workflow file: it keeps every instance in the scale set running an identical, known runner build instead of whatever happens to be latest at provisioning time.
+
+The archive is then extracted in place.
+
+```bash
+tar xzf ./actions-runner-linux-x64-2.336.0.tar.gz
+```
+
+## Configuration
+
+Registering the runner against the repository requires a short-lived registration token, generated from the repository itself.
+
+Navigate to the repository, then **Settings**, then **Actions**, then **Runners**, then **New self-hosted runner**. Selecting Linux as the operating system generates a `config.sh` command with the token already filled in, valid for a limited window after generation.
+
+```bash
+./config.sh --url https://github.com/vijay-anand-code/project1 --token <REGISTRATION_TOKEN>
+```
+
+Running this starts an interactive setup that asks a series of questions.
+
+**Enter the name of the runner group to add this runner to.** Pressing enter without typing anything accepts the default value, `Default`. Runner groups exist to control which repositories or workflows are allowed to use a given set of runners, mainly relevant at the organization level. For a single repository registering its own runner, `Default` is almost always the right answer.
+
+**Enter the name of runner.** This is where `vmss-runner-01` was entered, the name used to identify this specific instance in the GitHub UI.
+
+**Enter any additional labels.** `vmss` and `ubuntu` were added here, on top of the labels GitHub assigns automatically (`self-hosted`, `Linux`, `X64`). These custom labels are what a workflow will target later.
+
+**Enter name of work folder.** Pressing enter accepted the default, `_work`, the directory the runner uses to check out repository code and run each job.
+
+A mistake happened during this step that is worth documenting, since it produces a confusing error message. At the runner group prompt, `vmss-runner-01` was typed instead of pressing enter to accept the default. The intention was to set that as the runner's name, but the runner group prompt comes first, so `config.sh` interpreted it as the name of a runner group to join. Since no runner group named `vmss-runner-01` exists (runner groups are created separately at the organization or repository level, not implicitly by naming one at registration time), the configuration failed with:
+
+```
+Could not find any self-hosted runner group named vmss-runner-01.
+```
+
+The fix was straightforward once the cause was clear: rerun `config.sh`, press enter at the runner group prompt to accept `Default`, and only enter `vmss-runner-01` when prompted for the runner name.
+
+## Starting the Runner
+
+With configuration complete, the runner process is started in the foreground.
+
+```bash
+./run.sh
+```
+
+Once started, the terminal shows:
+
+```
+Connected to GitHub
+Current runner version: '2.336.0'
+Listening for Jobs
+```
+
+"Listening for Jobs" means the runner has successfully authenticated with GitHub and is now polling for any workflow run whose `runs-on` labels match the labels this runner was registered with. It stays in this idle state until a matching job is dispatched to it, at which point it picks up the job, executes it, reports the result, then returns to listening.
+
+## GitHub Verification
+
+Back in the repository, under **Settings**, then **Actions**, then **Runners**, the newly registered runner appeared in the list with a status of Idle.
+
+| Field | Value |
+|---|---|
+| Runner name | vmss-runner-01 |
+| Labels | self-hosted, Linux, X64, vmss, ubuntu |
+| Status | Idle |
+
+This confirms the runner registered correctly and is reachable by GitHub, before pointing any real workflow at it.
+
+## Workflow Configuration
+
+Before this runner existed, the workflow used a GitHub-hosted runner, since that was the only option available.
+
+```yaml
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install
+      - run: npm test
+```
+
+To move this job onto the self-hosted runner, the `runs-on` value was changed to a list of labels matching what the runner was registered with.
+
+```yaml
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: [self-hosted, vmss, ubuntu]
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm install
+      - run: npm test
+```
+
+GitHub does not match on the runner's name at all. `runs-on: ubuntu-latest` is really just a special label that identifies a GitHub-hosted image, and `runs-on: [self-hosted, vmss, ubuntu]` works the same way: GitHub looks for a registered runner whose full set of labels is a superset of everything listed, and assigns the job to it. The runner name `vmss-runner-01` exists purely to identify the machine in the GitHub UI. It is never written anywhere in workflow YAML.
+
+## Workflow Execution Flow
+
+```
+Developer pushes code
+        |
+        v
+Workflow starts
+        |
+        v
+GitHub searches registered runners
+        |
+        v
+Runner labels matched against runs-on
+        |
+        v
+Job assigned to the matching runner
+        |
+        v
+Runner downloads repository contents
+        |
+        v
+Workflow steps execute on the runner
+        |
+        v
+Logs streamed back to the Actions tab
+        |
+        v
+Runner returns to idle, listening for the next job
+```
+
+## Challenges Faced
+
+| Issue | Cause | Resolution |
+|---|---|---|
+| SSH timeout | No inbound rule allowing TCP port 22 | Created an NSG rule allowing TCP 22 |
+| No public IP | VMSS was deployed with private IP addressing only | Assigned a public IP to each instance |
+| Runner group error | Runner name was entered at the runner group prompt | Used the default runner group, entered the name at the correct prompt |
+
+## Current Status
+
+| Task | Status |
+|---|---|
+| VMSS deployment | Complete |
+| SSH connectivity | Complete |
+| GitHub runner installed | Complete |
+| Runner registered | Complete |
+| Workflow ready | Complete |
+
+## Best Practices
+
+**Run the runner as a service, not a foreground process.** `./run.sh` only stays alive for as long as the terminal session that started it. Installing it as a systemd service with `sudo ./svc.sh install` followed by `sudo ./svc.sh start` keeps the runner alive across SSH disconnects and instance reboots.
+
+**Automate registration with cloud-init.** Manually SSHing into each instance to download, configure, and start the runner does not scale past a couple of instances. Cloud-init can run the entire installation and registration sequence automatically the first time an instance boots.
+
+**Use a custom VM image.** Baking the runner software and any required tooling into a custom image means new instances are ready to accept jobs immediately, instead of needing a provisioning script to run on every scale-out event.
+
+**Use managed identity instead of stored credentials.** If workflows running on this runner need to authenticate to other Azure resources, a system-assigned or user-assigned managed identity avoids putting any credentials on the machine at all.
+
+**Keep secrets in GitHub Secrets.** The registration token and any other sensitive values belong in GitHub Secrets, never hardcoded in a script or committed to the repository.
+
+**Avoid public IP addresses in production.** The public IP used here was a convenience for manual setup. A production runner should sit on a private IP only, reaching GitHub over outbound internet through a NAT gateway, with administrative access handled through a bastion host rather than direct SSH from the public internet.
+
+**Use private endpoints.** Any Azure resource the runner needs to reach, storage accounts, key vaults, container registries, should be reached through a private endpoint rather than a public one.
+
+## Production Improvements
+
+The current setup is a fixed pool of two manually provisioned instances, sufficient for validating the approach but not built for scale. A production version of this setup would include the following.
+
+**Azure VMSS autoscaling.** Scale-out and scale-in rules based on CPU usage or a custom metric, so the pool grows during periods of heavy workflow activity and shrinks back down during idle periods, instead of a fixed manual count.
+
+**Cloud-init.** Automates the entire installation and registration sequence at boot time, removing the need to SSH into every new instance by hand.
+
+**Custom Script Extension.** An alternative to cloud-init for running post-provisioning configuration, useful when the setup logic is more involved than a single startup script can comfortably express.
+
+**Runner Scale Sets.** GitHub's newer Actions Runner Controller model, which manages autoscaling runners on Kubernetes. Worth evaluating as a longer-term replacement for a VMSS-based approach for teams already running a Kubernetes cluster.
+
+**Azure Key Vault.** Storing the runner registration token and any workflow secrets centrally, retrieved by each instance at boot using its managed identity rather than being passed around in plain text.
+
+**Managed identity.** Removing long-lived credentials from the runner entirely for any Azure resource access it needs.
+
+**Private networking.** Moving the entire scale set behind a private subnet with no public IP addresses at all, reachable only through a bastion host for the rare occasions manual access is needed.
+
+## Summary
+
+A self-hosted GitHub Actions runner was deployed on an Azure Virtual Machine Scale Set, registered against the `vijay-anand-code/project1` repository, and configured with the labels `self-hosted`, `vmss`, and `ubuntu`. Along the way, two configuration issues came up and were resolved: an SSH timeout caused by a missing NSG rule, and a runner group error caused by entering the runner's intended name at the wrong prompt during registration. With the runner registered and idle, the workflow's `runs-on` value was updated from `ubuntu-latest` to the runner's label set, moving execution from a GitHub-hosted machine onto infrastructure the team controls directly. The current deployment is a fixed two-instance pool suitable for validating the setup, with autoscaling, cloud-init based provisioning, and private networking identified as the next steps toward a production-grade configuration.

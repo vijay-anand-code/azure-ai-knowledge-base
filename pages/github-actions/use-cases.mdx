@@ -34,12 +34,12 @@ update Container App revision (new version goes live)
 
 ### Running agent evaluations in CI
 
-When someone changes an agent's system prompt or tools, a workflow automatically runs the evaluation suite. If the eval score drops below a set threshold, the PR check fails — the change can't merge until the score recovers.
+When someone changes an agent's system prompt or tools, a workflow automatically runs the evaluation suite. If the eval score drops below a set threshold, the PR check fails, and the change can't merge until the score recovers.
 
 ### Controlled prod deployments
 
 <Callout type="warning">
-  Pushes to `main` deploy to nonprod automatically. For production, we use `workflow_dispatch` — someone has to manually click "run" in the Actions tab. That manual step is the human gate before anything hits production.
+  Pushes to `main` deploy to nonprod automatically. For production, we use `workflow_dispatch`, someone has to manually click "run" in the Actions tab. That manual step is the human gate before anything hits production.
 </Callout>
 
 ```yaml
@@ -55,7 +55,7 @@ on:
 
 ### Notifications to Teams or Slack
 
-Trigger a message whenever something specific happens — a new issue, a deployment, a failed build.
+Trigger a message whenever something specific happens: a new issue, a deployment, a failed build.
 
 ```yaml
 name: notify on failure
@@ -74,7 +74,7 @@ jobs:
         run: |
           curl -X POST "${{ secrets.TEAMS_WEBHOOK }}" \
           -H "Content-Type: application/json" \
-          -d '{"text": "Build failed on main — check the Actions tab"}'
+          -d '{"text": "Build failed on main, check the Actions tab"}'
 ```
 
 ### Scheduled jobs
@@ -112,7 +112,7 @@ jobs:
 
 Every PR now shows a green check or red X before anyone reviews it. Reviewers know at a glance whether the code even passes tests.
 
-### Matrix builds — test across multiple versions
+### Matrix builds: test across multiple versions
 
 Run the same job in parallel across different environments:
 
@@ -130,7 +130,7 @@ jobs:
       - run: npm test
 ```
 
-Three jobs run simultaneously — one per Node version. Useful when you need to make sure your code works across versions without running them one by one.
+Three jobs run simultaneously, one per Node version. Useful when you need to make sure your code works across versions without running them one by one.
 
 ---
 
@@ -138,6 +138,6 @@ Three jobs run simultaneously — one per Node version. Useful when you need to 
 
 Once you're comfortable with the basics here:
 
-- **Reusable workflows** — when the same job appears in multiple workflow files, extract it into a reusable workflow that other repos can call with `uses:`
-- **Environments and secrets** — store API keys and credentials securely in GitHub Settings → Secrets, reference them as `${{ secrets.MY_KEY }}`
-- **GitHub Marketplace** — always search before writing custom scripts. Most integrations (Slack, Azure, Docker, Jira) already exist as actions
+- **Reusable workflows**: when the same job appears in multiple workflow files, extract it into a reusable workflow that other repos can call with `uses:`
+- **Environments and secrets**: store API keys and credentials securely in GitHub Settings → Secrets, reference them as `${{ secrets.MY_KEY }}`
+- **GitHub Marketplace**: always search before writing custom scripts. Most integrations (Slack, Azure, Docker, Jira) already exist as actions

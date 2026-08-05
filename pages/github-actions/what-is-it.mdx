@@ -7,7 +7,7 @@ import { Callout } from 'nextra/components'
 
 # What is GitHub Actions?
 
-GitHub Actions automates the way you build, test, and deploy your code — directly from your GitHub repository. It's not a separate product. It's built into every repo, zero setup required.
+GitHub Actions automates the way you build, test, and deploy your code, directly from your GitHub repository. It's not a separate product. It's built into every repo, zero setup required.
 
 ---
 
@@ -15,7 +15,7 @@ GitHub Actions automates the way you build, test, and deploy your code — direc
 
 Imagine you work at a restaurant. Every time a new order comes in (event), the kitchen automatically starts cooking (workflow), different chefs handle different dishes in parallel (jobs), and each chef follows a recipe step by step (steps).
 
-GitHub Actions works exactly like that — but for your code.
+GitHub Actions works exactly like that, but for your code.
 
 - **Order comes in** = you push code to GitHub
 - **Kitchen starts cooking** = your workflow triggers
@@ -26,7 +26,7 @@ GitHub Actions works exactly like that — but for your code.
 
 ## The three core benefits
 
-### 1. Efficiency — automate the boring stuff
+### 1. Efficiency: automate the boring stuff
 
 Before GitHub Actions, every developer on the team had to manually run tests before merging. Someone would forget. Bugs would slip through. Deployments were done by hand and someone always got it slightly wrong.
 
@@ -35,15 +35,15 @@ With Actions, the moment you push code:
 - Build errors get caught immediately
 - Deployments happen the same way every single time
 
-### 2. It lives inside GitHub — no third-party tools
+### 2. It lives inside GitHub, no third-party tools
 
 Other CI/CD tools need a separate account, a separate dashboard, and separate credentials to manage. GitHub Actions is already inside your repo.
 
 The workflow files sit next to your code. They go through the same code review process. If someone has access to the repo, they can see the workflows. No extra logins, no extra tools.
 
-### 3. Custom workflows — you control exactly what happens
+### 3. Custom workflows: you control exactly what happens
 
-Simple pipeline or complex multi-environment deployment — you define it. The YAML file is the source of truth. If it's in the file, it runs. If it's not, it doesn't.
+Simple pipeline or complex multi-environment deployment, you define it. The YAML file is the source of truth. If it's in the file, it runs. If it's not, it doesn't.
 
 ---
 
@@ -61,7 +61,7 @@ Common ones you'll use on every project:
 | `actions/deploy-pages@v4` | Deploys the artifact to GitHub Pages |
 
 <Callout type="warning">
-  Always pin to a specific version like `@v4`. Never use `@latest`. If the action author releases a breaking change, your unpinned workflow breaks on the next run — and you won't know why until you check the logs.
+  Always pin to a specific version like `@v4`. Never use `@latest`. If the action author releases a breaking change, your unpinned workflow breaks on the next run, and you won't know why until you check the logs.
 </Callout>
 
 ---

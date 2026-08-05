@@ -1,6 +1,6 @@
 ---
 title: My first workflow file
-description: Checking out repo code and printing a file — the smallest complete workflow
+description: Checking out repo code and printing a file, the smallest complete workflow
 ---
 
 import { Callout, Steps } from 'nextra/components'
@@ -8,7 +8,7 @@ import FlowTracker from '../../components/FlowTracker'
 
 # My first workflow file
 
-This was my first hands-on workflow. It checks out the repo code and prints the contents of a text file. Simple — but it's enough to understand how every part connects.
+This was my first hands-on workflow. It checks out the repo code and prints the contents of a text file. Simple, but it's enough to understand how every part connects.
 
 ---
 
@@ -52,7 +52,7 @@ on:
     branches: [main]   # only triggers on pushes to main
 ```
 
-But for learning, `on: push` is fine — it fires on everything.
+But for learning, `on: push` is fine, it fires on everything.
 
 ---
 
@@ -70,7 +70,7 @@ The name of our job. This shows up in the Actions tab under the workflow run. Ca
 
 ### `runs-on: ubuntu-latest`
 
-Tells GitHub: spin up an Ubuntu Linux virtual machine for this job. It's a fresh machine with nothing on it — no code, no files, nothing from previous runs.
+Tells GitHub: spin up an Ubuntu Linux virtual machine for this job. It's a fresh machine with nothing on it. No code, no files, nothing from previous runs.
 
 `ubuntu-latest` always uses the most recent stable Ubuntu version GitHub supports. For most workflows, this is all you need.
 
@@ -94,7 +94,7 @@ Without this step, the next step (`cat hello_world.txt`) would fail because the 
 
 ### `run: echo "$(cat hello_world.txt)"`
 
-This runs a shell command directly on the runner — same as typing it in your terminal. `cat hello_world.txt` reads the file, `echo` prints it to the Actions log.
+This runs a shell command directly on the runner, same as typing it in your terminal. `cat hello_world.txt` reads the file, `echo` prints it to the Actions log.
 
 ---
 
@@ -118,7 +118,7 @@ You commit this file to `.github/workflows/hello-world.yml`
 
 ### Push triggers the workflow
 
-That commit is a push — so the workflow triggers immediately
+That commit is a push, so the workflow triggers immediately
 
 ### GitHub spins up a runner
 
@@ -149,11 +149,11 @@ You can watch every step live in the **Actions tab** of your repo.
 ## Common mistakes at this stage
 
 <Callout type="warning">
-  **Forgetting `checkout`** — If you skip the checkout step and try to read a file, you'll get a "file not found" error. The runner starts blank — your code isn't there until you explicitly check it out.
+  **Forgetting `checkout`**: if you skip the checkout step and try to read a file, you'll get a "file not found" error. The runner starts blank, your code isn't there until you explicitly check it out.
 </Callout>
 
 <Callout type="warning">
-  **Wrong indentation** — YAML is whitespace-sensitive. Two spaces per level, no tabs.
+  **Wrong indentation**: YAML is whitespace-sensitive. Two spaces per level, no tabs.
 
   This is wrong:
   ```yaml
