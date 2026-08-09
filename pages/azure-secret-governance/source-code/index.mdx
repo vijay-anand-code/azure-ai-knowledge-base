@@ -15,7 +15,7 @@ Azure Automation and the container files that power the monitoring API.
 | File | Schedule | What it does |
 |------|----------|-------------|
 | [runbook_discovery.py](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery) | Mon 00:00 | Scans all App Registrations, fetches owners in parallel, batch-writes to SharePoint |
-| [owner_sync_local.py](/azure-secret-governance/source-code/owner-sync-runbook/owner-sync-local) | Manual | Run locally from a laptop, adds `ManualAppOwners` identities as Entra owners |
+| [owner_sync_local.py](/azure-secret-governance/source-code/owner-sync-runbook/owner-sync-local) | Manual | Run locally from a laptop, adds `DevSecOpsOwnership` identities as Entra owners |
 | [runbook_monitoring.py](/azure-secret-governance/source-code/monitoring-runbook/runbook-monitoring) | Mon 00:30 | Triggers the monitoring container — fire and forget |
 | [runbook_rotation.py](/azure-secret-governance/source-code/rotation-runbook/runbook-rotation) | Mon 01:00 | Rotates P1/P2/P3 secrets, stores in Key Vault, updates Jira and SharePoint |
 

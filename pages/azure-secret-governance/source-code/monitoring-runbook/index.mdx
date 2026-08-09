@@ -5,12 +5,14 @@ description: Azure Automation Runbook that triggers the weekly monitoring cycle
 
 # Monitoring Runbook
 
-**File:** `runbook_monitoring.py`
+**File:** `runbook_monitoring.py` (on disk: `devsecops-secret-governance-monitor-langchain.py`)
 **Runtime:** Python 3.10 — Azure Automation Account
 **Schedule:** Weekly Monday 00:30
 
-Triggers the secret monitoring cycle with a POST to `AGENT_ENDPOINT`. In the current
-deployment this is pointed directly at Container 2, bypassing Container 1's LangChain agent,
-since a scheduled trigger needs no reasoning step and this avoids GPT-4o cost and rate limits.
+Triggers the secret monitoring cycle with a POST to `AGENT_ENDPOINT`, which points at Container
+1's `/run` endpoint. Container 1's LangChain agent picks up the instruction and calls its
+`run_secret_monitoring` tool, which forwards the actual work internally to Container 2's
+`/tools/run_secret_monitoring`. The runbook itself is a thin fire-and-forget trigger — the real
+classification, ticket, and alert logic all lives in Container 2's `decision_engine.py`.
 
 - [View source](/azure-secret-governance/source-code/monitoring-runbook/runbook-monitoring)

@@ -1,92 +1,109 @@
 ---
-title: owner_sync_local.py
-description: Local script that resolves ManualAppOwners identities and adds them as Entra owners
+title: devsecops-secret-governance-sync.py
+description: Local script that gates DevSecOpsOwnership on a ProductName allowlist and adds the resulting identity as an Entra owner
 ---
 
 import { Callout } from 'nextra/components'
 
-# owner_sync_local.py
+# devsecops-secret-governance-sync.py
 
-**Location:** `secret-governance-infra/runbooks/owner_sync_local.py`
+**Location:** `secret-governance-infra/devsecops-secret-governance-sync.py`
 
-**Runtime:** Python 3.10+, run locally from a laptop under the operator's own `az login`
-session, not Azure Automation
+**Runtime:** Python 3.10+, run locally from a laptop under the operator's own `az login` session,
+not Azure Automation
 
-**Schedule:** Manual, run whenever `ManualAppOwners` has changed
+**Schedule:** Manual, run whenever `ALLOWED-PRODUCT-NAMES` or a row's `ProductName` has changed
 
-**What it does:** Reads the `ManualAppOwners` column in `SecretAlertRegistry`. For every row
-where it's filled in (directly, or resolved from `ProductName`, see below), resolves that name
-to an Entra object ID and adds it as an owner on the matching App Registration, using the
-operator's own signed in session rather than any shared identity.
+**What it does:** For every active row in `SecretAlertRegistry` with a non-blank `TenantID`, sets
+`DevSecOpsOwnership` to the fixed identity `devsecops-secret-governance-monitor` if the row's
+`ProductName` is on the `ALLOWED-PRODUCT-NAMES` Key Vault allowlist, or clears it back to blank if
+not — overwriting whatever was there either way. For rows where the product is allowed, it also
+resolves that identity to an Entra object ID and adds it as a real owner on the matching App
+Registration, using the operator's own signed in session rather than any shared identity.
 
 ---
 
 ## Why this runs locally, not on a schedule
 
 Adding a new owner to an App Registration needs a Graph permission broader than anything else in
-this system holds. Granting that permission to the shared automation identity would mean every
-runbook sharing it could add ownership to any app in either tenant, unattended, with no single
-person accountable for it.
+this system holds. Prior versions (v1–v3) ran unattended on a schedule, using the UAMI federated to
+`CROSS_TENANT_APP_ID`. Granting that shared identity `Application.ReadWrite.All` to add owners
+meant every runbook sharing that one app registration (discovery, rotation, owner sync) gained
+standing, tenant-wide write over App Registration ownership — a permission-scope problem flagged
+before v3 was built.
 
-Running this step locally means the Entra write happens under a real person's own sign in,
-subject to whatever role and approval requirements already apply to that person, instead of a
-shared identity with no single owner behind it.
+v4 removed that entirely: no service principal, no federated credential, no
+`Application.ReadWrite.All` grant on the shared app registration anywhere in this script. It
+authenticates as you, using whatever `az login` session is already active. Every Entra write this
+script makes is attributed to your own individually-accountable account, subject to whatever role,
+Conditional Access, and MFA already govern you.
 
 ---
 
 ## What it does, step by step
 
-1. Reads every active row in `SecretAlertRegistry`
-2. If a row's `ManualAppOwners` is blank, checks `ProductName`, if that's filled in, resolves it
-   against a Key Vault secret and writes the result back into `ManualAppOwners` on that row, see
-   "ProductName lookup" below
-3. For each identifier now in `ManualAppOwners` (typed in directly, or just resolved from
-   `ProductName`), resolves it to an Entra object ID, see "Identifier resolution" below for the
-   exact order
-4. Adds the resolved identity as an owner on the matching App Registration, via
-   `POST /applications/{id}/owners/$ref`, using the credential for whichever tenant that
-   specific app actually lives in
-5. Skips identities already listed as owners, so re-running the script safely does nothing to
-   rows that already resolved correctly
+1. Confirms the tenant your current `az login` session is signed into, by decoding the `tid` claim
+   out of a Graph token (`get_current_cli_tenant()`)
+2. Reads every active row in `SecretAlertRegistry` (`AlertStatus` not one of `Rotated`, `Ignored`,
+   `Resolved`, `JiraClosed-Unverified`)
+3. Loads the `ALLOWED-PRODUCT-NAMES` allowlist from Key Vault once, up front, for the whole run —
+   this is a hard prerequisite, see the gate section below
+4. For every active row with a non-blank `TenantID`, syncs `DevSecOpsOwnership` to match whatever
+   the allowlist says it should be — see "The `DevSecOpsOwnership` gate" below
+5. For rows where the product is on the allowlist, resolves `devsecops-secret-governance-monitor`
+   to an Entra object ID (see "Identifier resolution" below) and adds it as an owner on the
+   matching App Registration, via `POST /applications/{id}/owners/$ref`, processing one tenant's
+   apps at a time
+6. Skips identities already listed as owners, so re-running the script safely does nothing to rows
+   that already resolved correctly
 
 ---
 
-## ProductName lookup
+## The `DevSecOpsOwnership` gate: `ALLOWED-PRODUCT-NAMES`
 
-This mirrors `decision_engine.py`'s monitoring-side `ProductName` lookup, but runs independently
-here, so this script doesn't depend on monitoring having already run and filled `ManualAppOwners`
-in first. If a row's `ManualAppOwners` is blank and its `ProductName` is filled in, the script
-looks up a Key Vault secret literally named after that product (a secret called `ProductA` for a
-row with `ProductName` `ProductA`) and, if found, writes its value directly into that row's
-`ManualAppOwners` column in SharePoint, then continues using that resolved value for the rest of
-this run, same as if it had been typed in directly.
+Before touching any row, the script loads a single Key Vault secret, `ALLOWED-PRODUCT-NAMES`
+(`get_allowed_product_names()`) — a comma-separated list of `ProductName` values, for example
+`nextechpm,nextechehr,nextechcrm`, case-folded into a set. This is a hard prerequisite: if
+`ROTATOR_KV_URL` wasn't supplied (so there's no Key Vault client to read it with), or the secret is
+missing or empty, the run aborts immediately with an error. It does not fall back to skipping just
+the ownership logic for that run.
+
+For every active row with a non-blank `TenantID`, the script then computes:
+
+- `product_is_allowed` — `ProductName` is non-blank and its case-folded value is in the allowlist
+- `desired_ownership` — the fixed string `devsecops-secret-governance-monitor` if
+  `product_is_allowed`, otherwise an empty string
+
+If the row's current `DevSecOpsOwnership` doesn't already equal `desired_ownership`, the script
+writes it via `write_devsecops_ownership()` — the only SharePoint write this script makes. That
+write touches `DevSecOpsOwnership` only; `ProductName` and `TenantID` are read-only here.
 
 <Callout type="warning">
-  This is different from monitoring's own version of the same lookup: monitoring's
-  `ProductName` resolution always overwrites `ManualAppOwners`, since `ProductName` is meant to
-  be the ongoing source of truth there. This script's version only runs when `ManualAppOwners`
-  is currently blank, it never overwrites a value someone (or monitoring) already set. If you
-  need to force a stale `ManualAppOwners` to re-resolve from `ProductName`, clear the column
-  first, either here or through monitoring.
+  This overwrites `DevSecOpsOwnership` unconditionally whenever it doesn't already match the
+  allowlist-derived value — it is **not** gated on the column currently being blank. A row with a
+  manually-typed `DevSecOpsOwnership` that isn't exactly `devsecops-secret-governance-monitor` gets
+  cleared if its `ProductName` isn't on the allowlist, or overwritten to
+  `devsecops-secret-governance-monitor` if it is. This is a real behavior change from an earlier
+  design (still described on some other pages in this doc set) where a per-`ProductName` Key Vault
+  secret resolved to an arbitrary, possibly comma-separated identity list, and was only ever
+  applied when `DevSecOpsOwnership` was blank. That design is gone from the current source — this
+  script now standardizes on one fixed owner identity gated by a single allowlist, and actively
+  keeps the column in sync with it on every row it can act on. If a row needs
+  `DevSecOpsOwnership` to hold something other than `devsecops-secret-governance-monitor` or blank,
+  keep its `ProductName` off `ALLOWED-PRODUCT-NAMES` — running this script will otherwise overwrite
+  it back to whichever of the two values the allowlist says it should be.
 </Callout>
 
-A `ProductName` with no matching Key Vault secret leaves `ManualAppOwners` blank, logged, not
-treated as an error, since a typo or an unregistered product shouldn't stop the rest of the run.
-This lookup reuses the same Key Vault client already built for reading `SHAREPOINT-SITE-ID` and
-the other config secrets, so it only works when `ROTATOR_KV_URL` was provided, if the script was
-configured entirely through plain environment variables instead, `ProductName` resolution is
-silently unavailable and rows depending on it are skipped like any other row with blank
-`ManualAppOwners`.
-
-This is the only SharePoint write this script makes. Every other write it performs is against
-Entra ID (adding owners); `ManualAppOwners` itself is otherwise only ever read.
+Entra owner work only happens for rows where `product_is_allowed` is true. A row that just had
+`DevSecOpsOwnership` cleared because its product isn't allowed gets no Entra call at all.
 
 ---
 
 ## Identifier resolution
 
-Each identifier in `ManualAppOwners` is resolved in this order, scoped strictly to the app's own
-tenant, resolution never falls through to a different tenant:
+`devsecops-secret-governance-monitor` — or, if `process_app()`'s input string ever contains commas
+again in a future change, each comma-separated piece of it — is resolved in this order, scoped
+strictly to the app's own tenant. Resolution never falls through to a different tenant:
 
 1. If the identifier contains an `@`, tries an exact user UPN match first
 2. Otherwise, tries an exact service principal `displayName` match
@@ -119,6 +136,17 @@ az login --tenant <tenant-id>
 
 It waits for the operator to run that in a separate terminal, then continues once confirmed.
 
+<Callout type="warning">
+  The script's own module docstring (in its v4.1 changelog) describes a single-tenant fallback:
+  if `TenantID` is blank on a row but exactly one tenant is configured in
+  `CROSS_TENANT_TENANT_IDS`, it claims the row falls back to that one tenant instead of being
+  skipped. The current `run()` implementation does not do this. It applies a strict rule instead —
+  a blank `TenantID` always means no SharePoint or Entra action for that row, `TenantID` is never
+  inferred or written, regardless of how many tenants are configured. Treat the code as
+  authoritative here; the docstring's fallback description is stale relative to what `run()`
+  actually does.
+</Callout>
+
 ---
 
 ## Key design decisions
@@ -126,12 +154,15 @@ It waits for the operator to run that in a separate terminal, then continues onc
 | Decision | Reason |
 |----------|--------|
 | Runs locally under the operator's own `az login` | Adding ownership needs a broader Graph permission than any shared identity in this system holds, see "Why this runs locally" above |
+| `DevSecOpsOwnership` gated on `ALLOWED-PRODUCT-NAMES`, loaded once per run | One Key Vault read up front instead of a per-row, per-product secret lookup — the allowlist is the single source of truth for which products get the monitor identity |
+| `DevSecOpsOwnership` always synced to match, not preserved when non-blank | Keeps the column an accurate reflection of the current allowlist, rather than accumulating stale manual entries — see the warning in the gate section above |
+| Fixed owner identity, `devsecops-secret-governance-monitor` | Replaces an earlier per-`ProductName` Key Vault secret lookup that could resolve to an arbitrary, possibly comma-separated identity list |
+| `ALLOWED-PRODUCT-NAMES` is a hard prerequisite | If it can't be loaded (no `ROTATOR_KV_URL`, or a missing/empty secret), the run aborts entirely rather than silently skipping the ownership logic |
 | Strictly scoped to the app's own tenant | Display names aren't guaranteed unique across tenants, resolving in the wrong one risks granting ownership in the wrong directory |
 | Groups apps by tenant, pauses between tenants | A single `az login` session can only be authenticated into one tenant at a time |
+| Blank `TenantID` always skipped | No SharePoint or Entra action; never inferred, despite what the module docstring's v4.1 changelog claims — see the callout above |
 | Already-owners skipped, not re-added | Re-running the script safely does nothing to rows that already resolved correctly |
 | Ambiguous matches add all of them, not gated | A deliberate, explicit behavior, see the warning callout above |
-| `ProductName` lookup, only when `ManualAppOwners` is blank | Lets this script resolve ownership on its own without depending on monitoring having already run, but never overwrites a value that's already set, unlike monitoring's always-overwrite version of the same lookup |
-| `ManualAppOwners` otherwise read-only | Never cleared by this script. The only write it ever makes to that column is the one described above, resolving a blank value from `ProductName` |
 | No Jira ticket filed for any outcome | Success, failure, and ambiguous matches are all visible only in that run's own printed summary |
 
 ---
@@ -141,6 +172,11 @@ It waits for the operator to run that in a separate terminal, then continues onc
 - `az login`, signed in as yourself, before running the script
 - Your account needs sufficient Entra permission to add owners on the apps involved, ideally a
   PIM-activated role rather than something held standing
+- `pip install azure-identity azure-keyvault-secrets tzdata` — `tzdata` is required on Windows,
+  since `zoneinfo` has no OS-level timezone database to read there, unlike Linux/macOS. A missing
+  `tzdata` package isn't fatal: the script's own console-only timestamp just falls back to plain
+  UTC. That timestamp is never written to SharePoint, it only appears in this script's own printed
+  output
 
 ---
 
@@ -152,8 +188,16 @@ az login
 
 ```powershell
 $env:ROTATOR_KV_URL = "<YOUR_KEY_VAULT_URL>"
-python owner_sync_local.py
+python devsecops-secret-governance-sync.py
 ```
+
+<Callout type="info">
+  `ROTATOR_KV_URL` is effectively required now, even though `SHAREPOINT_SITE_ID` /
+  `SHAREPOINT_LIST_ID` / `CROSS_TENANT_TENANT_IDS` can still be supplied directly as plain
+  environment variables instead of through Key Vault. `ALLOWED-PRODUCT-NAMES` has no
+  environment-variable equivalent — it can only be read from Key Vault — so without
+  `ROTATOR_KV_URL` the run aborts as soon as it tries to load the allowlist.
+</Callout>
 
 ---
 
@@ -164,6 +208,7 @@ python owner_sync_local.py
 | `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
 | `SHAREPOINT-LIST-ID` | `SecretAlertRegistry` list ID |
 | `CROSS-TENANT-TENANT-IDS` | Comma separated tenant IDs to check for matching apps. Falls back to the older singular `CROSS-TENANT-TENANT-ID` if not set |
+| `ALLOWED-PRODUCT-NAMES` | Comma-separated allowlist of `ProductName` values eligible for the `devsecops-secret-governance-monitor` owner. Required — the run aborts if this can't be loaded |
 
 ---
 
@@ -171,9 +216,9 @@ python owner_sync_local.py
 
 ```python
 """
-owner_sync_local.py — LOCAL SCRIPT (v4.1 — Run From Your Laptop, Not Azure Automation)
+devsecops-secret-governance-sync.py — LOCAL SCRIPT (v4.1 — Run From Your Laptop, Not Azure Automation)
 =========================================================================================
-Purpose : Reads the ManualAppOwners column in SharePoint SecretAlertRegistry and
+Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry and
           adds the named identity(ies) as owners directly on the matching App
           Registration in Entra ID — using YOUR OWN signed-in `az login` session,
           not a shared managed identity or app registration.
@@ -197,7 +242,7 @@ Purpose : Reads the ManualAppOwners column in SharePoint SecretAlertRegistry and
           CHANGES IN v4.1 (fixing the "Apps Checked: 0 / Apps Skipped: 243"
           issue seen on first real run):
             - v4 silently lumped THREE different skip reasons (blank ObjectID,
-              blank ManualAppOwners, blank/unrecognised TenantID) into one
+              blank DevSecOpsOwnership, blank/unrecognised TenantID) into one
               counter with no way to tell which one actually fired. v4.1 tracks
               each reason separately and prints a breakdown, so a
               misconfigured or blank column is diagnosable from the summary
@@ -306,6 +351,8 @@ ROTATOR_KV_URL = os.environ.get("ROTATOR_KV_URL", "")
 SKIP_STATUSES = {"Rotated", "Ignored", "Resolved", "JiraClosed-Unverified"}
 RETRY_MAX     = 3
 RETRY_BACKOFF = 2.0
+ALLOWED_PRODUCT_NAMES_SECRET = "ALLOWED-PRODUCT-NAMES"
+DEVSECOPS_MONITOR_OWNER = "devsecops-secret-governance-monitor"
 
 
 def _fail_config(name: str) -> None:
@@ -322,7 +369,7 @@ def get_config_from_keyvault(vault_url: str) -> None:
     from azure.keyvault.secrets import SecretClient
     cred = AzureCliCredential()
     kv = SecretClient(vault_url=vault_url, credential=cred)
-    _kv_client = kv  # kept for the ProductName lookup below, reused rather than rebuilt per call
+    _kv_client = kv  # reused to load the ProductName allowlist
     SHAREPOINT_SITE_ID = kv.get_secret("SHAREPOINT-SITE-ID").value
     SHAREPOINT_LIST_ID = kv.get_secret("SHAREPOINT-LIST-ID").value
     try:
@@ -347,30 +394,36 @@ if not CROSS_TENANT_TENANT_IDS:
 
 print(f"Configured tenants: {CROSS_TENANT_TENANT_IDS}")
 
-def get_product_service_principal(product_name: str) -> str | None:
+def get_allowed_product_names() -> set[str]:
     """
-    Mirrors main.py's get_product_service_principal() (container 2), so this
-    script can resolve a row's ProductName into a managed identity name on
-    its own, without depending on monitoring having already run and filled
-    in ManualAppOwners first. Looks up a Key Vault secret literally named
-    after product_name and returns its value, or None if no such secret
-    exists (or this script wasn't given ROTATOR_KV_URL at all, so no client
-    is available to look anything up with).
+    Reads a comma-separated ProductName allowlist from Key Vault.
 
-    A missing secret is NOT an error — it's expected whenever ProductName
-    has a typo or names a product that hasn't been registered in Key Vault
-    yet, so this returns None rather than raising, letting the caller decide
-    what to do (leave ManualAppOwners as-is).
+    Example:
+    nextechpm,nextechehr,nextechcrm
     """
     if _kv_client is None:
-        return None
-    try:
-        return _kv_client.get_secret(product_name).value
-    except Exception as e:
-        log.info("get_product_service_principal: no Key Vault secret found for "
-                 "product %r (or lookup failed): %s", product_name, e)
-        return None
+        raise RuntimeError(
+            "ROTATOR_KV_URL is required because the ProductName allowlist "
+            "must be loaded from Key Vault."
+        )
 
+    raw_value = _kv_client.get_secret(
+        ALLOWED_PRODUCT_NAMES_SECRET
+    ).value
+
+    allowed_products = {
+        value.strip().casefold()
+        for value in raw_value.split(",")
+        if value.strip()
+    }
+
+    if not allowed_products:
+        raise RuntimeError(
+            f"Key Vault secret {ALLOWED_PRODUCT_NAMES_SECRET!r} "
+            "contains no allowed ProductName values."
+        )
+
+    return allowed_products
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH — YOUR az login session.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -460,22 +513,32 @@ def _patch_retry(url: str, body: dict, timeout: int = 30) -> dict:
     hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
     return _http_with_retry("PATCH", url, hdrs, body, timeout)
 
-def write_manual_app_owners(item_id: str, resolved_value: str) -> dict:
+def write_devsecops_ownership(item_id: str, ownership_value: str) -> dict:
     """
-    Writes a ProductName-resolved value back into ManualAppOwners on a
-    SharePoint row, permanently — so the next time this row is read (by
-    this script, by monitoring, by anything else), ManualAppOwners already
-    has the value, and the ProductName lookup doesn't need to happen again
-    for this row. This is the ONLY write this script makes to SharePoint —
-    everything else it does writes to Entra (adding owners), never here.
+    Updates ONLY DevSecOpsOwnership.
+
+    ProductName is read-only.
+    TenantID is read-only.
+    No other SharePoint business field is included in the write.
     """
-    url = (f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
-           f"/lists/{SHAREPOINT_LIST_ID}/items/{item_id}")
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_LIST_ID}/items/{item_id}"
+    )
+
     try:
-        _patch_retry(url, {"fields": {"ManualAppOwners": resolved_value}}, timeout=20)
+        _patch_retry(
+            url,
+            {
+                "fields": {
+                    "DevSecOpsOwnership": ownership_value,
+                }
+            },
+            timeout=20,
+        )
         return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Read active SharePoint rows
@@ -616,11 +679,11 @@ def process_app(app_object_id: str, app_name: str, manual_owners_str: str) -> di
 def run() -> dict:
     summary: dict[str, Any] = {
         "rowsScanned": 0, "appsChecked": 0,
-        "skippedBlankObjectId": 0, "skippedBlankManualOwners": 0,
+        "skippedBlankObjectId": 0,
         "skippedBlankTenant": 0, "skippedTenantNotConfigured": 0,
         "ownersAdded": 0, "ownersAlready": 0, "ownersFailed": 0,
         "unresolved": 0, "ambiguousCount": 0,
-        "productLookupsApplied": 0, "productLookupsNotFound": 0,
+        "ownershipAssigned": 0, "ownershipCleared": 0,
         "changes": [], "ambiguousDetail": [], "unresolvedDetail": [], "errors": [],
     }
 
@@ -628,18 +691,26 @@ def run() -> dict:
     try:
         current_tenant = get_current_cli_tenant()
         print(f"  Currently signed into tenant: {current_tenant}\n")
-    except Exception as e:
-        print(f"\nCould not get a token from your az login session: {e}")
+    except Exception as exc:
+        print(f"\nCould not get a token from your az login session: {exc}")
         print("Run `az login` first, then re-run this script.")
         sys.exit(1)
 
     active_rows = get_active_sp_rows()
     summary["rowsScanned"] = len(active_rows)
+
     if not active_rows:
         print("No active rows — nothing to sync.")
         return summary
 
-    single_tenant_fallback = CROSS_TENANT_TENANT_IDS[0] if len(CROSS_TENANT_TENANT_IDS) == 1 else None
+    try:
+        allowed_product_names = get_allowed_product_names()
+    except Exception as exc:
+        summary["errors"].append(
+            f"Could not load {ALLOWED_PRODUCT_NAMES_SECRET} from Key Vault: {exc}"
+        )
+        return summary
+            
 
     apps: dict[str, dict] = {}
     for item in active_rows:
@@ -647,61 +718,96 @@ def run() -> dict:
         item_id       = item.get("id")
         object_id     = f.get("ObjectID", "")
         app_name      = f.get("AppName", "Unknown")
-        tenant_id     = (f.get("TenantID") or "").strip()
-        manual_owners = (f.get("ManualAppOwners") or "").strip()
+        tenant_id = (f.get("TenantID") or "").strip()
+        product_name = (f.get("ProductName") or "").strip()
+        current_ownership = (f.get("DevSecOpsOwnership") or "").strip()
+        
+        # Strict rule: a blank TenantID means no SharePoint or Entra action.
+        # TenantID is never inferred or written.
+        if not tenant_id:
+            summary["skippedBlankTenant"] += 1
+            log.info(
+                "Skipping %s because TenantID is blank. "
+                "No SharePoint fields or Entra ownership will be changed.",
+                app_name,
+            )
+            continue
 
-        # ProductName lookup — mirrors decision_engine.py's monitoring-side
-        # lookup, but runs independently here, so this script doesn't depend
-        # on monitoring having already run and filled ManualAppOwners in
-        # first. Only attempted if ManualAppOwners is currently blank — if
-        # it's already set (by a person directly, or by monitoring earlier),
-        # that value is left alone and ProductName is not consulted at all.
-        if not manual_owners:
-            product = (f.get("ProductName") or "").strip()
-            if product:
-                resolved = get_product_service_principal(product)
-                if resolved:
-                    write_result = write_manual_app_owners(item_id, resolved)
-                    if write_result.get("success"):
-                        manual_owners = resolved
-                        summary["productLookupsApplied"] = summary.get("productLookupsApplied", 0) + 1
-                        print(f"  Resolved ProductName {product!r} -> ManualAppOwners "
-                              f"{resolved!r} for {app_name}, written back to SharePoint")
-                    else:
-                        summary["errors"].append(
-                            f"Failed to write ManualAppOwners for {app_name} "
-                            f"(ProductName={product!r}): {write_result.get('error')}")
-                else:
-                    summary["productLookupsNotFound"] = summary.get("productLookupsNotFound", 0) + 1
-                    log.info("ProductName %r for %s has no matching Key Vault secret — "
-                            "ManualAppOwners left blank", product, app_name)
+        # ProductName is only eligible when it is nonblank and appears in the
+        # Key Vault allowlist. Everything else must have blank ownership.
+        product_is_allowed = (
+            bool(product_name)
+            and product_name.casefold() in allowed_product_names
+        )
 
-        if not manual_owners:
-            continue  # not an error — most rows legitimately have no manual entry
+        desired_ownership = (
+            DEVSECOPS_MONITOR_OWNER
+            if product_is_allowed
+            else ""
+        )
+        # This is the only SharePoint mutation in the script. It touches only
+        # DevSecOpsOwnership, and only when the current value differs from the
+        # exact required value.
+        if current_ownership != desired_ownership:
+            write_result = write_devsecops_ownership(
+                item_id,
+                desired_ownership,
+            )
 
+            if not write_result.get("success"):
+                summary["errors"].append(
+                    f"Failed to update DevSecOpsOwnership for {app_name} "
+                    f"(ProductName={product_name!r}): "
+                    f"{write_result.get('error')}"
+                )
+                continue
+
+            if desired_ownership:
+                summary["ownershipAssigned"] += 1
+                log.info(
+                    "Set DevSecOpsOwnership=%r for %s because ProductName=%r is allowed.",
+                    desired_ownership,
+                    app_name,
+                    product_name,
+                )
+            else:
+                summary["ownershipCleared"] += 1
+                log.info(
+                    "Cleared DevSecOpsOwnership for %s because ProductName=%r is blank "
+                    "or is not in the Key Vault allowlist.",
+                    app_name,
+                    product_name,
+                )
+        # Do not perform Entra owner work for blank or unapproved ProductName.
+        if not product_is_allowed:
+            continue
+
+        manual_owners = DEVSECOPS_MONITOR_OWNER
         if not object_id:
             summary["skippedBlankObjectId"] += 1
-            log.warning("Row %s has ManualAppOwners set but blank ObjectID — cannot act on it.", app_name)
+            log.warning(
+                "Row %s has an allowed ProductName but blank ObjectID — "
+                "skipping Entra owner sync.",
+                app_name,
+            )
             continue
 
-        if not tenant_id:
-            if single_tenant_fallback:
-                tenant_id = single_tenant_fallback
-                log.info("Row %s has blank TenantID — only one tenant configured (%s), using it.",
-                         app_name, tenant_id)
-            else:
-                summary["skippedBlankTenant"] += 1
-                log.warning("Row %s has ManualAppOwners set but blank TenantID, and multiple "
-                            "tenants are configured — cannot safely guess which one. Skipping.",
-                            app_name)
-                continue
-        elif tenant_id not in CROSS_TENANT_TENANT_IDS:
+        if tenant_id not in CROSS_TENANT_TENANT_IDS:
             summary["skippedTenantNotConfigured"] += 1
-            log.warning("Row %s has TenantID=%s, not in configured CROSS_TENANT_TENANT_IDS=%s — skipping.",
-                        app_name, tenant_id, CROSS_TENANT_TENANT_IDS)
+            log.warning(
+                "Row %s has TenantID=%s, not in configured "
+                "CROSS_TENANT_TENANT_IDS=%s — skipping Entra owner sync.",
+                app_name,
+                tenant_id,
+                CROSS_TENANT_TENANT_IDS,
+            )
             continue
 
-        apps.setdefault(tenant_id, {})[object_id] = {"app_name": app_name, "manual_owners": manual_owners}
+        apps.setdefault(tenant_id, {})[object_id] = {
+            "app_name": app_name,
+            "manual_owners": DEVSECOPS_MONITOR_OWNER,
+        }
+
 
     summary["appsChecked"] = sum(len(v) for v in apps.values())
 
@@ -755,19 +861,25 @@ def main():
     print("=" * 60)
     print(f"  Total Runtime      : {elapsed:.1f}s")
     print(f"  SP Rows Scanned    : {summary['rowsScanned']}")
-    print(f"  Apps Checked       : {summary['appsChecked']}  (non-blank ManualAppOwners, usable)")
-    print(f"  ProductName Resolved : {summary.get('productLookupsApplied', 0)}  (ManualAppOwners filled in from a Key Vault product lookup)")
-    print(f"  ProductName Not Found: {summary.get('productLookupsNotFound', 0)}  (no matching Key Vault secret for that product name)")
+    print(
+        f"  Apps Checked       : {summary['appsChecked']} "
+        "(allowed ProductName, valid TenantID and ObjectID)"
+    )
+    print(f"  Ownership Assigned : {summary['ownershipAssigned']}")
+    print(f"  Ownership Cleared  : {summary['ownershipCleared']}")
     print(f"  Owners Added       : {summary['ownersAdded']}")
     print(f"  Already in Entra   : {summary['ownersAlready']}")
     print(f"  Failed             : {summary['ownersFailed']}")
     print(f"  Unresolved         : {summary['unresolved']}")
     print(f"  Ambiguous          : {summary['ambiguousCount']}")
 
-    skip_total = (summary['skippedBlankObjectId'] + summary['skippedBlankManualOwners']
-                  + summary['skippedBlankTenant'] + summary['skippedTenantNotConfigured'])
+    skip_total = (
+        summary["skippedBlankObjectId"]
+        + summary["skippedBlankTenant"]
+        + summary["skippedTenantNotConfigured"]
+    )
     if skip_total:
-        print(f"\n  Skipped rows with ManualAppOwners set but unusable ({skip_total}):")
+        print(f"\n  Skipped rows for Entra owner sync ({skip_total}):")
         if summary['skippedBlankObjectId']:
             print(f"    Blank ObjectID              : {summary['skippedBlankObjectId']}")
         if summary['skippedBlankTenant']:

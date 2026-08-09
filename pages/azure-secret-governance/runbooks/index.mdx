@@ -14,7 +14,7 @@ one-time cleanup tools, used when resetting the SharePoint lists back to empty.
 | Runbook | Where it runs | Schedule |
 |---------|--------------|----------|
 | `runbook_discovery.py` | Azure Automation | Weekly, `00:00` |
-| `owner_sync_local.py` | A laptop, under the operator's own signed in session | Manual, run whenever `ManualAppOwners` has changed |
+| `owner_sync_local.py` | A laptop, under the operator's own signed in session | Manual, run whenever `DevSecOpsOwnership` has changed |
 | `runbook_owner_sync.py` | Azure Automation | Not scheduled by default, ticket-based alternative to the local script |
 | `runbook_monitoring.py` | Azure Automation | Weekly, `00:30` |
 | `runbook_rotation.py` | Azure Automation | Weekly, `01:00` |
@@ -76,8 +76,9 @@ SharePoint. This is the only runbook that ever creates a new row for a secret.
    meant to be checked against a manual count from the Entra command line
 
 <Callout type="info">
-  `ManualAppOwners` is the one column this runbook never writes to, on either a new row or an
-  existing one. Whatever a person has typed into that column stays exactly as they left it.
+  `DevSecOpsOwnership` (renamed from `ManualAppOwners`) is the one column this runbook never
+  writes to, on either a new row or an existing one. Whatever a person has typed into that column
+  stays exactly as they left it.
 </Callout>
 
 ### Required Key Vault secrets
@@ -90,7 +91,7 @@ SharePoint. This is the only runbook that ever creates a new row for a secret.
 
 ## owner_sync_local.py
 
-Reads `ManualAppOwners` and adds the named identity as an Entra owner on the matching App
+Reads `DevSecOpsOwnership` and adds the named identity as an Entra owner on the matching App
 Registration. This runbook does not run on the Automation Account at all. It is a plain Python
 script, run from a laptop, under the operator's own signed in session.
 
@@ -125,7 +126,7 @@ az login --tenant <tenant-id>
 Run that in a second terminal, then return to the first and press Enter to continue.
 
 <Callout type="warning">
-  If a name typed into `ManualAppOwners` matches more than one object in a tenant, for example
+  If a name typed into `DevSecOpsOwnership` matches more than one object in a tenant, for example
   two service principals with the same display name, the script adds all of them as owners and
   logs it clearly as ambiguous. It does not file a ticket or otherwise gate this. Check the
   summary output after every run for an ambiguous match, since this is the one place a typo or a
@@ -138,7 +139,7 @@ Run that in a second terminal, then return to the first and press Enter to conti
 
 An alternative to the local script, meant for environments where running a script from a
 laptop is not workable. Instead of writing to Entra directly, it detects the gap between
-`ManualAppOwners` and Entra's actual owner list, and files a Jira ticket per gap containing the
+`DevSecOpsOwnership` and Entra's actual owner list, and files a Jira ticket per gap containing the
 exact command a person with the right role needs to run. It holds no write permission to Entra
 at all, by design, so it cannot make the change itself under any circumstance.
 
@@ -155,28 +156,49 @@ the background and can take several minutes across a large tenant.
 
 ### What the monitoring cycle actually does
 
-1. Fetches every App Registration's secrets, across every configured tenant
-2. Reads `SecretAlertRegistry`
+1. Fetches every App Registration's secrets, across every configured tenant, and reads
+   `SecretAlertRegistry`
+2. Backs up both `SecretAlertRegistry` and `IgnoredSecretRegistry` — archiving whatever was
+   previously in each backup list to Storage as CSV first, then writing a fresh snapshot, then
+   deleting the old backup rows. This runs before anything else touches either list. If backup
+   fails, the whole run aborts without touching anything further. See the
+   [SharePoint Setup](/azure-secret-governance/sharepoint) page for the exact ordering
 3. For any row with `ProductName` filled in, looks up a Key Vault secret named exactly after
-   that product and writes its value into `ManualAppOwners` for that row, always overwriting
+   that product and writes its value into `DevSecOpsOwnership` for that row, always overwriting
    whatever was there. A `ProductName` with no matching secret just leaves the row as-is
 4. For any secret that's new to SharePoint and matches an existing row's `NewSecretKeyId` (meaning
    it's the freshly-rotated replacement for that row), copies `TeamName`, `ProductName`, and
-   `ProductTeamkeyVaultName` from that parent row automatically, see "Lineage tracking" on the
-   `decision_engine.py` source page
-5. For any app where `ManualAppOwners` is filled in on at least one row (directly, from the
+   `ProductTeamsKeyVaultName` from that parent row automatically, see "Lineage tracking" on the
+   `decision_engine.py` source page — **note:** the current code actually writes this last field
+   under the misspelled column name `ProductTeamkeyVaultName` (missing the "s"), a real bug; see
+   the warning on the [SharePoint Setup](/azure-secret-governance/sharepoint) page
+5. For any app where `DevSecOpsOwnership` is filled in on at least one row (directly, from the
    `ProductName` lookup, or from a lineage copy above), copies that value onto every other row
    belonging to the same app that does not have it yet
-6. Filters to only the secrets whose app has `ManualAppOwners` set. Everything else is skipped
-   entirely
+6. Re-stamps `AppOwners`, `TenantID`, and `ObjectID` from live Entra data on every row it touches,
+   not just at first discovery
 7. For P1, P2, and P3, and for ExpiredManualReview, raises a Jira ticket if one does not already
-   exist
+   exist — this fires on severity/bucket alone now, regardless of whether `DevSecOpsOwnership` is
+   set. An app with no ownership set still gets tickets and alerts; ownership no longer gates
+   ticket/alert creation, only whether monitoring keeps actively working the row afterward (see
+   the note below)
 8. For P1 and P2, also sends a Teams alert. Within P1, the 0 to 3 day half tags a specific
    person, read from `TEAMS-TAG-EMAIL` in Key Vault, the 4 to 7 day half does not
 9. For secrets that have crossed 8 days expired, checks whether there is still a live Jira
    ticket before deciding what to do. See the abandonment check below
 10. Updates SharePoint with the current bucket, notice text, and last checked date for every
     secret it processed
+
+<Callout type="warning">
+  An earlier version of this system gated ticket and Teams alert creation on `DevSecOpsOwnership`
+  (then `ManualAppOwners`) being set, and step 6 above used to read "filters to only secrets whose
+  app has ownership set — everything else is skipped." That gate has been removed, per an explicit
+  client requirement: severity alone now decides whether a ticket or Teams alert gets raised, for
+  both brand-new and existing rows. `DevSecOpsOwnership` being blank no longer blocks self-heal,
+  escalation, or first-time ticket creation in monitoring — it's tracked only as an informational
+  count. Rotation is a separate story: it still will not touch a secret whose app has no
+  `DevSecOpsOwnership` set.
+</Callout>
 
 ### The 8 day abandonment check
 
@@ -193,21 +215,25 @@ would risk hiding a secret someone is actively rotating right now. The actual de
 ### Required Key Vault secrets
 
 `GRAPH-TENANT-ID`, `HOME-TENANT-ID`, `SHAREPOINT-SITE-ID`, `SHAREPOINT-LIST-ID`,
-`SHAREPOINT-IGNORED-LIST-ID`, `CROSS-TENANT-APP-ID`, `CROSS-TENANT-TENANT-IDS`, `JIRA-BASE-URL`,
+`SHAREPOINT-IGNORED-LIST-ID`, `SHAREPOINT-BACKUP-LIST-ID`, `SHAREPOINT-IGNORED-BACKUP-LIST-ID`,
+`CROSS-TENANT-APP-ID`, `CROSS-TENANT-TENANT-IDS`, `JIRA-BASE-URL`,
 `JIRA-API-TOKEN`, `JIRA-USER-EMAIL`, `JIRA-PROJECT-KEY`, `JIRA-ISSUE-TYPE`,
-`TEAMS-WEBHOOK-URL`, `TEAMS-TAG-EMAIL`
+`TEAMS-WEBHOOK-URL`, `TEAMS-TAG-EMAIL`, `BACKUP-STORAGE-ACCOUNT-URL` (optional — archival only)
 
 <Callout type="warning">
   `OWNER-EMAILS` and the older singular `OWNER-EMAIL` are not used to decide which secrets get
-  monitored anymore. If a secret is not getting alerts or tickets and you expect it to, check
-  `ManualAppOwners` on that app's row first. That is the actual gate now.
+  monitored anymore, and neither is `DevSecOpsOwnership` (renamed from `ManualAppOwners`) —
+  tickets and Teams alerts now fire on bucket/severity alone. If a secret is not getting alerts or
+  tickets and you expect it to, ownership is not the first thing to check anymore; look at its
+  bucket and whether a Jira ticket already exists instead. `DevSecOpsOwnership` still matters for
+  rotation, see below.
 </Callout>
 
 ---
 
 ## runbook_rotation.py
 
-Rotates secrets automatically for P1 through P3 apps, once `ManualAppOwners` is set. P4 (61+
+Rotates secrets automatically for P1 through P3 apps, once `DevSecOpsOwnership` is set. P4 (61+
 days, safe) is never rotation eligible.
 
 ### What it does, step by step
@@ -215,8 +241,9 @@ days, safe) is never rotation eligible.
 1. Reads `SecretAlertRegistry`, filtered to rows in an actionable status
 2. Checks any row already marked `RotatedPendingDeployment`. If its Jira ticket is now closed,
    marks the row `Rotated`
-3. Filters remaining candidates to only apps where `ManualAppOwners` is set, the same gate
-   monitoring uses
+3. Filters remaining candidates to only apps where `DevSecOpsOwnership` is set. Unlike
+   monitoring's ticket/alert creation, which now fires on severity alone regardless of ownership,
+   rotation still will not touch a secret until its app's ownership is set
 4. For each remaining candidate in P1 through P3 within the rotation threshold, calls
    `addPassword` on the App Registration, using the credential for whichever tenant that app
    actually lives in
@@ -224,7 +251,7 @@ days, safe) is never rotation eligible.
    lands as a new version of the same entry), otherwise generates one from
    `ProductName-TeamName-AppName` and writes it back for future rotations to reuse
 6. Stores the new secret value in the rotation Key Vault, unless the row's
-   `ProductTeamkeyVaultName` is filled in, in which case the value goes into that specifically
+   `ProductTeamsKeyVaultName` is filled in, in which case the value goes into that specifically
    named vault instead (the URL is derived by appending the standard Key Vault suffix)
 7. Adds a Jira comment with the new key ID, expiry date, and Key Vault reference
 8. Marks the row `RotatedPendingDeployment`, waiting for a person to deploy the new value and
@@ -338,9 +365,10 @@ under the runbook's own Schedules tab:
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| A secret never gets a ticket or alert | `ManualAppOwners` is blank for that app | Fill it in on any one row for the app, monitoring copies it to the rest automatically on the next run |
+| A secret never gets a ticket or alert | The secret is in bucket P4 (safe) — the only bucket that never gets one — or it's an unrecognized/unparseable expiry date | Check `ExpiryBucket` on the row. Tickets and Teams alerts fire on severity alone now, not on `DevSecOpsOwnership` |
+| A secret gets tickets/alerts but rotation never touches it | `DevSecOpsOwnership` is blank for that app | Fill it in on any one row for the app (directly, or via `ProductName`), monitoring propagates it to the rest automatically on the next run, and rotation only acts once it's set |
 | Discovery reconciliation totals do not match | A write failed partway through | Check the run's error list, the summary always prints total apps and secrets seen, separate from what actually got written |
 | Backup rows look wrong or missing | Check whether the backup was written before or after the purge | The backup step always writes this run's snapshot first, then deletes the previous run's rows. A number that looks low is usually the previous run's smaller starting count, not a bug |
-| A Jira status change does not reach SharePoint | The automation rule's trigger list is missing that status | See the Jira automation page, the trigger needs to watch all six real statuses |
-| Rotation skips a secret that looks eligible | `ManualAppOwners` is blank, or the secret's bucket is P4 | P4 (61+ days, safe) is never rotation eligible by design. Everything else needs `ManualAppOwners` set |
+| A Jira status change does not reach SharePoint | The automation rule's trigger list is missing that status | See the Jira automation page — the live KAN project workflow has four real statuses (To Do, In Progress, Waiting for Customer, Resolved), the trigger needs to watch all four |
+| Rotation skips a secret that looks eligible | `DevSecOpsOwnership` is blank, or the secret's bucket is P4 | P4 (61+ days, safe) is never rotation eligible by design. Everything else needs `DevSecOpsOwnership` set |
 | Secrets from only one tenant show up | `CROSS-TENANT-TENANT-IDS` is missing a tenant, or still set to the old singular `CROSS-TENANT-TENANT-ID` with only one value | Set the plural secret with every tenant ID, comma separated |

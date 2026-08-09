@@ -1,6 +1,6 @@
 ---
 title: Container 1 - LangChain Agent
-description: Public container hosting the LangChain GPT-4o agent and Teams bot
+description: Public container hosting the LangChain GPT-4o agent and (currently disabled) Teams bot
 ---
 
 # Container 1 - LangChain Agent
@@ -9,5 +9,5 @@ description: Public container hosting the LangChain GPT-4o agent and Teams bot
 
 | File | Purpose |
 |------|---------|
-| [main.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-main) | FastAPI app — LangChain agent, tool definitions, all endpoints |
-| [teams_bot.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-teams-bot) | Standalone Teams Bot module |
+| [main.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-main) | FastAPI app — LangChain agent, tool definitions, `/run`, `/chat`, and the `/jira-status-update` proxy to Container 2 |
+| [teams_bot.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-teams-bot) | Standalone Teams Bot module — currently commented out in `main.py`, so it is not wired into the running app in this deployment |

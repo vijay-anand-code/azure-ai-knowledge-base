@@ -62,9 +62,9 @@ Create a custom list named exactly `SecretAlertRegistry`. Add these columns:
 | `ExpiryNotice` | Single line of text | Human readable notice text, refreshed every run |
 | `AlertStatus` | Single line of text | See the status lifecycle below |
 | `AppOwners` | Single line of text | Re-stamped from live Entra data on every row monitoring touches, not just at first discovery. Reference only, does not gate anything |
-| `DevSecOpsOwnership` | Single line of text | The actual gate. Filled in one of three ways: directly by a person; by `decision_engine.py`'s `get_product_service_principal()`, which looks up any `ProductName` as a Key Vault secret name with no allowlist gate; or by the local `sync.py` script, which gates through an `ALLOWED-PRODUCT-NAMES` Key Vault allowlist first and also adds the resolved identity as a real Entra owner. See the [Ownership model](/azure-secret-governance#ownership-model) section for the full breakdown. Discovery never writes to it |
-| `ProductName` | Choice | Optional. If filled in, monitoring's `decision_engine.py` looks up a Key Vault secret named exactly this and writes its value, a service principal name, into `DevSecOpsOwnership`, always overwriting whatever was there. The local `sync.py` does a related but stricter lookup — see the Ownership model section for the difference |
-| `ProductTeamkeyVaultName` | Choice | Optional. If filled in, rotation appends the standard `.vault.azure.net/` suffix to this value and stores the app's newly rotated secret there instead of the shared rotation Key Vault. This is a vault *name* (e.g. `kv-product-a`), not a URL |
+| `DevSecOpsOwnership` | Single line of text | Gates rotation only (see warning below). Filled in one of three ways: directly by a person; by `decision_engine.py`'s `get_product_service_principal()`, which looks up any `ProductName` as a Key Vault secret name with no allowlist gate; or by the local `sync.py` script, which checks `ProductName` against a flat `ALLOWED-PRODUCT-NAMES` Key Vault allowlist and, if allowed, sets this column to one fixed identity (`devsecops-secret-governance-monitor`) and also adds that same identity as a real Entra owner — clearing the column if the product isn't allowed. See the [Ownership model](/azure-secret-governance#ownership-model) section for the full breakdown. Discovery never writes to it |
+| `ProductName` | Choice | Optional. If filled in, monitoring's `decision_engine.py` looks up a Key Vault secret named exactly this and writes its value, a service principal name, into `DevSecOpsOwnership`, always overwriting whatever was there. The local `sync.py` script uses this column completely differently — as a flat allowlist membership check, not a per-product secret lookup — see the Ownership model section for the difference |
+| `ProductTeamsKeyVaultName` | Choice | Optional. If filled in, rotation appends the standard `.vault.azure.net/` suffix to this value and stores the app's newly rotated secret there instead of the shared rotation Key Vault. This is a vault *name* (e.g. `kv-product-a`), not a URL |
 | `ObjectID` | Single line of text | The app's Entra object ID, not its App ID |
 | `TenantID` | Single line of text | Which of the configured tenants this app actually lives in |
 | `TeamName` | Choice | Optional, feeds into rotation's generated secret name (`ProductName-TeamName-AppName`) when `NewSecretVaultName` is blank. Doesn't gate or route anything on its own |
@@ -74,26 +74,41 @@ Create a custom list named exactly `SecretAlertRegistry`. Add these columns:
 | `LastChecked` | Single line of text | Refreshed on every run that touches this row |
 | `AlertHistory` | Multiple lines of text | A running log of escalation events for this row |
 | `RotationDetectedDate` | Single line of text | |
-| `NewSecretKeyId` | Single line of text | Set once rotation creates a new secret. Also what monitoring's lineage tracking matches a rotated secret's brand-new row against, to carry `TeamName`/`ProductName`/`ProductTeamkeyVaultName` forward automatically |
+| `NewSecretKeyId` | Single line of text | Set once rotation creates a new secret. Also what monitoring's lineage tracking matches a rotated secret's brand-new row against, to carry `TeamName`/`ProductName`/`ProductTeamsKeyVaultName` forward automatically (see the warning below — this carry-forward currently has a bug) |
 | `NewSecretVaultName` | Single line of text | The Key Vault secret name a rotated value is stored under. Filled in by the team ahead of the first rotation if the app expects a specific, unchanging name; if left blank, rotation generates one and writes it back here so every later rotation reuses it as a new version |
 
 <Callout type="warning">
-  `DevSecOpsOwnership` decides whether monitoring and rotation actively work a row — it no longer
-  decides whether a Jira ticket or Teams alert gets raised in the first place; severity alone
-  drives that now. `AppOwners` looks similar and is easy to confuse with `DevSecOpsOwnership`,
-  but it is only a reference column showing Entra's actual current owners, and it does not gate
-  anything.
+  `DevSecOpsOwnership` gates **rotation only**. Monitoring's ownership gate was explicitly removed
+  — every row still gets tracked, ticketed, and alerted on severity alone regardless of ownership.
+  Rotation (`devsecops-secret-governance-secret-rotation.py`) still genuinely skips a row with
+  `DevSecOpsOwnership` blank. `AppOwners` looks similar and is easy to confuse with
+  `DevSecOpsOwnership`, but it is only a reference column showing Entra's actual current owners,
+  and it does not gate anything.
 </Callout>
 
 <Callout type="warning">
-  `ProductName`, `TeamName`, and `ProductTeamkeyVaultName` must be **single-select** Choice
+  `ProductName`, `TeamName`, and `ProductTeamsKeyVaultName` must be **single-select** Choice
   columns, not multi-select. A multi-select Choice field returns an array from Graph instead of a
   plain string, which breaks every piece of code that reads these columns as text (rotation's
   name generation, the Key Vault lookups, lineage matching). The option text you define also has
   to match exactly, case-sensitive, whatever the code looks it up against: a Key Vault secret
   name for `ProductName`, and the actual Key Vault's name (not its full URL) for
-  `ProductTeamkeyVaultName`, since rotation derives the URL by appending the standard
+  `ProductTeamsKeyVaultName`, since rotation derives the URL by appending the standard
   `.vault.azure.net/` suffix to whatever's selected.
+</Callout>
+
+<Callout type="error">
+  **Known bug, not yet fixed in code:** `decision_engine.py`'s lineage carry-forward (the logic
+  that copies `TeamName`/`ProductName`/`ProductTeamsKeyVaultName` onto a newly-rotated secret's
+  brand-new row) reads and writes the column as `ProductTeamkeyVaultName` — missing the "s" in
+  "Teams". Everywhere else that touches this column — the rotation script's vault-routing lookup,
+  and `main.py`'s Jira custom-field backfill — uses `ProductTeamsKeyVaultName` (with the "s"),
+  which is almost certainly the actual SharePoint column name. Net effect: after a secret's first
+  rotation, the lineage step silently writes the carried-forward value into a column that doesn't
+  exist / nothing else reads, so the new row's vault routing silently falls back to the shared
+  rotation vault instead of the product-specific one, with no error. Worth a code fix in
+  `decision_engine.py` (search for `ProductTeamkeyVaultName`, three occurrences) rather than a
+  docs-only workaround.
 </Callout>
 
 ### Create SecretAlertRegistryBackup

@@ -1,19 +1,19 @@
 ---
-title: runbook_rotation.py
+title: devsecops-secret-governance-secret-rotation.py
 description: Rotates expiring secrets, stores new values in Key Vault, and updates Jira and SharePoint
 ---
 
 import { Callout } from 'nextra/components'
 
-# runbook_rotation.py
+# devsecops-secret-governance-secret-rotation.py
 
-**Location:** `secret-governance-infra/runbooks/runbook_rotation.py`
+**Location:** `secret-governance-infra/runbooks/devsecops-secret-governance-secret-rotation.py`
 
 **Runtime:** Python 3.10 — Azure Automation Account
 
 **Schedule:** Weekly at `01:00`, 1 hour after monitoring.
 
-**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P3 secrets whose SharePoint row has `ManualAppOwners` filled in by a human (Phase B). P4 (61+ days, safe) is never rotation eligible. The new secret value reuses whatever name is already in `NewSecretVaultName` if one is set (so it lands as a new *version* of the same Key Vault entry, not a new one), or generates one from `ProductName`/`TeamName`/`AppName` if it's genuinely the first rotation for that app. It's stored in the rotation Key Vault by default, or in the vault named by that row's `ProductTeamkeyVaultName` instead if that column is filled in, and a comment is posted to the Jira ticket with retrieval instructions.
+**What it does:** Runs in two phases — first checks `RotatedPendingDeployment` rows to see if Jira tickets have been closed (Phase A), then proactively rotates P1-P3 secrets whose SharePoint row has `DevSecOpsOwnership` filled in by a human (Phase B). P4 (61+ days, safe) is never rotation eligible. If a row's `NewSecretKeyId` already has a value by the time Phase B reaches it — meaning an engineer already generated and recorded a replacement secret manually, via Jira's `NewSecretPresent` field flow — rotation records that instead of generating a second, conflicting secret. Otherwise, the new secret value reuses whatever name is already in `NewSecretVaultName` if one is set (so it lands as a new *version* of the same Key Vault entry, not a new one), or generates one from `ProductName`/`TeamName`/`AppName` if it's genuinely the first rotation for that app. It's stored in the rotation Key Vault by default, or in the vault named by that row's `ProductTeamsKeyVaultName` instead if that column is filled in, and a comment is posted to the Jira ticket with retrieval instructions.
 
 ---
 
@@ -23,15 +23,14 @@ import { Callout } from 'nextra/components'
 |----------|--------|
 | Two-phase design | Phase A closes the loop on already-rotated secrets before Phase B generates new ones — avoids double-rotation |
 | `AlertStatus`, not `NewSecretVaultName`, gates "already rotated this cycle" | A row moves to `RotatedPendingDeployment` once rotated, which is what excludes it from the next candidate list. `NewSecretVaultName` no longer serves this purpose, see "Secret naming" below for why |
-| `NewSecretKeyId` presence is a second, independent "already rotated" guard | Rotation writes `NewSecretKeyId` on the same row it flips to `RotatedPendingDeployment`. If someone manually resets `AlertStatus` back to an actionable value without also clearing `NewSecretKeyId`, this row-level check still skips it, so re-rotation now requires resetting both fields, not just the status |
+| `NewSecretKeyId` already present mid-cycle signals a manually-provided secret, not a duplicate-rotation guard | If `NewSecretKeyId` already has a value when Phase B reaches a row (synced from Jira's `NewSecretPresent` field via the `jira-status-update` endpoint once the ticket reaches In Progress), rotation treats it as an engineer having already generated and recorded the replacement themselves. It flips the row to `RotatedPendingDeployment` and posts a distinct "manual secret recorded" Jira comment, without calling `create_azure_secret()`/`store_rotated_secret()` again — avoiding a second, conflicting secret. This check runs *inside* Phase B's per-row try block, after the Jira-ticket-open check, not as an earlier candidate-list gate |
 | Jira check before rotation | If the ticket is already closed, marks the row `JiraClosed-Unverified` instead of rotating — someone may have rotated manually |
 | 5s pause between rotations | Prevents Azure AD `addPassword` concurrency conflicts when rotating multiple secrets in the same run |
 | Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
-| `ManualAppOwners` gate | Rotation is gated on `ManualAppOwners` in SharePoint, filled in by a human or resolved from `ProductName` by monitoring or owner sync — not the auto-stamped `AppOwners` column, which is informational only |
-| `ProductTeamkeyVaultName` derives a URL, doesn't store one | The row's value (e.g. `kv-product-a`) has the standard `https://<name>.vault.azure.net/` suffix appended directly, rather than being looked up against a separately maintained list. Blank means the shared rotation vault. A `SecretClient` for a given derived URL is built once and reused for the rest of the run |
+| `DevSecOpsOwnership` gate | Rotation is gated on `DevSecOpsOwnership` in SharePoint, filled in by a human or resolved from `ProductName` by monitoring or owner sync — not the auto-stamped `AppOwners` column, which is informational only |
+| `ProductTeamsKeyVaultName` derives a URL, doesn't store one | The row's value (e.g. `kv-product-a`) has the standard `https://<name>.vault.azure.net/` suffix appended directly, rather than being looked up against a separately maintained list. Blank means the shared rotation vault. A `SecretClient` for a given derived URL is built once and reused for the rest of the run |
 | Secret naming reuses `NewSecretVaultName` if set, else generates one | Reusing the same name every rotation is what makes Key Vault's own versioning do the work, `set_secret()` on an existing name creates a new version automatically. See "Secret naming" below |
 | urllib only — no httpx | Azure Automation's Python runtime has issues with asyncio/httpcore. Pure `urllib` avoids these entirely |
-| Fractional-seconds normalization | Graph's `endDateTime` can return 5 or 7-digit fractional seconds. Python 3.10's `fromisoformat()` only accepts 0, 3, or 6 digits and raises on anything else — normalized before parsing so valid expiry dates aren't silently skipped |
 | `LastChecked`/`RotationDetectedDate` as full EST timestamps | `_now_est_string()` matches `runbook_discovery.py`'s format exactly, no longer a bare UTC date. `write_sharepoint_row` no longer truncates these to 10 characters, that used to destroy the time portion whenever this runbook wrote to a row after discovery had already stamped a full timestamp on it |
 
 ---
@@ -43,19 +42,31 @@ A row must pass every one of these gates in Phase B, in order, or it's skipped f
 | # | Gate | Field checked | Skipped if... |
 |---|------|----------------|----------------|
 | 1 | Actionable status | `AlertStatus` | Not one of `Discovered`, `JiraRaised`, `TeamsAlerted`, `Escalated`, `Expired`, `ExpiredManualReview`. `RotatedPendingDeployment`, `Rotated`, `OverdueManualReview`, and `JiraClosed-Unverified` are all excluded here |
-| 2 | Owned by a human | `ManualAppOwners` | Blank — must be filled by a person directly, or resolved earlier by monitoring/owner sync from `ProductName` |
+| 2 | Owned by a human | `DevSecOpsOwnership` | Blank — must be filled by a person directly, or resolved earlier by monitoring/owner sync from `ProductName` |
 | 3 | Rotation-eligible bucket | `ExpirationDate` → computed bucket | Bucket is P4 (61+ days, safe) — only P1/P2/P3 are eligible |
 | 4 | Within threshold | `ExpirationDate` → days remaining | More than 60 days remain (`DEFAULT_ROTATION_THRESHOLD = 60`, hardcoded at the call site) |
-| 5 | Not already rotated | `NewSecretKeyId` | Already has a value — this exact row was already rotated once. Re-rotating it requires clearing this field, resetting `AlertStatus` alone is no longer enough |
-| 6 | Has a Jira ticket | `JiraTicketKey` | Blank — logged as an error (`"no JiraTicketKey, cannot rotate"`), never silently allowed through |
-| 7 | Jira ticket still open | Live status via `get_jira_issue()` | Status is `done`/`closed`/`resolved` — row instead flips to `JiraClosed-Unverified` for manual review, no rotation happens |
-| 8 | App still exists in Azure | `app_info_by_client_id` lookup | The app registration's `appId` isn't found across the scanned tenants |
+| 5 | Has a Jira ticket | `JiraTicketKey` | Blank — logged as an error (`"no JiraTicketKey, cannot rotate"`), never silently allowed through |
+| 6 | Jira ticket still open | Live status via `get_jira_issue()` | Status is `done`/`closed`/`resolved` — row instead flips to `JiraClosed-Unverified` for manual review, no rotation happens |
+| 7 | App still exists in Azure | `app_info_by_client_id` lookup | The app registration's `appId` isn't found across the scanned tenants |
 
-If a row clears all eight, `store_rotated_secret()` resolves the target vault (`ProductTeamkeyVaultName`
-if set, else the shared rotation vault) and secret name (reuse `NewSecretVaultName` if set, else
-generate and write one back — see "Secret naming" below), creates a new Key Vault secret version,
-posts a Jira comment with retrieval instructions, and writes `AlertStatus = RotatedPendingDeployment`
-plus `NewSecretKeyId`/`NewSecretVaultName`/`RotationDetectedDate` back to the row.
+<Callout type="info">
+  A row that clears gates 1–6 but already has a non-blank `NewSecretKeyId` doesn't go through
+  `create_azure_secret()`/`store_rotated_secret()` at all — it means an engineer already generated
+  and recorded a replacement secret manually (via Jira's `NewSecretPresent` field, synced into
+  this column by the `jira-status-update` endpoint when the ticket reaches In Progress). Rotation
+  instead flips the row straight to `RotatedPendingDeployment`, posts a distinct "manual secret
+  recorded" comment on the ticket, and moves on. This avoids generating a second, conflicting
+  secret, but it isn't one of the numbered gates above since it's checked *after* the Jira-open
+  check (gate 6), not before it — a row can still fail gate 7 (app not found in Azure) even with
+  a manually-provided `NewSecretKeyId`, since that check happens first.
+</Callout>
+
+If a row clears every gate above with no manually-provided `NewSecretKeyId`, `store_rotated_secret()`
+resolves the target vault (`ProductTeamsKeyVaultName` if set, else the shared rotation vault) and
+secret name (reuse `NewSecretVaultName` if set, else generate and write one back — see "Secret
+naming" below), creates a new Key Vault secret version, posts a Jira comment with retrieval
+instructions, and writes `AlertStatus = RotatedPendingDeployment` plus
+`NewSecretKeyId`/`NewSecretVaultName`/`RotationDetectedDate` back to the row.
 
 <Callout type="info">
   Phase A runs first, separately, every cycle: any row already in `RotatedPendingDeployment` has its
@@ -84,7 +95,7 @@ resolves the name to use in one of two ways, checked in this order:
    version, instead of generating a fresh name every single cycle.
 
 <Callout type="warning">
-  This only holds together if a row's `ProductTeamkeyVaultName` also stays stable once it's set.
+  This only holds together if a row's `ProductTeamsKeyVaultName` also stays stable once it's set.
   If it changes between rotations, a rotation will still reuse the same `NewSecretVaultName`, but
   against a *different* vault, which Key Vault sees as a name it's never encountered before, so
   it creates a fresh secret there rather than a new version, not a continuation of whatever
@@ -118,10 +129,10 @@ resolves the name to use in one of two ways, checked in this order:
 | `JIRA-BASE-URL` | Jira instance URL |
 | `JIRA-API-TOKEN` | Jira API token |
 | `JIRA-USER-EMAIL` | Jira account email |
-| `OWNER-EMAILS` | Legacy owner filter, logged only (falls back to `OWNER-EMAIL`) — no longer used to gate rotation; that's now `ManualAppOwners` in SharePoint |
+| `OWNER-EMAILS` | Legacy owner filter, logged only (falls back to `OWNER-EMAIL`) — no longer used to gate rotation; that's now `DevSecOpsOwnership` in SharePoint |
 
 <Callout type="warning">
-  The runbook will only rotate secrets for apps where `ManualAppOwners` in SharePoint is
+  The runbook will only rotate secrets for apps where `DevSecOpsOwnership` in SharePoint is
   filled in by a human — the auto-stamped `AppOwners` column is informational only and is
   never used to gate rotation. Separately, apps where the App Registration is not listed as
   an Entra owner return HTTP 403 from the Graph `addPassword` endpoint — a second layer of
@@ -141,13 +152,13 @@ resolves the name to use in one of two ways, checked in this order:
 
 ## Testing rotation — adding the cross-tenant app as an owner
 
-Rotation itself is gated on `ManualAppOwners` in SharePoint being filled in by a human.
+Rotation itself is gated on `DevSecOpsOwnership` in SharePoint being filled in by a human.
 Separately, the Graph `addPassword` call requires the cross-tenant App Registration's
 Service Principal to be listed as an **owner** of the target app in Entra ID, or it
 returns HTTP 403. To test rotation end-to-end on a specific app, add the cross-tenant
 Service Principal as an owner of that target app in Entra ID, then re-run discovery so
 the ownership is stamped into SharePoint's `AppOwners` column, and fill in
-`ManualAppOwners` on that row yourself.
+`DevSecOpsOwnership` on that row yourself.
 
 ### 1. Get a fresh Graph token
 
@@ -220,7 +231,7 @@ on the target app's row. Trigger it manually:
 
 Open the `SecretAlertRegistry` row for the target app — `AppOwners` should now
 include the cross-tenant app's display name (or `Name <email>` for user owners),
-confirming the Entra ownership landed. Rotation itself is gated by `ManualAppOwners`,
+confirming the Entra ownership landed. Rotation itself is gated by `DevSecOpsOwnership`,
 so also make sure that field is filled in by a human on this row (or resolved from
 `ProductName`). Once both are set, rotation will act on this app on its next run,
 provided the app's secret is also in a `P1`-`P3` bucket. `P4` (61+ days, safe) is
@@ -239,35 +250,44 @@ never rotation eligible.
 
 ```python
 """
-runbook_rotation.py — Azure Automation Runbook (v3 — Corrected Bucket Scheme)
+devsecops-secret-governance-secret-rotation.py - Azure Automation Runbook (v3 - Corrected Bucket Scheme)
 ================================================================================
-Purpose : Run the secret rotation cycle directly — NO AI, NO LangChain
+Purpose : Run the secret rotation cycle directly - NO AI, NO LangChain
 Schedule: Every 7 days, 1 hour after runbook_monitoring.py
 Runtime : Python 3.10 (Azure Automation)
 
 Changes in v3 (this version):
-  1. MULTI-TENANT CREDENTIAL SPLIT (matches runbook_discovery.py's v7 fix,
-     and the same fix applied to main.py/container 2). Two credentials —
+  1. MULTI-TENANT CREDENTIAL SPLIT (matches devsecops-secret-governance-secret-rotation.py's v7 fix,
+     and the same fix applied to main.py/container 2). Two credentials -
      one for Entra scanning (follows whichever tenant is being scanned),
      one for SharePoint (ALWAYS HOME_TENANT_ID).
 
-  2. MULTI-TENANT SCANNING — CROSS-TENANT-TENANT-IDS (plural), one
+  2. MULTI-TENANT SCANNING - CROSS-TENANT-TENANT-IDS (plural), one
      federated credential per tenant, each app tagged with its source
      tenant.
 
-  3. FILTER CHANGED: AppOwners/OWNER-EMAILS → ManualAppOwners non-blank,
+  3. FILTER CHANGED: AppOwners/OWNER-EMAILS → DevSecOpsOwnership non-blank,
      matching decision_engine.py's monitoring filter exactly.
 
-  4. CONFIGURABLE SECRET VALIDITY — SECRET-VALIDITY-DAYS from Key Vault,
+  4. CONFIGURABLE SECRET VALIDITY - SECRET-VALIDITY-DAYS from Key Vault,
      default 365, replacing the old hardcoded 12-month calculation.
 
-  5. BUCKET SCHEME CORRECTED (NEW in v3) — this file previously had its
-     OWN, stale bucket classifier (P4=safe/61+, P3=31-60, P2=8-30,
-     P1=0-7 — the OLD pre-split scheme) that disagreed with
-     decision_engine.py's current P1=0-3/P2=4-7/P3=8-30/P4=31-60/P5=61+.
-     _classify_bucket() now matches exactly. ROTATION_ELIGIBLE_BUCKETS is
-     {"P1","P2","P3","P4"} — same 0-60 day range as before, re-expressed
-     under the current names. P5 is never rotation-eligible.
+  5. BUCKET SCHEME CORRECTED (NEW in v3) - this file previously had its
+     OWN, stale bucket classifier that disagreed with decision_engine.py's
+     bucket names AT THE TIME (v3 shipped under the five-bucket scheme:
+     P1=0-3, P2=4-7, P3=8-30, P4=31-60, P5=61+ safe). _classify_bucket()
+     was brought in line with decision_engine.py's names as of v3.
+     ROTATION_ELIGIBLE_BUCKETS at the time was {"P1","P2","P3","P4"} - the
+     same 0-60 day range as before, re-expressed under v3's names. P5 was
+     never rotation-eligible under that scheme.
+
+     SUPERSEDED since v3: decision_engine.py later merged the old P1/P2
+     into one P1 (0-7 days) and renumbered everything below it down by
+     one - see the ROTATION_ELIGIBLE_BUCKETS definition and
+     _classify_bucket() further down in this file for the four-bucket
+     names actually in effect now. Under the current names,
+     ROTATION_ELIGIBLE_BUCKETS is {"P1","P2","P3"}, and P4 (now the safe,
+     61+ day bucket) is never rotation-eligible.
 
   (v1 retained: "Discovered" in ACTIONABLE_STATUSES and the SharePoint
    OData filter.)
@@ -681,7 +701,7 @@ def store_rotated_secret(secret_name: str, secret_value: str,
     Stores a rotated secret's value in Key Vault. By default, uses the
     shared ROTATION_KV_URL every app rotates into. If override_vault_url is
     given (non-empty), meaning the app's SharePoint row had
-    ProductTeamkeyVaultName set, uses that specific vault instead — a
+    ProductTeamsKeyVaultName set, uses that specific vault instead — a
     product team gets its own rotated secrets landing in their own Key
     Vault rather than the shared one.
 
@@ -708,7 +728,7 @@ def store_rotated_secret(secret_name: str, secret_value: str,
 
 def get_jira_issue(issue_key: str) -> dict:
     try:
-        b = _get(f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}?fields=status,summary",
+        b = _get(f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}?fields=status,summary",
                  _jira_hdrs(), timeout=15)
         return {"issue_key": issue_key,
                 "status": b.get("fields", {}).get("status", {}).get("name", "Unknown"),
@@ -722,7 +742,7 @@ def add_jira_comment(issue_key: str, comment_text: str) -> dict:
     payload = {"body": {"type": "doc", "version": 1,
                         "content": [{"type": "paragraph",
                                      "content": [{"type": "text", "text": comment_text}]}]}}
-    b = _post(f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/comment",
+    b = _post(f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/comment",
               _jira_hdrs(), payload, timeout=15)
     return {"issue_key": issue_key, "comment_id": b.get("id", "")}
 
@@ -819,10 +839,10 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
         app_id = f.get("Title", "")
 
         if MANUAL_OWNERS_ONLY:
-            manual_owners = (f.get("ManualAppOwners") or "").strip()
+            manual_owners = (f.get("DevSecOpsOwnership") or "").strip()
             if not manual_owners:
                 summary["rowsSkippedNoManualOwner"] += 1
-                log.debug("Skipping %s — ManualAppOwners is blank", app_id)
+                log.debug("Skipping %s — DevSecOpsOwnership is blank", app_id)
                 continue
         else:
             app_owners = (f.get("AppOwners") or "").lower()
@@ -839,9 +859,9 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
         candidates.append(item)
 
     print(f"[DEBUG] Phase B: {len(all_candidates)} total candidates, {len(candidates)} "
-          f"after {'ManualAppOwners' if MANUAL_OWNERS_ONLY else 'AppOwners/OWNER_EMAILS'} filter")
+          f"after {'DevSecOpsOwnership' if MANUAL_OWNERS_ONLY else 'AppOwners/OWNER_EMAILS'} filter")
     print(f"[DEBUG] Phase B: {summary['rowsSkippedNoManualOwner']} skipped "
-          f"({'ManualAppOwners blank' if MANUAL_OWNERS_ONLY else f'not owned by any of {OWNER_EMAILS}'})")
+          f"({'DevSecOpsOwnership blank' if MANUAL_OWNERS_ONLY else f'not owned by any of {OWNER_EMAILS}'})")
 
     for item in candidates[:5]:
         f    = item.get("fields", {})
@@ -864,14 +884,6 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
         item_id  = item.get("id")
         app_id   = f.get("Title")
         app_name = f.get("AppName", "Unknown")
-
-        existing_new_key_id = (f.get("NewSecretKeyId") or "").strip()
-        if existing_new_key_id:
-            summary["rowsSkippedRotated"] += 1
-            log.debug("Skipping %s — NewSecretKeyId already present (%s), row was already rotated",
-                      app_id, existing_new_key_id)
-            continue
-
         jira_key = f.get("JiraTicketKey", "")
 
         if not jira_key:
@@ -894,6 +906,43 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
                 summary["sharepointUpdated"] += 1
                 continue
 
+            # NEW - a non-blank NewSecretKeyId at this point means the
+            # engineer already created the new secret manually (generation
+            # AND storage, both outside this runbook) and typed its
+            # NewSecretKeyId into Jira (NewSecretPresent = Yes there) -
+            # synced into this row's NewSecretKeyId column by the
+            # jira-status-update endpoint on In Progress. No separate
+            # NewSecretPresent column exists in SharePoint - this reuses the
+            # existing NewSecretKeyId column as the signal instead. Skip
+            # create_azure_secret()/store_rotated_secret() entirely here -
+            # calling them anyway would generate a SECOND, conflicting
+            # secret alongside the one the engineer already made.
+            manually_provided_key_id = (f.get("NewSecretKeyId") or "").strip()
+            if manually_provided_key_id:
+                write_sharepoint_row(item_id, {
+                    "AlertStatus":  "RotatedPendingDeployment",
+                    "ExpiryNotice": f"Secret manually provided by engineer - pending deployment ({jira_key})",
+                    "LastChecked":  today,
+                })
+                summary["sharepointUpdated"] += 1
+                try:
+                    add_jira_comment(
+                        jira_key,
+                        f"🔐 MANUAL SECRET RECORDED — {today}\n"
+                        f"NewSecretPresent was marked Yes, so no secret was auto-generated. "
+                        f"The manually-provided secret (NewSecretKeyId: "
+                        f"{manually_provided_key_id}) has been recorded "
+                        f"for {app_name} (App ID: {app_id}).\n\n"
+                        f"Next steps:\n"
+                        f"1. Confirm the secret is deployed to all dependent services\n"
+                        f"2. Confirm authentication works\n"
+                        f"3. Close this ticket to mark as Rotated in SharePoint."
+                    )
+                    summary["jiraComments"] += 1
+                except Exception as e:
+                    summary["errors"].append(f"Jira comment failed for {jira_key}: {e}")
+                continue
+
             app_info = app_info_by_client_id.get(app_id)
             if not app_info:
                 summary["errors"].append(f"AppID={app_id}: not found in Azure snapshot")
@@ -911,7 +960,7 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
                 continue
             summary["newSecretsGenerated"] += 1
 
-            # ProductTeamkeyVaultName lets a specific product's team override
+            # ProductTeamsKeyVaultName lets a specific product's team override
             # where their rotated secret gets stored, instead of the shared
             # ROTATION_KV_URL every app uses by default. Blank means "use the
             # shared vault" — this is the normal case for most rows. Every
@@ -919,7 +968,7 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
             # https://<name>.vault.azure.net/ pattern, so the full URL is
             # derived directly from whatever short name is in the column,
             # rather than looked up against a separately maintained list.
-            raw_vault_key = (f.get("ProductTeamkeyVaultName") or "").strip()
+            raw_vault_key = (f.get("ProductTeamsKeyVaultName") or "").strip()
             override_vault_url = f"https://{raw_vault_key.lower()}.vault.azure.net/" if raw_vault_key else ""
 
             # SECRET NAMING — this is what makes "same name, new version every
@@ -1013,7 +1062,7 @@ def run_secret_rotation(rotation_threshold_days: int = DEFAULT_ROTATION_THRESHOL
 def main():
     started = datetime.now(timezone.utc).isoformat()
     log.info("Rotation Runbook v3 started at %s (multi-tenant credential split, "
-             "ManualAppOwners filter, configurable SECRET-VALIDITY-DAYS, "
+             "DevSecOpsOwnership filter, configurable SECRET-VALIDITY-DAYS, "
              "bucket scheme corrected to match decision_engine.py)", started)
 
     summary = run_secret_rotation(rotation_threshold_days=60)
@@ -1026,7 +1075,7 @@ def main():
     print(f"  Secret Validity (days)   : {summary.get('secretValidityDays')}")
     print(f"  Tenants Scanned          : {summary.get('tenantsScanned')} ({', '.join(CROSS_TENANT_TENANT_IDS)})")
     print(f"  SharePoint Rows Scanned  : {summary.get('rowsScanned')}")
-    print(f"  Skipped (ManualAppOwners blank): {summary.get('rowsSkippedNoManualOwner')}")
+    print(f"  Skipped (DevSecOpsOwnership blank): {summary.get('rowsSkippedNoManualOwner')}")
     print(f"  Skipped (already rotated): {summary.get('rowsSkippedRotated')}")
     print(f"  New Secrets Generated    : {summary.get('newSecretsGenerated')}")
     print(f"  Rotations Completed      : {summary.get('rotationsCompleted')}")

@@ -382,8 +382,8 @@ The UAMI is only used to assert identity, it holds no direct Graph permissions o
 | Time | Runbook | What it does |
 |------|---------|-------------|
 | `00:00` | `runbook_discovery.py` | Scans every configured tenant, classifies every secret P1 through P4, backs up both SharePoint lists before writing |
-| Run manually | `owner_sync_local.py` | Reads `ManualAppOwners` and adds the named identity as an Entra owner. Runs on a laptop, not on the Automation Account, so this step is deliberately outside the schedule |
-| `00:30` | `runbook_monitoring.py` | Triggers the monitoring container, raises Jira tickets and Teams alerts, propagates `ManualAppOwners` to sibling rows |
+| Run manually | `owner_sync_local.py` | Reads `DevSecOpsOwnership` and adds the named identity as an Entra owner. Runs on a laptop, not on the Automation Account, so this step is deliberately outside the schedule |
+| `00:30` | `runbook_monitoring.py` | Triggers the monitoring container (via Container 1's `/run`), raises Jira tickets and Teams alerts on severity alone, propagates `DevSecOpsOwnership` to sibling rows |
 | `01:00` | `runbook_rotation.py` | Rotates P1 through P3 secrets, stores new values in Key Vault |
 
 <Callout type="info">
@@ -416,16 +416,21 @@ The UAMI is only used to assert identity, it holds no direct Graph permissions o
 | `JIRA-EPIC-KEY` | example ticket key | Monitoring |
 | `JIRA-ISSUE-TYPE` | `Incident` | Monitoring |
 | `TEAMS-WEBHOOK-URL` | Teams incoming webhook URL | Monitoring |
-| `TEAMS-TAG-EMAIL` | example account to mention on P1 alerts | Monitoring |
+| `TEAMS-TAG-EMAIL` | example account to mention on P1 (0-3 day) Teams alerts | Monitoring |
+| `BACKUP-STORAGE-ACCOUNT-URL` | `https://example.blob.core.windows.net` | Monitoring. Deliberately optional — archives the previous `SecretAlertRegistryBackup`/`IgnoredSecretRegistryBackup` snapshot as CSV before it's overwritten each run. If unset, the old snapshot is simply discarded (with a warning) instead of archived, rather than blocking the run |
 | `OWNER-EMAILS` | kept for backwards compatibility only, not used to gate anything by default | Monitoring and rotation |
 | `AZURE-OPENAI-ENDPOINT` | `https://example.openai.azure.com` | Container 1 |
 | `AZURE-OPENAI-API-KEY` | key value | Container 1 |
 | `AZURE-OPENAI-DEPLOYMENT-NAME` | `gpt-4o` | Container 1 |
+| `ALLOWED-PRODUCT-NAMES` | comma separated product names | The separate local `devsecops-secret-governance-sync.py` script only, not Container 1 or Container 2. Allowlist gate on which `ProductName` values that script will resolve via its own per-product Key Vault lookup before adding a real Entra owner |
 
 <Callout type="warning">
   `OWNER-EMAILS` and the older singular `OWNER-EMAIL` are no longer what decides which secrets
-  get monitored or rotated. That gate is now the `ManualAppOwners` column in SharePoint, filled
-  in by a person, per app. Discovery never writes to that column, and monitoring propagates it
-  to every other row belonging to the same app automatically. See the Ownership model section on
-  the main page for the full picture.
+  get monitored or rotated. That gate is now the `DevSecOpsOwnership` column in SharePoint
+  (renamed from `ManualAppOwners`), filled in directly by a person, resolved automatically via a
+  `ProductName` Key Vault lookup, or set by the separate local sync script. Discovery never writes
+  to that column, and monitoring propagates it to every other row belonging to the same app
+  automatically. Ownership no longer gates whether a Jira ticket or Teams alert gets raised —
+  only whether monitoring/rotation actively work a row. See the Ownership model section on the
+  main page for the full picture.
 </Callout>

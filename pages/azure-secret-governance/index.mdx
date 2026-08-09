@@ -10,14 +10,23 @@ import { Callout } from 'nextra/components'
 This system watches Azure App Registration client secrets across two Entra ID tenants, opens
 Jira tickets, sends Teams alerts, and rotates secrets before they expire. It runs on a weekly
 schedule and doesn't need manual intervention, apart from one approval step a human does per
-app before that app's secrets get touched.
+app before that app's secrets get **rotated**.
 
 The system runs as two containers inside a single Azure Container App, triggered weekly by
 Azure Automation Runbooks. Credentials are handled through a User-Assigned Managed Identity, so
-there are no client secrets sitting in code or config files. A secret only becomes eligible for
-monitoring and rotation once its App Registration's `DevSecOpsOwnership` column in SharePoint is
-filled in — either directly, or resolved automatically via `ProductName`. More on that in the
-ownership model section below.
+there are no client secrets sitting in code or config files.
+
+<Callout type="warning">
+  `DevSecOpsOwnership` gates **rotation only**, not monitoring. Every secret gets discovered,
+  tracked, re-classified into a bucket, and gets its Jira ticket/Teams alert every run regardless
+  of ownership — monitoring's own code explicitly removed that gate on ticket/alert creation, per
+  an explicit client requirement that alerting fire purely on severity. The only place ownership
+  still blocks real action is `devsecops-secret-governance-secret-rotation.py`, which genuinely
+  skips a row (counted as `rowsSkippedNoManualOwner`) if `DevSecOpsOwnership` is blank when it
+  gets there. Monitoring still counts unowned rows (`skippedNotOwned`), but that's purely
+  informational now — it doesn't affect what monitoring actually does with the row. More on how
+  `DevSecOpsOwnership` gets filled in the ownership model section below.
+</Callout>
 
 <Callout type="warning">
   `ManualAppOwners` was renamed to `DevSecOpsOwnership` and the Jira custom fields were
@@ -152,13 +161,14 @@ A secret this old doesn't get dropped from tracking just because of the day coun
 risk losing visibility on something someone is actively rotating right now. The decision
 depends on whether there's still a live, open Jira ticket for it:
 
-- No ticket at all, or the ticket is canceled: genuinely abandoned, moved to
-  `IgnoredSecretRegistry`
-- Ticket is Done or Resolved but the row was never marked Rotated: flagged as a possible sync
-  gap and left visible for someone to look into, rather than quietly disappearing
-- Ticket is In Progress, To Do, Blocked, or Awaiting Reporter: someone's actively working it, so
-  the row stays in `SecretAlertRegistry`, `AlertStatus` set to `OverdueManualReview`, not auto
-  ignored
+- No ticket at all: genuinely abandoned, moved to `IgnoredSecretRegistry` (the code also handles
+  a canceled ticket the same way, but the live KAN workflow has no Canceled status, so that
+  specific trigger never actually fires today — see the Jira Automation page)
+- Ticket is Resolved but the row was never marked Rotated: flagged as a possible sync gap and
+  left visible for someone to look into, rather than quietly disappearing
+- Ticket is In Progress, To Do, or Waiting for Customer (the live KAN workflow's only three
+  non-terminal statuses): someone's actively working it, so the row stays in
+  `SecretAlertRegistry`, `AlertStatus` set to `OverdueManualReview`, not auto ignored
 
 <Callout type="warning">
   P1, P2, and P3 all raise a Jira ticket, and so does ExpiredManualReview. An earlier version of
@@ -198,9 +208,7 @@ different design.
 
 **Directly.** A human fills in `DevSecOpsOwnership` on any single secret row belonging to an
 app. Discovery never writes to this column, so whatever's typed in stays untouched. Monitoring
-then copies that value onto every other row for the same app automatically. If
-`DevSecOpsOwnership` is blank for an app, every one of its secrets is skipped by monitoring and
-rotation — but no longer by ticket/alert creation, see the note below.
+then copies that value onto every other row for the same app automatically.
 
 **Via `ProductName`, resolved by monitoring.** `decision_engine.py`'s `get_product_service_principal()`
 looks up a Key Vault secret named exactly after the row's `ProductName` and writes the secret's
@@ -208,22 +216,31 @@ value into `DevSecOpsOwnership`, always overwriting whatever was there. Any `Pro
 is tried directly — there's no allowlist gate on this path. A `ProductName` with no matching Key
 Vault secret just leaves `DevSecOpsOwnership` as it was, it doesn't fail the run.
 
-**Via `ProductName`, resolved by the local `sync.py` script.** A separate, deliberately different
-mechanism: `resolve_product_ownership()` first checks whether `ProductName` is in the
-`ALLOWED-PRODUCT-NAMES` Key Vault allowlist before doing the same per-product secret lookup. If
-the product is allowed but has no matching secret yet, the row is left completely untouched
-(not cleared) and counted as `ownershipMisconfigured` — a config gap to fix, not a rejection. If
-`ProductName` is blank or not in the allowlist, `DevSecOpsOwnership` is actively cleared if it
-currently has a value. This script also does something the container-app path never does: it
-adds the resolved identity (or identities — the per-product secret's value can be a
-comma-separated list) as a **real Entra owner** on the App Registration, using the operator's own
-signed-in `az login` session rather than the shared automation identity.
+**Via `ProductName`, resolved by the local `sync.py` script.** A materially different mechanism
+from monitoring's — this is not a per-product secret lookup at all. `sync.py` reads a single
+flat, comma-separated allowlist of `ProductName` values from the `ALLOWED-PRODUCT-NAMES` Key
+Vault secret. If a row's `ProductName` is non-blank and appears in that allowlist,
+`DevSecOpsOwnership` is set to one fixed, hardcoded identity — `devsecops-secret-governance-monitor`
+— never a per-product-resolved value, never a list. If `ProductName` is blank or not in the
+allowlist, `DevSecOpsOwnership` is actively **cleared**. Either way, the write only happens when
+the current value differs from the desired one — but "differs" cuts both ways: this **will**
+overwrite a manually-typed value in either direction (set it to the fixed identity, or wipe it
+blank), it is not a fill-if-blank operation. This script also does something the container-app
+path never does: for rows where the product is allowed, it adds that same fixed identity as a
+**real Entra owner** on the App Registration, using the operator's own signed-in `az login`
+session rather than the shared automation identity — one tenant at a time, pausing between
+tenants for the operator to switch their `az login` session.
 
 <Callout type="warning">
-  Ownership no longer gates whether a Jira ticket or Teams alert gets raised — only whether
-  monitoring/rotation actively work a row. This was an explicit client requirement: severity
-  alone decides whether something gets a ticket, ownership only decides whether it's actively
-  chased afterward.
+  `DevSecOpsOwnership` no longer gates monitoring at all — not row creation, not re-classification
+  into a new bucket, not Jira ticket creation, not Teams alerts. Monitoring's own code explicitly
+  removed that gate (an explicit client requirement: severity alone decides whether something
+  gets a ticket). Monitoring still counts unowned rows via a `skippedNotOwned` metric, but that's
+  informational only now, not a real skip. The only place ownership genuinely blocks action today
+  is rotation (`devsecops-secret-governance-secret-rotation.py`): a row with `DevSecOpsOwnership`
+  blank is skipped there and counted as `rowsSkippedNoManualOwner`. So in practice: an unowned
+  secret still gets tracked, ticketed, and alerted on schedule — it just never gets rotated until
+  someone sets ownership.
 </Callout>
 
 `AppOwners`, re-stamped from live Entra data on every row monitoring touches (not just at first

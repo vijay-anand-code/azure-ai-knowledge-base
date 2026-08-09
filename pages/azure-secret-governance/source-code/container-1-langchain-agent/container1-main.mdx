@@ -11,7 +11,7 @@ import { Callout } from 'nextra/components'
 
 **Runtime:** Python 3.11 — Azure Container App (public port 8000)
 
-**What it does:** Hosts the LangChain agent (GPT-4o) that orchestrates the full governance cycle. Defines all tools that call Container 2, manages per-session chat memory, and exposes FastAPI endpoints for the runbook trigger, chat, and Teams bot.
+**What it does:** Hosts the LangChain agent (GPT-4o) that orchestrates the full governance cycle. Defines all tools that call Container 2, manages per-session chat memory, and exposes FastAPI endpoints for the runbook trigger, chat, the Jira status-update proxy, and (when enabled) the Teams bot.
 
 ---
 
@@ -22,12 +22,26 @@ import { Callout } from 'nextra/components'
 | `/health` | GET | Liveness probe |
 | `/run` | POST | Trigger governance cycle as background task — returns immediately |
 | `/chat` | POST | Conversational endpoint with per-session memory |
+| `/jira-status-update` | POST | Plain proxy to Container 2's `/tools/jira-status-update` — gives the Jira automation rule one stable externally-reachable URL, regardless of which container ingress currently points at |
 | `/teams-webhook` | POST | Receives Teams Bot messages — routes through LangChain agent |
 
+<Callout type="warning">
+  The Teams bot integration (the `from teams_bot import ...` block near the bottom of the file)
+  is currently **commented out** in the deployed source — the Teams bot has been removed from
+  this deployment for now. `/teams-webhook` is still named in the module docstring and in the
+  table above because that's what the docstring itself claims, but with the import/router lines
+  commented out, `app.include_router(teams_router)` never runs, so this route does not actually
+  exist on the live app today. See the [Teams bot](/azure-secret-governance/teams-bot) page for
+  what's involved in reinstating it.
+</Callout>
+
 <Callout type="info">
-  `/jira-webhook` was retired from this container. Jira's automation rule now calls
-  Container 2's `/tools/jira-status-update` directly, so Container 1 is no longer part
-  of the Jira to SharePoint sync path.
+  `/jira-webhook` was retired from this container — it only ever recognized 3 status names and
+  did nothing for the rest. It has **not** been replaced by Jira calling Container 2 directly.
+  Instead, Container 1 now exposes `/jira-status-update`, a thin proxy that forwards straight to
+  Container 2's `/tools/jira-status-update`, added specifically because a Container App only
+  exposes one external port at a time and that port has to stay on Container 1 for `/run` to keep
+  working. See the [Jira Automation](/azure-secret-governance/jira) page for the full setup.
 </Callout>
 
 ---
@@ -37,15 +51,17 @@ import { Callout } from 'nextra/components'
 | Decision | Reason |
 |----------|--------|
 | `/run` returns immediately | Prevents 504 timeout on the Azure Automation runbook side — agent runs in background via `asyncio.create_task` |
-| Per-session `InMemoryChatMessageHistory` | Teams bot conversations maintain context across messages in the same session |
+| Per-session `InMemoryChatMessageHistory` | Multi-turn conversations (chat, or Teams bot if re-enabled) maintain context across messages in the same session |
 | UAMI for Key Vault auth | No client secrets in environment variables — identity-based authentication only |
 | `max_iterations=30` on AgentExecutor | Prevents infinite loops on complex monitoring cycles with many tool calls |
 | Container 1 does NOT call Graph API | All Graph, SharePoint, Jira, and Teams calls go through Container 2 — Container 1 only orchestrates |
+| `/jira-status-update` is a plain proxy | No status-mapping logic lives in Container 1 — it just forwards the request body to Container 2's `/tools/jira-status-update` over `_call_monitor`, so there is a single source of truth for the status mapping |
 
 <Callout type="info">
-  The Teams bot is enabled by 6 lines in this file. Comment them all out to
-  disable it without removing any code — the `/teams-webhook` endpoint simply
-  won't exist in the next deployment.
+  The Teams bot is enabled by uncommenting 6 lines near the bottom of this file (the
+  `from teams_bot import ...` block). Today those lines are commented out, so the bot is disabled
+  and `/teams-webhook` does not exist on the running app — re-enabling it is just uncommenting
+  those lines and redeploying, no other code changes needed.
 </Callout>
 
 ---
@@ -58,12 +74,21 @@ All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls G
 |------|---------------------|---------|
 | `run_secret_monitoring` | `/tools/run_secret_monitoring` | Full monitoring cycle |
 | `fetch_azure_secrets` | `/tools/fetch_azure_secrets` | List all App Registrations |
-| `get_sharepoint_state` | `/tools/get_sharepoint_state` | Read SecretAlertRegistry |
+| `get_sharepoint_state` | `/tools/get_sharepoint_state` | Read the SharePoint master list |
 | `get_jira_issue` | `/tools/get_jira_issue` | Get Jira ticket status |
 | `add_jira_comment` | `/tools/add_jira_comment` | Post comment to Jira |
 | `send_teams_alert` | `/tools/send_teams_alert` | Send Teams Adaptive Card |
 | `write_sharepoint_row` | `/tools/write_sharepoint_row` | Create or update SP row |
 | `create_jira_ticket` | `/tools/create_jira_ticket` | Raise new Jira incident |
+
+<Callout type="warning">
+  The current source's docstrings for `get_sharepoint_state` and `write_sharepoint_row` (and the
+  `SYSTEM_PROMPT` string below) call the list `DevSecOpsSecretMonitoringRegistry`. That name is
+  stale inside this file itself — the actual SharePoint list Container 2 reads and writes is
+  `SecretAlertRegistry` (see the [SharePoint Setup](/azure-secret-governance/sharepoint) page).
+  This doc mirrors the source as written; the mismatch is a leftover in the source's own comments,
+  not something this page invented.
+</Callout>
 
 ---
 
@@ -82,14 +107,14 @@ All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls G
 | `AZURE-OPENAI-ENDPOINT` | Azure OpenAI endpoint URL |
 | `AZURE-OPENAI-API-KEY` | Azure OpenAI API key |
 | `AZURE-OPENAI-DEPLOYMENT-NAME` | GPT-4o deployment name |
-| `BOT-APP-ID` | Teams Bot App Registration client ID |
-| `BOT-APP-SECRET` | Teams Bot client secret |
-| `BOT-TENANT-ID` | Azure tenant ID for Bot Framework token |
 
 <Callout type="info">
-  Container 1 only needs Key Vault access for OpenAI and Teams Bot credentials.
-  All Graph API, SharePoint, and Jira credentials are loaded by Container 2.
-  The UAMI only needs `Key Vault Secrets User` role — no Graph permissions needed here.
+  `BOT-APP-ID`, `BOT-APP-SECRET`, and `BOT-TENANT-ID` are only read if the Teams bot integration
+  block is uncommented (see above) — with it commented out, as it currently is, `_kv_get()` is
+  never called for those three secrets and Container 1 only actually needs Key Vault access for
+  the three Azure OpenAI secrets above. All Graph API, SharePoint, and Jira credentials are loaded
+  separately by Container 2. The UAMI only needs `Key Vault Secrets User` role — no Graph
+  permissions needed here.
 </Callout>
 
 ---
@@ -98,93 +123,97 @@ All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls G
 
 ```python
 """
-Azure Secret Governance — LangChain Agent  (Container 1)
+Azure Secret Governance - LangChain Agent  (Container 1)
 =========================================================
 Endpoints:
-  GET  /health          — liveness probe
-  POST /run             — trigger a governance cycle (background task — returns immediately)
-  POST /chat            — conversational endpoint with per-session memory
-  POST /teams-webhook   — Microsoft Teams Bot Service messages
-
+  GET  /health              - liveness probe
+  POST /run                 - trigger a governance cycle (background task - returns immediately)
+  POST /chat                - conversational endpoint with per-session memory
+  POST /jira-status-update  - NEW: plain proxy to Container 2's /tools/jira-status-update,
+                               added so the Jira automation rule has a stable externally-reachable
+                               URL regardless of which port ingress currently points at (see the
+                               endpoint's own docstring for the full reasoning)
+  POST /teams-webhook       - Microsoft Teams Bot Service messages
+ 
 REMOVED in this version:
-  POST /jira-webhook — retired. This endpoint only ever recognized 3 status
+  POST /jira-webhook - retired. This endpoint only ever recognized 3 status
   names (done/closed/resolved) and did nothing for Canceled, Blocked, or
-  Awaiting Reporter — the exact "status change doesn't update SharePoint"
+  Awaiting Reporter - the exact "status change doesn't update SharePoint"
   problem the client reported. It has been fully superseded by
   /tools/jira-status-update on Container 2's main.py, which correctly maps
   all six real workflow statuses (To Do, In Progress, Done, Canceled,
   Blocked, Awaiting Reporter: Needs more information) to the right
   SharePoint AlertStatus. The Jira automation rule ("Trigger Secret Agent
-  on Ticket Close") has been repointed to call Container 2 directly —
+  on Ticket Close") has been repointed to call Container 2 directly -
   see runbook/automation notes for the exact rule setup (trigger status
   list + request body). Leaving this endpoint in place risked someone
   re-pointing a Jira rule at it later and silently regressing back to the
-  narrower, wrong behavior — retiring it removes that risk entirely rather
+  narrower, wrong behavior - retiring it removes that risk entirely rather
   than leaving two endpoints that do overlapping, inconsistent jobs.
-
+ 
   _update_sharepoint_on_close() (the helper this endpoint used) is retired
-  alongside it for the same reason — it called the OLDER
+  alongside it for the same reason - it called the OLDER
   /tools/update_on_jira_close endpoint on Container 2, which only ever
   handled the close case, not the full 6-status mapping. Container 2's
   /tools/jira-status-update is now the single source of truth for every
-  Jira→SharePoint status transition, called directly by Jira automation —
+  Jira→SharePoint status transition, called directly by Jira automation -
   no Container 1 involvement needed for this flow at all anymore.
 """
-
+ 
 from __future__ import annotations
-
+ 
 import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
-
+ 
 import httpx
 from azure.identity import ManagedIdentityCredential
 from azure.keyvault.secrets import SecretClient
-
+ 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-
+ 
 from langchain_openai import AzureChatOpenAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.tools import tool
-
+ 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("secret-agent")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 KV_URL          = os.environ["KEY_VAULT_URL"]
 UAMI_CLIENT_ID  = os.environ["UAMI_CLIENT_ID"]
 MONITOR_API_URL = os.environ.get("MONITOR_API_URL", "http://localhost:8001")
-
+ 
 _credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
 _kv         = SecretClient(vault_url=KV_URL, credential=_credential)
-
+ 
 def _kv_get(name: str) -> str:
     try:
         return _kv.get_secret(name).value
     except Exception as exc:
         raise RuntimeError(f"Required Key Vault secret '{name}' could not be loaded: {exc}") from exc
-
+ 
 log.info("Loading Azure OpenAI config from Key Vault...")
 AOAI_ENDPOINT   = _kv_get("AZURE-OPENAI-ENDPOINT")
 AOAI_API_KEY    = _kv_get("AZURE-OPENAI-API-KEY")
 AOAI_DEPLOYMENT = _kv_get("AZURE-OPENAI-DEPLOYMENT-NAME")
 log.info("Azure OpenAI config loaded. Deployment: %s", AOAI_DEPLOYMENT)
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP CLIENT — talks to Container 2 REST API
+# HTTP CLIENT - talks to Container 2 REST API
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 async def _call_monitor(endpoint: str, payload: dict | None = None) -> dict:
     """POST to a Container 2 /tools/* endpoint and return the JSON response."""
     url = f"{MONITOR_API_URL}/tools/{endpoint}"
@@ -192,47 +221,47 @@ async def _call_monitor(endpoint: str, payload: dict | None = None) -> dict:
         r = await c.post(url, json=payload or {})
         r.raise_for_status()
         return r.json()
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # LANGCHAIN TOOLS
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 @tool
 async def run_secret_monitoring() -> dict:
     """Runs the complete Azure secret expiry monitoring cycle: scans all App Registrations,
     classifies expiry buckets, raises Jira tickets, sends Teams alerts, and updates SharePoint."""
     return await _call_monitor("run_secret_monitoring")
-
+ 
 @tool
 async def fetch_azure_secrets() -> dict:
     """Fetches all Azure App Registrations and their client secrets from Entra ID."""
     return await _call_monitor("fetch_azure_secrets")
-
+ 
 @tool
 async def get_sharepoint_state() -> dict:
-    """Reads all items from the SecretAlertRegistry SharePoint list."""
+    """Reads all items from the DevSecOpsSecretMonitoringRegistry SharePoint list."""
     return await _call_monitor("get_sharepoint_state")
-
+ 
 @tool
 async def get_jira_issue(issue_key: str) -> dict:
-    """Returns the current status and summary of a Jira issue by its key (e.g. KAN-96)."""
+    """Returns the current status and summary of a Jira issue by its key (e.g. CSD-96)."""
     return await _call_monitor("get_jira_issue", {"issue_key": issue_key})
-
+ 
 @tool
 async def add_jira_comment(issue_key: str, comment_text: str) -> dict:
     """Adds a comment to an existing Jira issue."""
     return await _call_monitor("add_jira_comment", {"issue_key": issue_key, "comment_text": comment_text})
-
+ 
 @tool
 async def send_teams_alert(alert_text: str) -> dict:
     """Posts an Adaptive Card alert message to the Teams webhook channel."""
     return await _call_monitor("send_teams_alert", {"alert_text": alert_text})
-
+ 
 @tool
 async def write_sharepoint_row(item_id: Optional[str], fields: dict) -> dict:
-    """Creates or updates a row in the SecretAlertRegistry SharePoint list."""
+    """Creates or updates a row in the DevSecOpsSecretMonitoringRegistry SharePoint list."""
     return await _call_monitor("write_sharepoint_row", {"item_id": item_id, "fields": fields})
-
+ 
 @tool
 async def create_jira_ticket(
     app_name: str, app_id: str, secret_id: str, secret_description: str,
@@ -246,7 +275,7 @@ async def create_jira_ticket(
         "days_remaining": days_remaining, "severity": severity,
         "priority": priority, "extra_note": extra_note,
     })
-
+ 
 TOOLS = [
     run_secret_monitoring,
     fetch_azure_secrets,
@@ -257,65 +286,65 @@ TOOLS = [
     write_sharepoint_row,
     create_jira_ticket,
 ]
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # MEMORY
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 _chat_histories: dict[str, BaseChatMessageHistory] = {}
-
+ 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     if session_id not in _chat_histories:
         _chat_histories[session_id] = InMemoryChatMessageHistory()
     return _chat_histories[session_id]
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 SYSTEM_PROMPT = """You are the Azure Secret Governance Agent.
-
+ 
 You have access to tools that interact with Azure Entra ID, SharePoint, Jira, and Teams:
-- run_secret_monitoring    — runs the full weekly monitoring cycle (use this for scheduled runs)
-- fetch_azure_secrets      — fetch all App Registrations and their secrets from Entra ID
-- get_sharepoint_state     — read all rows from the SecretAlertRegistry SharePoint list
-- get_jira_issue           — get the current status of a specific Jira ticket
-- add_jira_comment         — add a comment to a Jira ticket
-- send_teams_alert         — post an alert to the Teams channel
-- write_sharepoint_row     — create or update a SharePoint row
-- create_jira_ticket       — raise a new Jira incident ticket
-
+- run_secret_monitoring    - runs the full weekly monitoring cycle (use this for scheduled runs)
+- fetch_azure_secrets      - fetch all App Registrations and their secrets from Entra ID
+- get_sharepoint_state     - read all rows from the DevSecOpsSecretMonitoringRegistry SharePoint list
+- get_jira_issue           - get the current status of a specific Jira ticket
+- add_jira_comment         - add a comment to a Jira ticket
+- send_teams_alert         - post an alert to the Teams channel
+- write_sharepoint_row     - create or update a SharePoint row
+- create_jira_ticket       - raise a new Jira incident ticket
+ 
 Guidelines:
 - For a full monitoring cycle, call run_secret_monitoring().
-- For specific questions ("What is the status of KAN-96?", "Show secrets for App X"),
+- For specific questions ("What is the status of CSD-96?", "Show secrets for App X"),
   use the targeted individual tools rather than the full cycle.
 - Jira ticket status changes (Done, Canceled, Blocked, Awaiting Reporter, etc.) are
   synced to SharePoint automatically by a Jira automation rule calling Container 2
-  directly (/tools/jira-status-update) — this agent does not need to handle that flow.
+  directly (/tools/jira-status-update) - this agent does not need to handle that flow.
 - Rotation is handled automatically by a separate Azure Automation Runbook.
 - Always respond in clear, well-formatted Markdown with ticket keys, dates, and counts.
-
+ 
 Bucket classifications (use these exactly when reporting):
-- P1: 0-7 days remaining (CRITICAL) — 0-3 days additionally tags a specific person in Teams alerts
+- P1: 0-7 days remaining (CRITICAL) - 0-3 days additionally tags a specific person in Teams alerts
 - P2: 8-30 days remaining (WARNING)
 - P3: 31-60 days remaining (INFORMATION)
 - P4: 61+ days remaining (SAFE)
 - ExpiredManualReview: expired 1-7 days ago (MANUAL REVIEW)
 - Ignore: expired 8+ days ago (SKIPPED)
 """
-
+ 
 DEFAULT_INSTRUCTION = (
     "Run the weekly secret monitoring check. "
     "Summarise everything: secrets scanned, new Jira tickets raised, "
     "Teams alerts sent, SharePoint rows created or updated, and any errors."
 )
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT FACTORY
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 _agent_with_history: RunnableWithMessageHistory | None = None
-
+ 
 def build_agent() -> RunnableWithMessageHistory:
     log.info("Building LangChain agent with %d tools", len(TOOLS))
     llm = AzureChatOpenAI(
@@ -323,7 +352,7 @@ def build_agent() -> RunnableWithMessageHistory:
         api_key=AOAI_API_KEY,
         azure_deployment=AOAI_DEPLOYMENT,
         api_version="2024-10-21",
-        temperature=0,
+        temperature=1,
     )
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -339,17 +368,17 @@ def build_agent() -> RunnableWithMessageHistory:
         input_messages_key="input",
         history_messages_key="chat_history",
     )
-
+ 
 async def _get_agent() -> RunnableWithMessageHistory:
     global _agent_with_history
     if _agent_with_history is None:
         _agent_with_history = build_agent()
     return _agent_with_history
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # GOVERNANCE CYCLE
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 async def run_governance_cycle(instruction: str = DEFAULT_INSTRUCTION) -> dict:
     agent   = await _get_agent()
     started = datetime.now(timezone.utc)
@@ -368,43 +397,62 @@ async def run_governance_cycle(instruction: str = DEFAULT_INSTRUCTION) -> dict:
     except Exception as e:
         log.exception("Governance cycle failed")
         return {"success": False, "startedAt": started.isoformat(), "error": str(e)}
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # FASTAPI APP
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _agent_with_history
     _agent_with_history = build_agent()
     log.info("Agent ready. Monitor API: %s", MONITOR_API_URL)
     yield
-
+ 
 app = FastAPI(title="Azure Secret Governance Agent", lifespan=lifespan)
-
-# ── Teams Bot — comment out both lines below to disable ──────────────────────
-from teams_bot import router as teams_router
-import teams_bot
-teams_bot.configure(
-    bot_app_id     = _kv_get("BOT-APP-ID"),
-    bot_app_secret = _kv_get("BOT-APP-SECRET"),
-    bot_tenant_id  = _kv_get("BOT-TENANT-ID"),
-    get_agent_fn   = _get_agent,
-)
-app.include_router(teams_router)
+ 
+# ── Teams Bot - comment out both lines below to disable ──────────────────────
+# from teams_bot import router as teams_router
+# import teams_bot
+# teams_bot.configure(
+#     bot_app_id     = _kv_get("BOT-APP-ID"),
+#     bot_app_secret = _kv_get("BOT-APP-SECRET"),
+#     bot_tenant_id  = _kv_get("BOT-TENANT-ID"),
+#     get_agent_fn   = _get_agent,
+# )
+# app.include_router(teams_router)
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 # ── Request models ────────────────────────────────────────────────────────────
-
+ 
 class RunRequest(BaseModel):
     instruction: str | None = None
-
+ 
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default_user_session"
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+class JiraStatusUpdateReq(BaseModel):
+    jira_key:  str
+    to_status: str
+    today:     str
+    # Must mirror Container 2's JiraStatusUpdateReq exactly - this model is
+    # what actually parses the incoming request from Jira Automation (this
+    # proxy is the externally-reachable endpoint), and Pydantic silently
+    # drops any field not declared here before req.dict() forwards it on to
+    # Container 2. Missing any of these would mean Container 2 always sees
+    # them as None, silently defeating the SharePoint backfill feature with
+    # no error anywhere.
+    team_name:           Optional[str] = None
+    product_name:        Optional[str] = None
+    devsecops_ownership: Optional[str] = None  # DEPRECATED - no longer sent, see Container 2
+    product_teams_key_vault_name: Optional[str] = None
+    new_secret_vault_name:        Optional[str] = None
+    new_secret_key_id:            Optional[str] = None
+    new_secret_present:           Optional[str] = None
 
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+ 
 @app.get("/health")
 async def health():
     return {
@@ -412,7 +460,7 @@ async def health():
         "server": "AzureSecretGovernanceAgent",
         "deployment": AOAI_DEPLOYMENT
     }
-
+ 
 @app.post("/run")
 async def run(req: RunRequest):
     """
@@ -426,7 +474,7 @@ async def run(req: RunRequest):
         "message":   "Monitoring cycle started in background",
         "startedAt": datetime.now(timezone.utc).isoformat(),
     }
-
+ 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     """Conversational endpoint with per-session memory. Ready for Teams bot or web UI."""
@@ -441,9 +489,30 @@ async def chat(req: ChatRequest):
         log.exception("Chat request failed for session %s", req.session_id)
         raise HTTPException(status_code=500, detail=str(e))
 
-# NOTE: /jira-webhook and _update_sharepoint_on_close() were REMOVED here —
-# see the module docstring at the top of this file for why. Jira automation
-# now calls Container 2's /tools/jira-status-update directly; Container 1 is
-# no longer part of the Jira→SharePoint sync path at all.
+@app.post("/jira-status-update")
+async def jira_status_update_proxy(req: JiraStatusUpdateReq):
+    """
+    NEW - plain pass-through proxy to Container 2's /tools/jira-status-update,
+    added specifically because a Container App only exposes ONE external
+    port at a time. Container 2's own /tools/* routes (port 8001) aren't
+    reachable externally whenever ingress is pointed at Container 1 (port
+    8000, needed for /run to work for the scheduled monitoring trigger).
+    Rather than fight over which port ingress points at, point the Jira
+    automation rule at THIS endpoint instead - same request body as before,
+    just a different external host. Container 1 forwards it internally to
+    Container 2 via the same localhost:8001 call every other tool here
+    already uses (_call_monitor), so ingress can stay on 8000 permanently.
 
+    No logic lives here - Container 2's /tools/jira-status-update remains
+    the single source of truth for the six-status mapping and the
+    master-list <-> IgnoredSecretRegistry move logic. This route only
+    exists to make it reachable from outside the Container App.
+    """
+    return await _call_monitor("jira-status-update", req.dict())
+
+# NOTE: /jira-webhook and _update_sharepoint_on_close() were REMOVED here -
+# see the module docstring at the top of this file for why. Jira automation
+# now calls Container 2's /tools/jira-status-update directly (via the
+# /jira-status-update proxy above); the retired /jira-webhook endpoint's old
+# 3-status logic is not reused here.
 ```

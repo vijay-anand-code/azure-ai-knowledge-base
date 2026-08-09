@@ -1,32 +1,34 @@
-## Source
+## Source — DevSecOpsSecretMonitoringRegistry cleanup
+
+`devsecops-secret-governance-sharepoint-cleanup.py` — one-time cleanup that deletes ALL rows from the main active registry list, keyed off `SHAREPOINT-LIST-ID`. Run this to reset the list before a fresh discovery + monitoring run.
 
 ```python
 """
-runbook_cleanup_sharepoint.py — Azure Automation Runbook
-=========================================================
-Purpose : ONE-TIME cleanup — deletes ALL rows from SecretAlertRegistry.
-          Run this to reset the list before a fresh discovery + monitoring run.
-
+devsecops-secret-governance-sharepoint-cleanup.py - Azure Automation Runbook
+==============================================================================
+Purpose : ONE-TIME cleanup — deletes ALL rows from DevSecOpsSecretAlertRegistry list in SharePoint.
+          Run this to reset the DevSecOpsSecretAlertRegistry list before a fresh discovery + monitoring run.
+ 
 WARNING : This deletes ALL rows permanently. Run discovery immediately after.
-
+ 
 Authentication: Federated credential
   UAMI asserts identity → App Registration → Graph API token
   No client secrets or certificates needed anywhere.
-
+ 
 Required Automation Variables:
   ROTATOR_KV_URL  — Key Vault URL
   UAMI_CLIENT_ID  — User-assigned Managed Identity client ID
-
+ 
 Required Key Vault secrets:
   GRAPH-TENANT-ID         — Azure tenant ID
   SHAREPOINT-SITE-ID      — SharePoint site composite ID
-  SHAREPOINT-LIST-ID      — SecretAlertRegistry list ID
+  SHAREPOINT-LIST-ID      — DevSecOpsSecretAlertRegistry list ID
   CROSS-TENANT-APP-ID     — App Registration client ID
   CROSS-TENANT-TENANT-ID  — Tenant ID for federated credential
 """
-
+ 
 from __future__ import annotations
-
+ 
 import json
 import logging
 import sys
@@ -34,40 +36,40 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
-
+ 
 import automationassets
 from azure.identity import ManagedIdentityCredential, ClientAssertionCredential
 from azure.keyvault.secrets import SecretClient
-
+ 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 log = logging.getLogger("sp-cleanup")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTOMATION VARIABLES
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def _get_var(name: str) -> str:
     value = automationassets.get_automation_variable(name)
     if not value:
         raise ValueError(f"Automation Variable '{name}' is not set.")
     return str(value).strip()
-
+ 
 ROTATOR_KV_URL = _get_var("ROTATOR_KV_URL")
 UAMI_CLIENT_ID = _get_var("UAMI_CLIENT_ID")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # AZURE CLIENTS — Key Vault (UAMI used only for KV access)
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 _credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
 _config_kv  = SecretClient(vault_url=ROTATOR_KV_URL, credential=_credential)
-
+ 
 def _kv_get(name: str) -> str:
     try:
         return _config_kv.get_secret(name).value
     except Exception as exc:
         raise RuntimeError(f"Required KV secret '{name}' could not be loaded: {exc}") from exc
-
+ 
 log.info("Loading config secrets from Key Vault...")
 GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
 SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
@@ -75,39 +77,39 @@ SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-LIST-ID")
 CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
 CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
 log.info("Config secrets loaded.")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 _uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
-
+ 
 def _get_uami_assertion() -> str:
     token = _uami_credential.get_token("api://AzureADTokenExchange")
     return token.token
-
+ 
 _graph_credential = ClientAssertionCredential(
     tenant_id = CROSS_TENANT_TENANT_ID,
     client_id = CROSS_TENANT_APP_ID,
     func      = _get_uami_assertion,
 )
-
+ 
 def _graph_token() -> str:
     token = _graph_credential.get_token("https://graph.microsoft.com/.default")
     return token.token
-
+ 
 def _auth_hdrs() -> dict:
     return {"Authorization": f"Bearer {_graph_token()}"}
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def _get(url: str, timeout: int = 30) -> dict:
     req = urllib.request.Request(url, headers=_auth_hdrs(), method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
-
+ 
 def _delete(url: str, timeout: int = 30) -> None:
     req = urllib.request.Request(url, headers=_auth_hdrs(), method="DELETE")
     try:
@@ -116,17 +118,17 @@ def _delete(url: str, timeout: int = 30) -> None:
     except urllib.error.HTTPError as e:
         if e.code not in (204, 404):
             raise
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def main():
     base = (
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
         f"/lists/{SHAREPOINT_LIST_ID}/items"
     )
-
+ 
     # Step 1 — Fetch all item IDs
     log.info("Fetching all SharePoint rows...")
     url      = f"{base}?$select=id&$top=999"
@@ -135,18 +137,18 @@ def main():
         b = _get(url)
         item_ids.extend([i["id"] for i in b.get("value", [])])
         url = b.get("@odata.nextLink")
-
+ 
     total = len(item_ids)
     log.info("Found %d rows to delete", total)
-
+ 
     if total == 0:
         print("SharePoint list is already empty — nothing to delete.")
         return
-
+ 
     # Step 2 — Delete all rows
     deleted = 0
     failed  = 0
-
+ 
     for item_id in item_ids:
         try:
             _delete(f"{base}/{item_id}")
@@ -157,7 +159,7 @@ def main():
         except Exception as e:
             failed += 1
             log.warning("Failed to delete item %s: %s", item_id, e)
-
+ 
     print("=" * 60)
     print("SHAREPOINT CLEANUP — SUMMARY")
     print("=" * 60)
@@ -169,7 +171,187 @@ def main():
     else:
         print(f"\n  Completed with {failed} failures — check logs above.")
         sys.exit(1)
-
+ 
 main()
+ 
+```
 
+---
+
+## Source — IgnoredSecretRegistry cleanup
+
+`devsecops-secret-governance-ignore-registry-sharepoint-cleanup.py` — the same one-time cleanup logic, but keyed off `SHAREPOINT-IGNORED-LIST-ID` instead, so it empties `IgnoredSecretRegistry` rather than the active registry. Its own module docstring still calls the target list `IgnoreSecretRegistry` (missing the "d") — that's a typo in the source itself, not a different list.
+
+```python
+"""
+devsecops-secret-governance-sharepoint-cleanup.py - Azure Automation Runbook
+==============================================================================
+Purpose : ONE-TIME cleanup — deletes ALL rows from IgnoreSecretRegistry  list in SharePoint.
+          Run this to reset the IgnoreSecretRegistry  list before a fresh discovery + monitoring run.
+ 
+WARNING : This deletes ALL rows permanently. Run discovery immediately after.
+ 
+Authentication: Federated credential
+  UAMI asserts identity → App Registration → Graph API token
+  No client secrets or certificates needed anywhere.
+ 
+Required Automation Variables:
+  ROTATOR_KV_URL  — Key Vault URL
+  UAMI_CLIENT_ID  — User-assigned Managed Identity client ID
+ 
+Required Key Vault secrets:
+  GRAPH-TENANT-ID         — Azure tenant ID
+  SHAREPOINT-SITE-ID      — SharePoint site composite ID
+  SHAREPOINT-IGNORED-LIST-ID      — IgnoreSecretRegistry list ID
+  CROSS-TENANT-APP-ID     — App Registration client ID
+  CROSS-TENANT-TENANT-ID  — Tenant ID for federated credential
+"""
+ 
+from __future__ import annotations
+ 
+import json
+import logging
+import sys
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+ 
+import automationassets
+from azure.identity import ManagedIdentityCredential, ClientAssertionCredential
+from azure.keyvault.secrets import SecretClient
+ 
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+log = logging.getLogger("sp-cleanup")
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTOMATION VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def _get_var(name: str) -> str:
+    value = automationassets.get_automation_variable(name)
+    if not value:
+        raise ValueError(f"Automation Variable '{name}' is not set.")
+    return str(value).strip()
+ 
+ROTATOR_KV_URL = _get_var("ROTATOR_KV_URL")
+UAMI_CLIENT_ID = _get_var("UAMI_CLIENT_ID")
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# AZURE CLIENTS — Key Vault (UAMI used only for KV access)
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+_config_kv  = SecretClient(vault_url=ROTATOR_KV_URL, credential=_credential)
+ 
+def _kv_get(name: str) -> str:
+    try:
+        return _config_kv.get_secret(name).value
+    except Exception as exc:
+        raise RuntimeError(f"Required KV secret '{name}' could not be loaded: {exc}") from exc
+ 
+log.info("Loading config secrets from Key Vault...")
+GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
+SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
+SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-IGNORED-LIST-ID")
+CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
+CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+log.info("Config secrets loaded.")
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# GRAPH TOKEN — Federated Credential (UAMI → App Registration → Graph)
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+_uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+ 
+def _get_uami_assertion() -> str:
+    token = _uami_credential.get_token("api://AzureADTokenExchange")
+    return token.token
+ 
+_graph_credential = ClientAssertionCredential(
+    tenant_id = CROSS_TENANT_TENANT_ID,
+    client_id = CROSS_TENANT_APP_ID,
+    func      = _get_uami_assertion,
+)
+ 
+def _graph_token() -> str:
+    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
+ 
+def _auth_hdrs() -> dict:
+    return {"Authorization": f"Bearer {_graph_token()}"}
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def _get(url: str, timeout: int = 30) -> dict:
+    req = urllib.request.Request(url, headers=_auth_hdrs(), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+ 
+def _delete(url: str, timeout: int = 30) -> None:
+    req = urllib.request.Request(url, headers=_auth_hdrs(), method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code not in (204, 404):
+            raise
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def main():
+    base = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_LIST_ID}/items"
+    )
+ 
+    # Step 1 — Fetch all item IDs
+    log.info("Fetching all SharePoint rows...")
+    url      = f"{base}?$select=id&$top=999"
+    item_ids = []
+    while url:
+        b = _get(url)
+        item_ids.extend([i["id"] for i in b.get("value", [])])
+        url = b.get("@odata.nextLink")
+ 
+    total = len(item_ids)
+    log.info("Found %d rows to delete", total)
+ 
+    if total == 0:
+        print("SharePoint list is already empty — nothing to delete.")
+        return
+ 
+    # Step 2 — Delete all rows
+    deleted = 0
+    failed  = 0
+ 
+    for item_id in item_ids:
+        try:
+            _delete(f"{base}/{item_id}")
+            deleted += 1
+            if deleted % 50 == 0:
+                print(f"  Deleted {deleted}/{total}...")
+            time.sleep(0.1)  # small pause to avoid throttling
+        except Exception as e:
+            failed += 1
+            log.warning("Failed to delete item %s: %s", item_id, e)
+ 
+    print("=" * 60)
+    print("SHAREPOINT CLEANUP — SUMMARY")
+    print("=" * 60)
+    print(f"  Total rows found : {total}")
+    print(f"  Deleted          : {deleted}")
+    print(f"  Failed           : {failed}")
+    if failed == 0:
+        print(f"\n  Done — run discovery runbook next to repopulate.")
+    else:
+        print(f"\n  Completed with {failed} failures — check logs above.")
+        sys.exit(1)
+ 
+main()
+ 
 ```
