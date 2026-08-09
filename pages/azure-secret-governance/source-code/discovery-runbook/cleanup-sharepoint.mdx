@@ -1,6 +1,6 @@
-## Source — DevSecOpsSecretMonitoringRegistry cleanup
+## Source: DevSecOpsSecretMonitoringRegistry cleanup
 
-`devsecops-secret-governance-sharepoint-cleanup.py` — one-time cleanup that deletes ALL rows from the main active registry list, keyed off `SHAREPOINT-LIST-ID`. Run this to reset the list before a fresh discovery + monitoring run.
+`devsecops-secret-governance-sharepoint-cleanup.py`: one-time cleanup that deletes ALL rows from the main active registry list, keyed off `SHAREPOINT-LIST-ID`. Run this to reset the list before a fresh discovery + monitoring run.
 
 ```python
 """
@@ -178,9 +178,9 @@ main()
 
 ---
 
-## Source — IgnoredSecretRegistry cleanup
+## Source: IgnoredSecretRegistry cleanup
 
-`devsecops-secret-governance-ignore-registry-sharepoint-cleanup.py` — the same one-time cleanup logic, but keyed off `SHAREPOINT-IGNORED-LIST-ID` instead, so it empties `IgnoredSecretRegistry` rather than the active registry. Its own module docstring still calls the target list `IgnoreSecretRegistry` (missing the "d") — that's a typo in the source itself, not a different list.
+`devsecops-secret-governance-ignore-registry-sharepoint-cleanup.py`: the same one-time cleanup logic, but keyed off `SHAREPOINT-IGNORED-LIST-ID` instead, so it empties `IgnoredSecretRegistry` rather than the active registry. Its own module docstring still calls the target list `IgnoreSecretRegistry` (missing the "d"); that's a typo in the source itself, not a different list.
 
 ```python
 """

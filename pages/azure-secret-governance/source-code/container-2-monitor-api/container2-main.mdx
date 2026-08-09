@@ -1,17 +1,17 @@
 ---
 title: main.py (Container 2)
-description: FastAPI REST API — all tool implementations and endpoints for the secret monitoring system
+description: FastAPI REST API for all tool implementations and endpoints in the secret monitoring system
 ---
 
 import { Callout } from 'nextra/components'
 
-# main.py — Container 2 (Monitor REST API)
+# main.py (Container 2 Monitor REST API)
 
 **Location:** `secret-governance-app/container-2/main.py`
 
-**Runtime:** Python 3.11 — Azure Container App (internal port 8001)
+**Runtime:** Python 3.11, Azure Container App (internal port 8001)
 
-**What it does:** Exposes all the tool implementations as FastAPI endpoints. Container 1 (LangChain agent) calls these endpoints to interact with Entra ID, SharePoint, Jira, Teams, and Blob Storage. Also handles the Jira automation webhook (`/tools/jira-status-update`) directly — no LangChain or OpenAI tokens needed for that.
+**What it does:** Exposes all the tool implementations as FastAPI endpoints. Container 1 (LangChain agent) calls these endpoints to interact with Entra ID, SharePoint, Jira, Teams, and Blob Storage. Also handles the Jira automation webhook (`/tools/jira-status-update`) directly, needing no LangChain or OpenAI tokens for that.
 
 ---
 
@@ -19,7 +19,7 @@ import { Callout } from 'nextra/components'
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/health` | GET | Health check — returns `{"status": "ok"}` |
+| `/health` | GET | Health check, returns `{"status": "ok"}` |
 | `/tools/fetch_azure_secrets` | POST | Lists all App Registrations and their secrets from Entra ID, across every configured tenant |
 | `/tools/get_sharepoint_state` | POST | Reads all rows from `SecretAlertRegistry` |
 | `/tools/write_sharepoint_row` | POST | Creates or updates a `SecretAlertRegistry` row |
@@ -28,13 +28,13 @@ import { Callout } from 'nextra/components'
 | `/tools/add_jira_comment` | POST | Adds a comment to a Jira ticket |
 | `/tools/send_teams_alert` | POST | Sends an Adaptive Card to the Teams webhook, optionally with an `@mention` |
 | `/tools/run_secret_monitoring` | POST | Runs the full monitoring cycle via `decision_engine.py`, including the pre-run backup snapshot of both SharePoint lists |
-| `/tools/update_on_jira_close` | POST | Legacy — marks matching rows `Rotated`. Superseded by `/tools/jira-status-update` |
-| `/tools/jira-status-update` | POST | Unified Jira transition handler — the real handler behind Container 1's `/jira-status-update` proxy. See [Jira transition handling](#jira-transition-handling) below |
-| `/tools/update_on_jira_reopen` | POST | Legacy compatibility shim — calls `/tools/jira-status-update` with `to_status="In Progress"` |
+| `/tools/update_on_jira_close` | POST | Legacy, marks matching rows `Rotated`. Superseded by `/tools/jira-status-update` |
+| `/tools/jira-status-update` | POST | Unified Jira transition handler, the real handler behind Container 1's `/jira-status-update` proxy. See [Jira transition handling](#jira-transition-handling) below |
+| `/tools/update_on_jira_reopen` | POST | Legacy compatibility shim that calls `/tools/jira-status-update` with `to_status="In Progress"` |
 
 <Callout type="warning">
   This container's live Jira project (KAN) only ever transitions a ticket through four real
-  statuses — To Do, In Progress, Waiting for Customer, Resolved — verified directly against the
+  statuses (To Do, In Progress, Waiting for Customer, Resolved), verified directly against the
   Jira project itself. `/tools/jira-status-update`'s code also recognizes Done, Canceled/Cancelled,
   Blocked, and "Awaiting Reporter: Needs more information" defensively, but those transitions are
   not reachable in this deployment; don't take their presence in the code as evidence the live
@@ -48,14 +48,14 @@ import { Callout } from 'nextra/components'
 
 | Decision | Reason |
 |----------|--------|
-| UAMI for Graph auth | No client secrets in code or environment variables — UAMI token obtained at runtime |
-| `DevSecOpsOwnership` populated, but not a hard gate here | This file reads `OWNER-EMAILS`/`OWNER-EMAIL` from Key Vault for backwards compatibility only (ignored by `decision_engine.py`'s default `manual_owners_only=True`). `DevSecOpsOwnership` itself no longer gates ticket/Teams-alert creation in `decision_engine.py` — see that page's Ownership section |
-| Jira webhook handled directly | Status transitions don't need AI reasoning — a direct SharePoint update is faster (2–3s vs 30–60s) and avoids OpenAI rate limits |
+| UAMI for Graph auth | No client secrets in code or environment variables; the UAMI token is obtained at runtime |
+| `DevSecOpsOwnership` populated, but not a hard gate here | This file reads `OWNER-EMAILS`/`OWNER-EMAIL` from Key Vault for backwards compatibility only (ignored by `decision_engine.py`'s default `manual_owners_only=True`). `DevSecOpsOwnership` itself no longer gates ticket/Teams-alert creation in `decision_engine.py`; see that page's Ownership section |
+| Jira webhook handled directly | Status transitions don't need AI reasoning, so a direct SharePoint update is faster (2–3s vs 30–60s) and avoids OpenAI rate limits |
 | `httpx.AsyncClient` | All tool implementations are async for compatibility with FastAPI's async event loop |
 | Date/time columns carry full EST timestamps, not truncated | `LastChecked`, `AlertSentDate`, `RotationDetectedDate`, `JiraTicketCreatedDate`, and `ExpirationDate` arrive pre-formatted (via `decision_engine.py`'s `_format_datetime_est`/`_now_est_string`, matching `runbook_discovery.py`'s format exactly) rather than as raw ISO strings, so `write_sharepoint_row` no longer slices any of them to 10 characters |
 | Two credential scopes, not one | Entra scanning and SharePoint access are deliberately kept on separate federated credentials. See "Multi-tenant credentials" below |
 | `get_product_service_principal()` | Looks up a Key Vault secret named exactly after a row's `ProductName` and returns its value, or `None` if no such secret exists. A missing secret is expected, not an error, so one unrecognized product doesn't fail the whole run. Passed into `decision_engine.py` as `get_product_service_principal`; no allowlist gate on this path (the separate sync script's `ALLOWED-PRODUCT-NAMES` gate is not part of this file) |
-| `fetch_app_owners()` prefers display names | Returns a comma-separated list of Entra display names now (falling back to UPN/email only when Entra has no display name for that user) — an explicit client requirement ("names, not emails"). An earlier version always returned the UPN |
+| `fetch_app_owners()` prefers display names | Returns a comma-separated list of Entra display names now (falling back to UPN/email only when Entra has no display name for that user), per an explicit client requirement ("names, not emails"). An earlier version always returned the UPN |
 | Backup rotation wired here, executed there | `get_list_state`/`create_list_row`/`delete_list_row`/`upload_backup_to_storage` are the actual HTTP/Storage calls; the ordering and abort logic that calls them lives in `decision_engine.py`'s `_rotate_backup_list()` |
 
 <Callout type="info">
@@ -68,7 +68,7 @@ import { Callout } from 'nextra/components'
   A couple of this file's own docstrings and inline comments still say `ManualAppOwners` (e.g. in
   `get_product_service_principal()`'s docstring) even though the SharePoint column itself was
   renamed to `DevSecOpsOwnership` everywhere it's actually used. Treat those specific comments as
-  stale wording, not a second column — there is only one ownership column in the live schema,
+  stale wording, not a second column; there is only one ownership column in the live schema,
   `DevSecOpsOwnership`.
 </Callout>
 
@@ -83,14 +83,14 @@ Container 2 scans App Registrations across multiple Entra ID tenants, but ShareP
 | Per-tenant scanning credential | One `ClientAssertionCredential` is built for every entry in `CROSS-TENANT-TENANT-IDS` (plural, comma-separated). Falls back to the older singular `CROSS-TENANT-TENANT-ID` if the plural secret isn't set | `fetch_azure_secrets`, `fetch_app_owners` |
 | Home-tenant SharePoint credential | Always `HOME-TENANT-ID`, falling back to `GRAPH-TENANT-ID` if not set | `get_sharepoint_state`, `write_sharepoint_row`, `get_ignored_sharepoint_state`, `get_list_state`, `create_list_row`, `delete_list_row` |
 
-Both credentials assert through the same UAMI and the same `CROSS-TENANT-APP-ID` App Registration — the split is about which `tenant_id` each `ClientAssertionCredential` is constructed with, not a second App Registration.
+Both credentials assert through the same UAMI and the same `CROSS-TENANT-APP-ID` App Registration; the split is about which `tenant_id` each `ClientAssertionCredential` is constructed with, not a second App Registration.
 
 <Callout type="warning">
   An earlier version of this file used a single credential, scoped to whatever tenant was
   currently being scanned, for both Entra and SharePoint calls. That happened to work only
   because the scanned tenant and the SharePoint tenant were the same at the time. Once
   `CROSS-TENANT-TENANT-IDS` started pointing at a genuinely different tenant for multi-tenant
-  scanning, every SharePoint call in this file inherited that same tenant scope too — producing
+  scanning, every SharePoint call in this file inherited that same tenant scope too, producing
   `{"code":"BadRequest","message":"Tenant does not have a SPO license."}`. The fix is to build
   one federated credential per scanned tenant for Entra calls, and keep a separate credential
   permanently pinned to the home tenant for every SharePoint call, regardless of which tenant is
@@ -108,7 +108,7 @@ implemented here:
 |---|---|---|
 | `move_secret_to_ignored()` | master list → Ignored (create in Ignored, then delete from master) | `decision_engine.py`'s -8-day abandonment check; `/tools/jira-status-update`'s Canceled handling |
 | `create_ignored_row()` | straight into Ignored, no master-list row ever existed | `decision_engine.py`'s Phase 3a (brand-new secret already 8+ days expired) |
-| `move_secret_from_ignored()` | Ignored → master list (create in master, then delete from Ignored) | `/tools/jira-status-update`, when a ticket not found in the master list is found in `IgnoredSecretRegistry` instead — i.e. a Canceled ticket got reopened |
+| `move_secret_from_ignored()` | Ignored → master list (create in master, then delete from Ignored) | `/tools/jira-status-update`, when a ticket not found in the master list is found in `IgnoredSecretRegistry` instead, i.e. a Canceled ticket got reopened |
 | `get_ignored_sharepoint_state()` | read-only | both of the above reverse-lookup paths |
 
 Every move is create-first, delete-second, so a failure partway through leaves a row duplicated
@@ -116,7 +116,7 @@ across both lists (visible, safe to fix by hand) rather than vanishing from both
 
 <Callout type="warning">
   The reverse lookup (`move_secret_from_ignored`, triggered from `/tools/jira-status-update`)
-  depends on `IgnoredSecretRegistry` having a `JiraTicketKey` column — added specifically so a
+  depends on `IgnoredSecretRegistry` having a `JiraTicketKey` column, added specifically so a
   reopened ticket can be matched back to its row. Rows moved into `IgnoredSecretRegistry` before
   this column existed have no `JiraTicketKey` recorded and cannot be found by this reverse lookup
   even if their ticket is later reopened; only rows ignored from this point forward are covered.
@@ -127,7 +127,7 @@ across both lists (visible, safe to fix by hand) rather than vanishing from both
 ## Backup and archive helpers
 
 Both `SecretAlertRegistry` and `IgnoredSecretRegistry` get snapshotted into their own dedicated
-backup lists before every monitoring run touches either one — SharePoint has no built-in
+backup lists before every monitoring run touches either one, since SharePoint has no built-in
 point-in-time backup for a list. The actual HTTP/Storage boundary lives here; the ordering and
 abort logic that calls these functions is `decision_engine.py`'s `_rotate_backup_list()` (see that
 page's Backup rotation section for the full sequence).
@@ -136,14 +136,14 @@ page's Backup rotation section for the full sequence).
 |---|---|
 | `get_list_state(list_id)` / `create_list_row(list_id, fields)` / `delete_list_row(list_id, item_id)` | Generic, list-ID-parameterized versions of the master-list read/write/delete calls, shared between the master and Ignored backup lists instead of duplicating near-identical code twice |
 | `SHAREPOINT_BACKUP_LIST_ID` / `SHAREPOINT_IGNORED_BACKUP_LIST_ID` | From `SHAREPOINT-BACKUP-LIST-ID` / `SHAREPOINT-IGNORED-BACKUP-LIST-ID` in Key Vault. Falls back to `""` (that list's backup is skipped, logged) rather than crashing the container if not yet provisioned |
-| `upload_backup_to_storage(blob_name, items)` | Uploads a CSV snapshot of a backup list's full item set — captured right before it gets overwritten — to a Storage Account, via the Storage Blob REST API (a different token audience than Graph, so it cannot reuse the Graph credentials) |
+| `upload_backup_to_storage(blob_name, items)` | Uploads a CSV snapshot of a backup list's full item set, captured right before it gets overwritten, to a Storage Account, via the Storage Blob REST API (a different token audience than Graph, so it cannot reuse the Graph credentials) |
 | `BACKUP_STORAGE_ACCOUNT_URL` | From `BACKUP-STORAGE-ACCOUNT-URL`, deliberately optional. If unset, the rolling SharePoint-side backup still runs, the old snapshot is just discarded instead of archived, rather than blocking monitoring on a Storage Account that may not exist yet |
 | `_items_to_csv(items)` | Flattens Graph list items down to their `fields` dict and serializes as CSV. Columns are the union of every field name seen across all items, in first-seen order, so a row missing a column just gets an empty cell |
-| `backup_list_row_fields(source_fields)` | Strips SharePoint system/read-only fields (`id`, `Modified`, `_UIVersionString`, etc.) before a row gets re-created in a backup list — an allowlist-by-exclusion, so new business columns added to the source list later get backed up automatically with no code change |
+| `backup_list_row_fields(source_fields)` | Strips SharePoint system/read-only fields (`id`, `Modified`, `_UIVersionString`, etc.) before a row gets re-created in a backup list. It's an allowlist-by-exclusion, so new business columns added to the source list later get backed up automatically with no code change |
 
 <Callout type="info">
   `run_secret_monitoring()` only calls `_rotate_backup_list()` at all if `get_list_state`,
-  `create_list_row`, and `delete_list_row` were all passed in — `/tools/run_secret_monitoring`
+  `create_list_row`, and `delete_list_row` were all passed in. `/tools/run_secret_monitoring`
   below always wires up all three, plus `upload_backup_to_storage` conditionally on
   `BACKUP_STORAGE_ACCOUNT_URL` being set.
 </Callout>
@@ -157,27 +157,27 @@ The request body carries `jira_key`, `to_status`, `today`, and six custom fields
 `product_name`, `product_teams_key_vault_name`, `new_secret_vault_name`, `new_secret_key_id`, and
 `new_secret_present`. A seventh field, `devsecops_ownership`, is still accepted on the request
 model for backwards compatibility but is never sent by the current automation rule and never acted
-on — the old `DevSecOpsOwnership` Jira custom field was removed from Jira entirely; ownership is
+on, since the old `DevSecOpsOwnership` Jira custom field was removed from Jira entirely; ownership is
 resolved from `ProductName` via Key Vault instead.
 
 Full setup instructions, the exact custom field IDs, and the real-vs-defensive status breakdown
 live on the [Jira Automation](/azure-secret-governance/jira) page. In brief, this endpoint:
 
 - Maps Resolved → `Rotated`, In Progress/To Do → `JiraRaised` (reopened), Waiting for Customer →
-  `AwaitingReporter` — the only three statuses the live KAN workflow ever actually sends.
+  `AwaitingReporter`, the only three statuses the live KAN workflow ever actually sends.
 - Also recognizes Done, Canceled/Cancelled, Blocked, and "Awaiting Reporter: Needs more
   information" defensively, in case this endpoint ever serves a different Jira project with a
   fuller workflow. Canceled specifically triggers a physical move to `IgnoredSecretRegistry`
   rather than an in-place status change.
 - Backfills `TeamName`, `ProductName`, `ProductTeamsKeyVaultName`, `NewSecretVaultName`, and
-  `NewSecretKeyId` onto the matching row on both the In Progress and Resolved transitions — but
+  `NewSecretKeyId` onto the matching row on both the In Progress and Resolved transitions, but
   only into columns that are still blank, never overwriting a value already set directly in
   SharePoint.
 - Posts an acknowledgment comment on the ticket immediately at the In Progress transition if the
   engineer marked `new_secret_present` as `"No"`, rather than leaving them with no confirmation
   until the rotation runbook actually runs, which could be much later.
 - If the ticket isn't found in the master list and the transition isn't Canceled, checks
-  `IgnoredSecretRegistry` too, and moves any match back to the master list — covering a
+  `IgnoredSecretRegistry` too, and moves any match back to the master list, covering a
   previously-Canceled ticket that's been reopened.
 
 ---

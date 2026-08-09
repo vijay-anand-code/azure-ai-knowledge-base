@@ -5,7 +5,7 @@ description: Full annotated source code for all runbooks and container files
 
 # Source Code
 
-Complete source for every file in the secret governance system — runbooks that run in
+Complete source for every file in the secret governance system: runbooks that run in
 Azure Automation and the container files that power the monitoring API.
 
 ---
@@ -16,19 +16,19 @@ Azure Automation and the container files that power the monitoring API.
 |------|----------|-------------|
 | [runbook_discovery.py](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery) | Mon 00:00 | Scans all App Registrations, fetches owners in parallel, batch-writes to SharePoint |
 | [owner_sync_local.py](/azure-secret-governance/source-code/owner-sync-runbook/owner-sync-local) | Manual | Run locally from a laptop, adds `DevSecOpsOwnership` identities as Entra owners |
-| [runbook_monitoring.py](/azure-secret-governance/source-code/monitoring-runbook/runbook-monitoring) | Mon 00:30 | Triggers the monitoring container — fire and forget |
+| [runbook_monitoring.py](/azure-secret-governance/source-code/monitoring-runbook/runbook-monitoring) | Mon 00:30 | Triggers the monitoring container, fire and forget |
 | [runbook_rotation.py](/azure-secret-governance/source-code/rotation-runbook/runbook-rotation) | Mon 01:00 | Rotates P1/P2/P3 secrets, stores in Key Vault, updates Jira and SharePoint |
 
-## Container 1 — LangChain Agent
+## Container 1: LangChain Agent
 
 | File | What it does |
 |------|-------------|
-| [main.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-main) | FastAPI app — LangChain agent, tool definitions, all endpoints |
-| [teams_bot.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-teams-bot) | Standalone Teams Bot — receives and replies to Teams messages |
+| [main.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-main) | FastAPI app, LangChain agent, tool definitions, all endpoints |
+| [teams_bot.py](/azure-secret-governance/source-code/container-1-langchain-agent/container1-teams-bot) | Standalone Teams Bot, receives and replies to Teams messages |
 
-## Container 2 — Monitor REST API
+## Container 2: Monitor REST API
 
 | File | What it does |
 |------|-------------|
-| [main.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-main) | FastAPI app — all tool implementations and HTTP endpoints |
-| [decision_engine.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-decision-engine) | Async orchestrator — classifies secrets, raises tickets, sends alerts |
+| [main.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-main) | FastAPI app, all tool implementations and HTTP endpoints |
+| [decision_engine.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-decision-engine) | Async orchestrator, classifies secrets, raises tickets, sends alerts |

@@ -9,23 +9,30 @@ import { Callout } from 'nextra/components'
 
 **Location:** `secret-governance-infra/runbooks/runbook_discovery.py`
 
-**Runtime:** Python 3.10 — Azure Automation Account
+**Runtime:** Python 3.10, Azure Automation Account
 
-**Schedule:** Weekly at `00:00`, 30 minutes before monitoring. Also run manually when new App Registrations are added.
+**Schedule (as designed, not currently active):** Weekly at `00:00`, 30 minutes before monitoring. Also run manually when new App Registrations are added.
 
-**What it does:** Fetches all App Registrations and their secrets from every tenant listed in `CROSS-TENANT-TENANT-IDS`, resolves owners in parallel using a thread pool, classifies each secret into an expiry bucket (`P1`–`P4`, `ExpiredManualReview`, or `Ignore`), and batch-writes active-bucket rows to the `DevSecOpsSecretMonitoringRegistry` SharePoint list and expired-8-plus-day rows to `IgnoredSecretRegistry`, using Graph `$batch` for both. Before touching either list it snapshots their pre-run state into `DevSecOpsSecretMonitoringRegistryBackup` and `IgnoredSecretRegistryBackup` — a hard prerequisite that aborts the whole run if either backup write fails — then rotates out the prior run's backup rows once the new snapshot is confirmed written.
+**What it does:** Fetches all App Registrations and their secrets from every tenant listed in `CROSS-TENANT-TENANT-IDS`, resolves owners in parallel using a thread pool, classifies each secret into an expiry bucket (`P1`–`P4`, `ExpiredManualReview`, or `Ignore`), and batch-writes active-bucket rows to the `DevSecOpsSecretMonitoringRegistry` SharePoint list and expired-8-plus-day rows to `IgnoredSecretRegistry`, using Graph `$batch` for both. Before touching either list it snapshots their pre-run state into `DevSecOpsSecretMonitoringRegistryBackup` and `IgnoredSecretRegistryBackup`, a hard prerequisite that aborts the whole run if either backup write fails, then rotates out the prior run's backup rows once the new snapshot is confirmed written.
+
+<Callout type="warning">
+  **Not currently in use.** Unlike owner-sync, monitoring, and rotation, this runbook is not part
+  of the active weekly schedule in this deployment. It was used for initial onboarding/setup and
+  is retained here for reference; the schedule and behavior described on this page are how it's
+  designed to run, not what's currently scheduled in Azure Automation.
+</Callout>
 
 <Callout type="warning">
   The source below is the current file almost verbatim, and it has a couple of small internal
   inconsistencies worth flagging up front so they don't read as documentation mistakes:
 
   - `fetch_all_applications_all_tenants()`'s own docstring still says a single tenant failure
-    "does not abort the whole run" — that was true once, but `run_discovery()` now aborts the
+    "does not abort the whole run", that was true once, but `run_discovery()` now aborts the
     entire run (before any SharePoint read or write) if `tenant_fetch_errors` is non-empty for
     *any* tenant. The docstring was not updated when that changed; the abort behavior actually
     executed in `run_discovery()` is what happens today.
   - The module docstring's "What it does" point 5 still describes ignored-list writes as
-    "Always appended as a fresh row per run" — that was also true once, but Step 6 now upserts
+    "Always appended as a fresh row per run", that was also true once, but Step 6 now upserts
     (PATCHes an existing Ignored row in place instead of duplicating it) whenever the same
     secret is still in the Ignore bucket on a later run.
 </Callout>
@@ -36,26 +43,26 @@ import { Callout } from 'nextra/components'
 
 | Decision | Reason |
 |----------|--------|
-| `ThreadPoolExecutor` for owner fetching | Azure Automation is synchronous Python — asyncio is not available. Threads drop owner-fetch time from ~4 min to under 1s for 255 apps |
-| Graph `$batch` for SharePoint writes | Bundles up to 20 POST/PATCH requests into a single HTTP call — avoids throttling on large tenants |
-| Per-child batch retry, honoring `Retry-After` | `_execute_sp_batch_with_child_retry` retries only the specific child operations that came back with a transient status (429/503/504) inside a Graph `$batch` response — successful children in the same batch are never re-sent. Uses the server's `Retry-After` header when present, falling back to the standard exponential backoff otherwise |
-| Never overwrites `AlertStatus` on existing rows | Only monitoring changes `AlertStatus` after creation. Discovery only stamps owners, severity, and expiry on update — safe to run anytime |
+| `ThreadPoolExecutor` for owner fetching | Azure Automation is synchronous Python; asyncio is not available. Threads drop owner-fetch time from ~4 min to under 1s for 255 apps |
+| Graph `$batch` for SharePoint writes | Bundles up to 20 POST/PATCH requests into a single HTTP call, avoiding throttling on large tenants |
+| Per-child batch retry, honoring `Retry-After` | `_execute_sp_batch_with_child_retry` retries only the specific child operations that came back with a transient status (429/503/504) inside a Graph `$batch` response; successful children in the same batch are never re-sent. Uses the server's `Retry-After` header when present, falling back to the standard exponential backoff otherwise |
+| Never overwrites `AlertStatus` on existing rows | Only monitoring changes `AlertStatus` after creation. Discovery only stamps owners, severity, and expiry on update, so it's safe to run anytime |
 | P1 through P4 and ExpiredManualReview all written to `DevSecOpsSecretMonitoringRegistry` | Owners are stamped on every bucket, including P4 (61+ days, safe), so they're already in place when a secret ages down into P3, P2, and beyond. Only the `Ignore` bucket (expired 8+ days) is excluded from this list |
-| `Ignore` bucket routed to `IgnoredSecretRegistry`, not skipped | Secrets expired 8+ days ago have no remediation value in the active list, but are still upserted into `IgnoredSecretRegistry` (with owners and an `IgnoreReason`) rather than dropped entirely — a repeat Ignore-bucket hit PATCHes the existing row instead of creating a duplicate |
-| `IgnoredSecretRegistry` is a hard prerequisite for the whole run | Unlike the backup lists (which skip backup with a warning if unconfigured), a missing `SHAREPOINT-IGNORED-LIST-ID` now aborts discovery entirely, before any SharePoint read or write — expired-8+-day secrets need somewhere safe to land, so discovery refuses to run at all rather than silently dropping them |
+| `Ignore` bucket routed to `IgnoredSecretRegistry`, not skipped | Secrets expired 8+ days ago have no remediation value in the active list, but are still upserted into `IgnoredSecretRegistry` (with owners and an `IgnoreReason`) rather than dropped entirely; a repeat Ignore-bucket hit PATCHes the existing row instead of creating a duplicate |
+| `IgnoredSecretRegistry` is a hard prerequisite for the whole run | Unlike the backup lists (which skip backup with a warning if unconfigured), a missing `SHAREPOINT-IGNORED-LIST-ID` now aborts discovery entirely, before any SharePoint read or write. Expired-8+-day secrets need somewhere safe to land, so discovery refuses to run at all rather than silently dropping them |
 | Unparseable `endDateTime` routes to `ExpiredManualReview`, not `Ignore` | A secret whose expiry date fails to parse is classified directly as `ExpiredManualReview` (notice: `UNPARSEABLE endDateTime - manual review required`) and stays visible in the active list. An older version routed parse failures into the `Ignore` bucket via a `-9999` sentinel day count, which mislabeled them with `IgnoreReason: Expired8Plus` and swept them out of sight into `IgnoredSecretRegistry` |
-| Owner-fetch failures leave `AppOwners` untouched, not blanked | `fetch_app_owners` returns `None` (not `""`) when the Graph call itself fails, so discovery skips the `AppOwners` field entirely on that write rather than overwriting a good value with blank. A successful lookup that legitimately finds zero owners still writes `""`, clearing a stale value on purpose — only a failed *lookup* is treated differently from a successful-but-empty one |
+| Owner-fetch failures leave `AppOwners` untouched, not blanked | `fetch_app_owners` returns `None` (not `""`) when the Graph call itself fails, so discovery skips the `AppOwners` field entirely on that write rather than overwriting a good value with blank. A successful lookup that legitimately finds zero owners still writes `""`, clearing a stale value on purpose; only a failed *lookup* is treated differently from a successful-but-empty one |
 | `DevSecOpsOwnership`, `TeamName`, `ProductName`, `ProductTeamsKeyVaultName` never written by discovery | All four are excluded from both the new-row fields and the existing-row diff/PATCH logic, on every run. `DevSecOpsOwnership` is filled in by a human (or resolved by monitoring/owner sync from `ProductName`); the other three are filled in by hand once per app, or copied automatically onto a rotated secret's new row by monitoring's lineage tracking, never by discovery |
-| Row identity includes `TenantID` | Existing/Ignored row lookups key on `(TenantID, appId, SecretID)`, not just `(appId, SecretID)` — `get_existing_sp_rows()` now raises if the same triple appears twice, surfacing genuine SharePoint duplicate data at read time instead of silently picking one row |
+| Row identity includes `TenantID` | Existing/Ignored row lookups key on `(TenantID, appId, SecretID)`, not just `(appId, SecretID)`. `get_existing_sp_rows()` now raises if the same triple appears twice, surfacing genuine SharePoint duplicate data at read time instead of silently picking one row |
 | Backup: write new snapshot before purging the old one | Each run's backup of `DevSecOpsSecretMonitoringRegistry` and `IgnoredSecretRegistry` is written first; only after that succeeds are the prior run's backup rows purged, so there's never a moment with zero backup for either list |
-| Purge failures are warnings, not errors | Non-fatal backup-purge failures (leftover prior-run rows) go to `summary["warnings"]`, kept separate from `summary["errors"]`, which alone decides the run's exit code — a purge hiccup no longer makes an otherwise-successful run report failure |
+| Purge failures are warnings, not errors | Non-fatal backup-purge failures (leftover prior-run rows) go to `summary["warnings"]`, kept separate from `summary["errors"]`, which alone decides the run's exit code, so a purge hiccup no longer makes an otherwise-successful run report failure |
 | Ignored-to-active recovery is confirm-before-delete | A secret sitting in `IgnoredSecretRegistry` whose `endDateTime` is later extended in Entra gets a fresh `DevSecOpsSecretMonitoringRegistry` row created; its stale Ignored row is deleted only once that new active write is confirmed successful. If the write wasn't confirmed, the Ignored row is deliberately left in place and a warning is logged |
-| Active-to-Ignored move is also confirm-before-delete | The mirror case: when a secret newly lands in the `Ignore` bucket, its existing active-list row is deleted only after the new `IgnoredSecretRegistry` row is confirmed written — a secret is never left with zero rows in either list because of a mid-batch failure |
+| Active-to-Ignored move is also confirm-before-delete | The mirror case: when a secret newly lands in the `Ignore` bucket, its existing active-list row is deleted only after the new `IgnoredSecretRegistry` row is confirmed written, so a secret is never left with zero rows in either list because of a mid-batch failure |
 | Two credential scopes, not one | Entra scanning and SharePoint access are deliberately kept on separate federated credentials. See "Multi-tenant credentials" below |
-| `TenantID` stamped per scanned tenant | Each row's `TenantID` reflects the tenant the app was actually fetched from, not a static home-tenant default. (The `TenantName` column was removed from SharePoint entirely — discovery no longer writes it anywhere) |
+| `TenantID` stamped per scanned tenant | Each row's `TenantID` reflects the tenant the app was actually fetched from, not a static home-tenant default. (The `TenantName` column was removed from SharePoint entirely; discovery no longer writes it anywhere) |
 | Reconciliation totals in the run summary | End of run, discovery prints total apps scanned and total secrets seen in Graph, meant to be diffed directly against a manual Entra CLI count. Secrets on apps skipped for missing `appId`/object ID now count toward that Graph-seen total too, so the reconciliation actually balances |
-| 404 PATCH → retry as POST | If a SharePoint item was deleted externally, discovery creates a fresh row instead of failing |
-| Federated credential | UAMI asserts identity to App Registration — no client secrets or certificates needed |
+| 404 PATCH, retry as POST | If a SharePoint item was deleted externally, discovery creates a fresh row instead of failing |
+| Federated credential | UAMI asserts identity to App Registration; no client secrets or certificates needed |
 
 ---
 
@@ -83,7 +90,7 @@ Both credentials assert through the same UAMI and the same `CROSS-TENANT-APP-ID`
 
 <Callout type="warning">
   If any configured tenant fails to fetch (`fetch_all_applications_for_tenant` raises), the
-  current code aborts the *entire* run before any SharePoint read or write happens — it does not
+  current code aborts the *entire* run before any SharePoint read or write happens; it does not
   proceed with just the tenants that succeeded. This is stricter than the surrounding docstring
   comments suggest; treat a partial multi-tenant fetch failure as a full-run failure, not a
   reduced-scope success.
@@ -108,14 +115,14 @@ Both credentials assert through the same UAMI and the same `CROSS-TENANT-APP-ID`
 | `HOME-TENANT-ID` | Tenant where SharePoint actually lives. Falls back to `GRAPH-TENANT-ID` if not set |
 | `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
 | `SHAREPOINT-LIST-ID` | `DevSecOpsSecretMonitoringRegistry` list ID |
-| `SHAREPOINT-IGNORED-LIST-ID` | `IgnoredSecretRegistry` list ID — required; the run aborts before any SharePoint access if this is missing |
-| `SHAREPOINT-BACKUP-LIST-ID` | `DevSecOpsSecretMonitoringRegistryBackup` list ID — required; the run aborts before any master-list change if this is missing |
-| `SHAREPOINT-IGNORED-BACKUP-LIST-ID` | `IgnoredSecretRegistryBackup` list ID — required; same hard-gate as above |
+| `SHAREPOINT-IGNORED-LIST-ID` | `IgnoredSecretRegistry` list ID; required, the run aborts before any SharePoint access if this is missing |
+| `SHAREPOINT-BACKUP-LIST-ID` | `DevSecOpsSecretMonitoringRegistryBackup` list ID; required, the run aborts before any master-list change if this is missing |
+| `SHAREPOINT-IGNORED-BACKUP-LIST-ID` | `IgnoredSecretRegistryBackup` list ID; required, same hard-gate as above |
 | `CROSS-TENANT-APP-ID` | App Registration client ID for the federated credential, shared by both tenant scopes |
 | `CROSS-TENANT-TENANT-IDS` | Comma-separated list of tenant IDs to scan for App Registrations. Falls back to the older singular `CROSS-TENANT-TENANT-ID` if not set |
 
 <Callout type="info">
-  Authentication uses a federated credential — the UAMI asserts its identity to the
+  Authentication uses a federated credential: the UAMI asserts its identity to the
   App Registration (`azure-secretgovernance-cross-tenant`) which then gets a Graph API
   token. The App Registration must have `Application.ReadWrite.OwnedBy` and
   `Sites.Selected` permissions granted with admin consent in every tenant listed in

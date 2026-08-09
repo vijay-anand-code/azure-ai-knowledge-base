@@ -8,10 +8,10 @@ import { Callout } from 'nextra/components'
 # runbook_monitoring.py
 
 **Location:** `devsecops-secret-governance-runbooks/devsecops-secret-governance-monitor-langchain.py`
-(the file on disk is named `devsecops-secret-governance-monitor-langchain.py` — this page keeps
+(the file on disk is named `devsecops-secret-governance-monitor-langchain.py`; this page keeps
 the `runbook_monitoring.py` slug used elsewhere in these docs for continuity)
 
-**Runtime:** Python 3.10 — Azure Automation Account
+**Runtime:** Python 3.10, Azure Automation Account
 
 **Schedule:** Weekly at `00:30`, 30 minutes after discovery. The gap gives discovery time to
 finish writing to `SecretAlertRegistry` before monitoring reads that same list, so monitoring
@@ -19,22 +19,22 @@ never reads a half-written run.
 
 **What it does:** Sends a POST to whatever `AGENT_ENDPOINT` points at, with an instruction to run
 the weekly monitoring check, and returns as soon as the request is accepted. It is a thin trigger
-stub — it contains none of the actual classification/ticket/alert logic itself, only the request
+stub: it contains none of the actual classification/ticket/alert logic itself, only the request
 and a success/failure check.
 
 <Callout type="warning">
   `AGENT_ENDPOINT` targets **Container 1's `/run` endpoint** (the LangChain agent), not Container
   2 directly. The script's own docstring says its purpose is to "trigger the Secret Monitoring
-  governance cycle in devsecopssecretgovernancelangchainagent" — i.e. the LangChain agent
-  container — and `/run` is only exposed by Container 1 (Container 2 exposes
+  governance cycle in devsecopssecretgovernancelangchainagent", i.e. the LangChain agent
+  container, and `/run` is only exposed by Container 1 (Container 2 exposes
   `/tools/run_secret_monitoring`, not `/run`). Container 1's `/run` handler
   (`run_governance_cycle()` in `main.py`) hands the instruction to the LangChain agent, which
-  normally responds by calling its `run_secret_monitoring` tool — that tool is what actually
+  normally responds by calling its `run_secret_monitoring` tool: that tool is what actually
   forwards the request internally to Container 2's `/tools/run_secret_monitoring` via Container
   1's `_call_monitor()` helper. So the real path is: this runbook → Container 1 `/run` → LangChain
   agent → Container 2 `/tools/run_secret_monitoring`, not a direct hit on Container 2. An earlier
   version of this page described `AGENT_ENDPOINT` as pointed straight at Container 2, bypassing
-  Container 1 entirely — that was incorrect and has been corrected here.
+  Container 1 entirely; that was incorrect and has been corrected here.
 </Callout>
 
 ---
@@ -45,7 +45,7 @@ and a success/failure check.
 |----------|--------|
 | Fire-and-forget pattern | Container 1's `/run` returns immediately and runs the actual cycle as a background task. A 30s timeout avoids the runbook hanging if the container is slow to respond |
 | Timeout treated as success | If no response arrives within 30s, or the connection resets, the request was already accepted and the cycle is running. Only a genuine HTTP error status from the container counts as a real failure. Raising an error on a plain timeout would be a false failure |
-| Minimal runbook | All classification, ticket, and alert logic lives in Container 2's `decision_engine.py`. This runbook only fires the trigger — the request passes through Container 1's LangChain agent on the way there, but there's no reasoning step involved for a fixed weekly instruction, so the agent effectively just calls its one `run_secret_monitoring` tool and returns |
+| Minimal runbook | All classification, ticket, and alert logic lives in Container 2's `decision_engine.py`. This runbook only fires the trigger: the request passes through Container 1's LangChain agent on the way there, but there's no reasoning step involved for a fixed weekly instruction, so the agent effectively just calls its one `run_secret_monitoring` tool and returns |
 
 ---
 

@@ -17,7 +17,7 @@ manually update SharePoint for any of these transitions.
   The live KAN "IT Helpdesk" project's actual workflow (verified directly against Jira) has
   exactly **four** statuses: To Do, In Progress, Waiting for Customer, Resolved. The endpoint's
   code also recognizes Done, Canceled/Cancelled, Blocked, and "Awaiting Reporter: Needs more
-  information" as a broader, defensive mapping — but none of those are real transitions this
+  information" as a broader, defensive mapping, but none of those are real transitions this
   project's tickets can ever actually be moved to. Don't configure the automation trigger to
   watch for them; they can't fire.
 </Callout>
@@ -26,7 +26,7 @@ manually update SharePoint for any of these transitions.
   This page describes the current, corrected setup. An earlier version of this integration
   called a `/jira-webhook` endpoint on Container 1 that only recognized three status names and
   silently did nothing for the other three. That endpoint has been retired. The replacement,
-  `/jira-status-update`, is also on Container 1 — it's a thin proxy, not a move to Container 2.
+  `/jira-status-update`, is also on Container 1: it's a thin proxy, not a move to Container 2.
   If your Jira automation rule still points at `/jira-webhook` or at `/tools/jira-status-update`
   directly on a Container 2 hostname, update it to the URL described below.
 </Callout>
@@ -111,7 +111,7 @@ not a subset:
   Waiting for Customer, and that transition will simply never reach SharePoint. Missing this is
   the most likely reason a status change appears to do nothing.
 
-  Don't add Done, Canceled, Blocked, or Awaiting Reporter to the trigger — they aren't real
+  Don't add Done, Canceled, Blocked, or Awaiting Reporter to the trigger: they aren't real
   statuses in this project's workflow (Jira's automation UI may not even let you pick them), and
   including them does nothing useful even if it did. The endpoint recognizes those names too, but
   purely defensively, for a workflow that isn't the one actually deployed here.
@@ -143,14 +143,14 @@ Add an action: **Send web request**
 ```
 
 <Callout type="info">
-  This hits `/jira-status-update` on Container 1, not `/tools/jira-status-update` directly —
+  This hits `/jira-status-update` on Container 1, not `/tools/jira-status-update` directly.
   Container 1 is a plain pass-through proxy in front of Container 2's real handler, added so the
   automation rule has one stable externally-reachable URL regardless of which container's port
   ingress currently points at. There's no `/tools/` prefix on the externally-facing path.
 </Callout>
 
 <Callout type="info">
-  Use `{{now.jiraDate}}` for `today`, not `{{now.format('yyyy-MM-dd')}}` — the single-quoted-arg
+  Use `{{now.jiraDate}}` for `today`, not `{{now.format('yyyy-MM-dd')}}`: the single-quoted-arg
   form has been observed to fail with "Unable to render smart values" in some Jira environments,
   which silently kills the whole request before it's ever sent. `{{destinationStatus.name}}` is
   the correct smart value for `to_status`, since the endpoint needs to know which status the
@@ -160,13 +160,13 @@ Add an action: **Send web request**
 <Callout type="warning">
   `customfield_10147`–`customfield_10152` are this KAN project's actual field IDs for
   TeamName / ProductName / ProductTeamsKeyVaultName / NewSecretVaultName / NewSecretKeyId /
-  NewSecretPresent — they changed when those fields were recreated as dropdowns, so don't reuse
+  NewSecretPresent: they changed when those fields were recreated as dropdowns, so don't reuse
   IDs from an older version of this rule without checking them against your project's current
-  field list. There used to be a seventh field, DevSecOpsOwnership (`customfield_10112`) — it has
+  field list. There used to be a seventh field, DevSecOpsOwnership (`customfield_10112`); it has
   been removed from Jira entirely and must **not** be sent; ownership is resolved from
   `ProductName` via Key Vault instead (see the [Ownership model](/azure-secret-governance#ownership-model)
-  section). All six fields are sent on every transition, including ones where they're irrelevant
-  — that's harmless, since the endpoint only reads them on In Progress and Resolved.
+  section). All six fields are sent on every transition, including ones where they're irrelevant,
+  which is harmless, since the endpoint only reads them on In Progress and Resolved.
 </Callout>
 
 ### Name and enable the rule
@@ -187,10 +187,10 @@ Add an action: **Send web request**
 Jira ticket moves to one of the four real statuses
       |
       v
-POST /jira-status-update           (Container 1 — plain proxy)
+POST /jira-status-update           (Container 1, plain proxy)
       |
       v
-POST /tools/jira-status-update     (Container 2 — real handler, internal call)
+POST /tools/jira-status-update     (Container 2, real handler, internal call)
       |
       v
 Match to_status against the recognized statuses (this workflow only ever
@@ -210,7 +210,7 @@ Update every master-list row whose JiraTicketKey matches jira_key
 | Resolved | `Rotated` | Also sets the rotation detected date to today |
 | In Progress, To Do | `JiraRaised` | Monitoring treats the row as reopened and resumes on it. If the row was previously moved to `IgnoredSecretRegistry`, it's moved back to the master list first |
 | Waiting for Customer | `AwaitingReporter` | Monitoring pauses alerts and escalation on this row until the status changes again |
-| Anything else | No update | Logged, in case this is a typo in the rule. This includes Done, Canceled/Cancelled, Blocked, and Awaiting Reporter — the endpoint's code recognizes those names too, but Jira never actually sends them, since none of them are real statuses in this project |
+| Anything else | No update | Logged, in case this is a typo in the rule. This includes Done, Canceled/Cancelled, Blocked, and Awaiting Reporter: the endpoint's code recognizes those names too, but Jira never actually sends them, since none of them are real statuses in this project |
 
 <Callout type="info">
   Waiting for Customer is not a dead end. Once the ticket moves to a different status again, the
@@ -218,12 +218,12 @@ Update every master-list row whose JiraTicketKey matches jira_key
 </Callout>
 
 <Callout type="warning">
-  The endpoint's code also implements a Canceled handler — physically moving a row to
-  `IgnoredSecretRegistry` with a two-way reopen sync back to the master list — but Canceled isn't
+  The endpoint's code also implements a Canceled handler, physically moving a row to
+  `IgnoredSecretRegistry` with a two-way reopen sync back to the master list, but Canceled isn't
   a real status in this project's workflow, so that path is currently unreachable from Jira. It's
   effectively dead code for this deployment, kept because the endpoint may end up serving other
   Jira projects with a different workflow later. Don't rely on tickets in this project ever
-  reaching `IgnoredSecretRegistry` via Jira status alone — that only happens through the 8-day
+  reaching `IgnoredSecretRegistry` via Jira status alone: that only happens through the 8-day
   abandonment check today.
 </Callout>
 
@@ -231,12 +231,12 @@ Update every master-list row whose JiraTicketKey matches jira_key
 
 On the In Progress and Resolved transitions, the endpoint backfills `TeamName`,
 `ProductName`, `ProductTeamsKeyVaultName`, `NewSecretVaultName`, and `NewSecretKeyId` from the
-Jira custom fields onto the matching SharePoint row — but only for columns that are still empty;
+Jira custom fields onto the matching SharePoint row, but only for columns that are still empty;
 it never overwrites a value someone already set directly in SharePoint. It fires at both
 transitions rather than only In Progress, per an explicit client requirement: a field cleared out
 after In Progress would otherwise never get re-synced before the ticket closes.
 
-`NewSecretPresent` itself is never written to SharePoint — there's no column for it. It exists
+`NewSecretPresent` itself is never written to SharePoint, since there's no column for it. It exists
 only to trigger the acknowledgment comment below. The rotation runbook infers the same Yes/No
 distinction later by checking whether `NewSecretKeyId` is already non-empty, so a separate column
 was never needed.
@@ -245,7 +245,7 @@ was never needed.
   If an engineer marks `NewSecretPresent = No` at the In Progress transition, the endpoint
   immediately posts a comment on the ticket acknowledging that the secret is scheduled for
   automatic rotation, rather than leaving the engineer with no confirmation until the rotation
-  runbook actually runs — which could be a long time later, once the secret nears its threshold
+  runbook actually runs, which could be a long time later, once the secret nears its threshold
   days.
 </Callout>
 
@@ -319,7 +319,7 @@ Before automation can raise tickets, configure the following in Key Vault:
   whether those three priority names actually exist in your Jira project's priority scheme. The
   system sets the ticket's priority field to the literal bucket name, and that requires
   priorities named exactly `P1`, `P2`, and `P3` to already exist there. Jira's own default
-  priorities, like Highest or Medium, do not satisfy this on their own. P4 is the safe bucket —
+  priorities, like Highest or Medium, do not satisfy this on their own. P4 is the safe bucket:
   it never raises a ticket, so it doesn't need a matching priority name.
 </Callout>
 
@@ -330,19 +330,19 @@ Before automation can raise tickets, configure the following in Key Vault:
 The six custom fields sent in the web request body only carry real data if Jira actually forces
 the engineer to fill them in before the ticket can move. That's enforced with two field-required
 validators on the **To Do -> In Progress** transition in the KAN workflow, not in application
-code — the endpoint only reads whatever Jira sends it:
+code: the endpoint only reads whatever Jira sends it:
 
-1. **Core assignment fields required** — `TeamName` and `ProductName` (customfield_10147/10148)
+1. **Core assignment fields required**: `TeamName` and `ProductName` (customfield_10147/10148)
    must be set before the ticket can leave To Do. Without this, the backfill described above has
    nothing to write and the row's `TeamName`/`ProductName` stay blank indefinitely.
-2. **New-secret intake fields required** — `NewSecretPresent` (customfield_10152) must be
+2. **New-secret intake fields required**: `NewSecretPresent` (customfield_10152) must be
    answered. If it's `No`, that's sufficient on its own. If it's `Yes`, `NewSecretVaultName` and
    `NewSecretKeyId` (customfield_10150/10151) must also be filled in, since those are what the
    backfill uses to populate the row's `NewSecretVaultName`/`NewSecretKeyId` columns for the
    rotation runbook to pick up later.
 
 Without both validators in place, tickets can sit in In Progress with any of these fields blank,
-and the backfill simply has nothing to copy — it's a silent no-op per field, not an error.
+and the backfill simply has nothing to copy: it's a silent no-op per field, not an error.
 
 ---
 
@@ -388,7 +388,7 @@ Next steps:
 | A specific status never updates SharePoint | That status is missing from the rule's trigger list | Add it. All four real statuses need to be in the trigger, not just the ones you expect to use most |
 | HTTP 400 on ticket creation | Jira API token expired, or a P1 to P3 priority name is missing from the project | Regenerate the token, or add the missing priority name to the Jira priority scheme |
 | HTTP 403 on ticket creation | Wrong `JIRA-USER-EMAIL` | Must match the account that owns the API token |
-| Web request returns 404 | Wrong Container App FQDN, or still pointing at the retired `/jira-webhook` path, or at `/tools/jira-status-update` (Container 2's internal-only path) | Verify the FQDN with the `az containerapp show` command above, and confirm the URL is `/jira-status-update` on Container 1 — no `/tools/` prefix |
+| Web request returns 404 | Wrong Container App FQDN, or still pointing at the retired `/jira-webhook` path, or at `/tools/jira-status-update` (Container 2's internal-only path) | Verify the FQDN with the `az containerapp show` command above, and confirm the URL is `/jira-status-update` on Container 1, with no `/tools/` prefix |
 | SharePoint not updating on any transition | Wrong smart value in the request body | Use `{{destinationStatus.name}}`, not `{{issue.status.name}}`, and send all nine fields (`jira_key`, `to_status`, `today`, plus the six custom fields) flat, not nested under an `issue` object |
 | `today` silently missing / whole request never arrives | `{{now.format('yyyy-MM-dd')}}` failing to render in this Jira environment | Use `{{now.jiraDate}}` instead |
-| Backfilled fields (TeamName, ProductName, etc.) never show up in SharePoint | Custom field IDs in the rule body don't match this project's actual field IDs, or the SharePoint column already had a value | Check `customfield_10147`–`10152` against your project's current field list — they're not portable across Jira projects; remember the backfill only fills blank columns, it won't overwrite an existing value |
+| Backfilled fields (TeamName, ProductName, etc.) never show up in SharePoint | Custom field IDs in the rule body don't match this project's actual field IDs, or the SharePoint column already had a value | Check `customfield_10147`–`10152` against your project's current field list; they're not portable across Jira projects. Remember the backfill only fills blank columns, it won't overwrite an existing value |

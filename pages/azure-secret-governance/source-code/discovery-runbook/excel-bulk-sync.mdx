@@ -5,10 +5,10 @@ description: Bulk-imports a corrected CSV into SecretAlertRegistry after the lis
 
 # Excel Bulk Sync
 
-**Runtime:** PowerShell 7+ (Microsoft Graph PowerShell SDK) — run manually from Cloud Shell or a local
+**Runtime:** PowerShell 7+ (Microsoft Graph PowerShell SDK), run manually from Cloud Shell or a local
 terminal, not an Azure Automation runbook.
 
-Creates a new SharePoint item (`POST`) for every row in a CSV. There is no `ID` matching here — this
+Creates a new SharePoint item (`POST`) for every row in a CSV. There is no `ID` matching here, so this
 is only safe to run against a genuinely **empty** list, e.g. right after
 `runbook_cleanup_sharepoint.py`. Running it against a populated list would create a duplicate of every
 row, since it has no way to know an item already exists.

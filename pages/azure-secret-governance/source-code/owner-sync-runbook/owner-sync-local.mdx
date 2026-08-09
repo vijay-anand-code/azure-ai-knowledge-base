@@ -17,7 +17,7 @@ not Azure Automation
 **What it does:** For every active row in `SecretAlertRegistry` with a non-blank `TenantID`, sets
 `DevSecOpsOwnership` to the fixed identity `devsecops-secret-governance-monitor` if the row's
 `ProductName` is on the `ALLOWED-PRODUCT-NAMES` Key Vault allowlist, or clears it back to blank if
-not — overwriting whatever was there either way. For rows where the product is allowed, it also
+not, overwriting whatever was there either way. For rows where the product is allowed, it also
 resolves that identity to an Entra object ID and adds it as a real owner on the matching App
 Registration, using the operator's own signed in session rather than any shared identity.
 
@@ -29,7 +29,7 @@ Adding a new owner to an App Registration needs a Graph permission broader than 
 this system holds. Prior versions (v1–v3) ran unattended on a schedule, using the UAMI federated to
 `CROSS_TENANT_APP_ID`. Granting that shared identity `Application.ReadWrite.All` to add owners
 meant every runbook sharing that one app registration (discovery, rotation, owner sync) gained
-standing, tenant-wide write over App Registration ownership — a permission-scope problem flagged
+standing, tenant-wide write over App Registration ownership: a permission-scope problem flagged
 before v3 was built.
 
 v4 removed that entirely: no service principal, no federated credential, no
@@ -46,10 +46,10 @@ Conditional Access, and MFA already govern you.
    out of a Graph token (`get_current_cli_tenant()`)
 2. Reads every active row in `SecretAlertRegistry` (`AlertStatus` not one of `Rotated`, `Ignored`,
    `Resolved`, `JiraClosed-Unverified`)
-3. Loads the `ALLOWED-PRODUCT-NAMES` allowlist from Key Vault once, up front, for the whole run —
-   this is a hard prerequisite, see the gate section below
+3. Loads the `ALLOWED-PRODUCT-NAMES` allowlist from Key Vault once, up front, for the whole run
+   (this is a hard prerequisite, see the gate section below)
 4. For every active row with a non-blank `TenantID`, syncs `DevSecOpsOwnership` to match whatever
-   the allowlist says it should be — see "The `DevSecOpsOwnership` gate" below
+   the allowlist says it should be (see "The `DevSecOpsOwnership` gate" below)
 5. For rows where the product is on the allowlist, resolves `devsecops-secret-governance-monitor`
    to an Entra object ID (see "Identifier resolution" below) and adds it as an owner on the
    matching App Registration, via `POST /applications/{id}/owners/$ref`, processing one tenant's
@@ -62,7 +62,7 @@ Conditional Access, and MFA already govern you.
 ## The `DevSecOpsOwnership` gate: `ALLOWED-PRODUCT-NAMES`
 
 Before touching any row, the script loads a single Key Vault secret, `ALLOWED-PRODUCT-NAMES`
-(`get_allowed_product_names()`) — a comma-separated list of `ProductName` values, for example
+(`get_allowed_product_names()`), a comma-separated list of `ProductName` values, for example
 `nextechpm,nextechehr,nextechcrm`, case-folded into a set. This is a hard prerequisite: if
 `ROTATOR_KV_URL` wasn't supplied (so there's no Key Vault client to read it with), or the secret is
 missing or empty, the run aborts immediately with an error. It does not fall back to skipping just
@@ -70,27 +70,27 @@ the ownership logic for that run.
 
 For every active row with a non-blank `TenantID`, the script then computes:
 
-- `product_is_allowed` — `ProductName` is non-blank and its case-folded value is in the allowlist
-- `desired_ownership` — the fixed string `devsecops-secret-governance-monitor` if
+- `product_is_allowed`: `ProductName` is non-blank and its case-folded value is in the allowlist
+- `desired_ownership`: the fixed string `devsecops-secret-governance-monitor` if
   `product_is_allowed`, otherwise an empty string
 
 If the row's current `DevSecOpsOwnership` doesn't already equal `desired_ownership`, the script
-writes it via `write_devsecops_ownership()` — the only SharePoint write this script makes. That
+writes it via `write_devsecops_ownership()`, the only SharePoint write this script makes. That
 write touches `DevSecOpsOwnership` only; `ProductName` and `TenantID` are read-only here.
 
 <Callout type="warning">
   This overwrites `DevSecOpsOwnership` unconditionally whenever it doesn't already match the
-  allowlist-derived value — it is **not** gated on the column currently being blank. A row with a
+  allowlist-derived value. It is **not** gated on the column currently being blank. A row with a
   manually-typed `DevSecOpsOwnership` that isn't exactly `devsecops-secret-governance-monitor` gets
   cleared if its `ProductName` isn't on the allowlist, or overwritten to
   `devsecops-secret-governance-monitor` if it is. This is a real behavior change from an earlier
   design (still described on some other pages in this doc set) where a per-`ProductName` Key Vault
   secret resolved to an arbitrary, possibly comma-separated identity list, and was only ever
-  applied when `DevSecOpsOwnership` was blank. That design is gone from the current source — this
+  applied when `DevSecOpsOwnership` was blank. That design is gone from the current source; this
   script now standardizes on one fixed owner identity gated by a single allowlist, and actively
   keeps the column in sync with it on every row it can act on. If a row needs
   `DevSecOpsOwnership` to hold something other than `devsecops-secret-governance-monitor` or blank,
-  keep its `ProductName` off `ALLOWED-PRODUCT-NAMES` — running this script will otherwise overwrite
+  keep its `ProductName` off `ALLOWED-PRODUCT-NAMES`, since running this script will otherwise overwrite
   it back to whichever of the two values the allowlist says it should be.
 </Callout>
 
@@ -101,8 +101,8 @@ Entra owner work only happens for rows where `product_is_allowed` is true. A row
 
 ## Identifier resolution
 
-`devsecops-secret-governance-monitor` — or, if `process_app()`'s input string ever contains commas
-again in a future change, each comma-separated piece of it — is resolved in this order, scoped
+`devsecops-secret-governance-monitor` (or, if `process_app()`'s input string ever contains commas
+again in a future change, each comma-separated piece of it) is resolved in this order, scoped
 strictly to the app's own tenant. Resolution never falls through to a different tenant:
 
 1. If the identifier contains an `@`, tries an exact user UPN match first
@@ -140,7 +140,7 @@ It waits for the operator to run that in a separate terminal, then continues onc
   The script's own module docstring (in its v4.1 changelog) describes a single-tenant fallback:
   if `TenantID` is blank on a row but exactly one tenant is configured in
   `CROSS_TENANT_TENANT_IDS`, it claims the row falls back to that one tenant instead of being
-  skipped. The current `run()` implementation does not do this. It applies a strict rule instead —
+  skipped. The current `run()` implementation does not do this. It applies a strict rule instead:
   a blank `TenantID` always means no SharePoint or Entra action for that row, `TenantID` is never
   inferred or written, regardless of how many tenants are configured. Treat the code as
   authoritative here; the docstring's fallback description is stale relative to what `run()`
@@ -154,13 +154,13 @@ It waits for the operator to run that in a separate terminal, then continues onc
 | Decision | Reason |
 |----------|--------|
 | Runs locally under the operator's own `az login` | Adding ownership needs a broader Graph permission than any shared identity in this system holds, see "Why this runs locally" above |
-| `DevSecOpsOwnership` gated on `ALLOWED-PRODUCT-NAMES`, loaded once per run | One Key Vault read up front instead of a per-row, per-product secret lookup — the allowlist is the single source of truth for which products get the monitor identity |
-| `DevSecOpsOwnership` always synced to match, not preserved when non-blank | Keeps the column an accurate reflection of the current allowlist, rather than accumulating stale manual entries — see the warning in the gate section above |
+| `DevSecOpsOwnership` gated on `ALLOWED-PRODUCT-NAMES`, loaded once per run | One Key Vault read up front instead of a per-row, per-product secret lookup: the allowlist is the single source of truth for which products get the monitor identity |
+| `DevSecOpsOwnership` always synced to match, not preserved when non-blank | Keeps the column an accurate reflection of the current allowlist, rather than accumulating stale manual entries (see the warning in the gate section above) |
 | Fixed owner identity, `devsecops-secret-governance-monitor` | Replaces an earlier per-`ProductName` Key Vault secret lookup that could resolve to an arbitrary, possibly comma-separated identity list |
 | `ALLOWED-PRODUCT-NAMES` is a hard prerequisite | If it can't be loaded (no `ROTATOR_KV_URL`, or a missing/empty secret), the run aborts entirely rather than silently skipping the ownership logic |
 | Strictly scoped to the app's own tenant | Display names aren't guaranteed unique across tenants, resolving in the wrong one risks granting ownership in the wrong directory |
 | Groups apps by tenant, pauses between tenants | A single `az login` session can only be authenticated into one tenant at a time |
-| Blank `TenantID` always skipped | No SharePoint or Entra action; never inferred, despite what the module docstring's v4.1 changelog claims — see the callout above |
+| Blank `TenantID` always skipped | No SharePoint or Entra action; never inferred, despite what the module docstring's v4.1 changelog claims (see the callout above) |
 | Already-owners skipped, not re-added | Re-running the script safely does nothing to rows that already resolved correctly |
 | Ambiguous matches add all of them, not gated | A deliberate, explicit behavior, see the warning callout above |
 | No Jira ticket filed for any outcome | Success, failure, and ambiguous matches are all visible only in that run's own printed summary |
@@ -172,7 +172,7 @@ It waits for the operator to run that in a separate terminal, then continues onc
 - `az login`, signed in as yourself, before running the script
 - Your account needs sufficient Entra permission to add owners on the apps involved, ideally a
   PIM-activated role rather than something held standing
-- `pip install azure-identity azure-keyvault-secrets tzdata` — `tzdata` is required on Windows,
+- `pip install azure-identity azure-keyvault-secrets tzdata`, and `tzdata` is required on Windows,
   since `zoneinfo` has no OS-level timezone database to read there, unlike Linux/macOS. A missing
   `tzdata` package isn't fatal: the script's own console-only timestamp just falls back to plain
   UTC. That timestamp is never written to SharePoint, it only appears in this script's own printed
@@ -195,7 +195,7 @@ python devsecops-secret-governance-sync.py
   `ROTATOR_KV_URL` is effectively required now, even though `SHAREPOINT_SITE_ID` /
   `SHAREPOINT_LIST_ID` / `CROSS_TENANT_TENANT_IDS` can still be supplied directly as plain
   environment variables instead of through Key Vault. `ALLOWED-PRODUCT-NAMES` has no
-  environment-variable equivalent — it can only be read from Key Vault — so without
+  environment-variable equivalent: it can only be read from Key Vault, so without
   `ROTATOR_KV_URL` the run aborts as soon as it tries to load the allowlist.
 </Callout>
 
@@ -208,7 +208,7 @@ python devsecops-secret-governance-sync.py
 | `SHAREPOINT-SITE-ID` | SharePoint site composite ID |
 | `SHAREPOINT-LIST-ID` | `SecretAlertRegistry` list ID |
 | `CROSS-TENANT-TENANT-IDS` | Comma separated tenant IDs to check for matching apps. Falls back to the older singular `CROSS-TENANT-TENANT-ID` if not set |
-| `ALLOWED-PRODUCT-NAMES` | Comma-separated allowlist of `ProductName` values eligible for the `devsecops-secret-governance-monitor` owner. Required — the run aborts if this can't be loaded |
+| `ALLOWED-PRODUCT-NAMES` | Comma-separated allowlist of `ProductName` values eligible for the `devsecops-secret-governance-monitor` owner. Required: the run aborts if this can't be loaded |
 
 ---
 
@@ -222,7 +222,7 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
           adds the named identity(ies) as owners directly on the matching App
           Registration in Entra ID — using YOUR OWN signed-in `az login` session,
           not a shared managed identity or app registration.
-
+ 
           THIS IS DELIBERATELY A LOCAL SCRIPT, NOT AN AZURE AUTOMATION RUNBOOK.
           Prior versions (v1–v3) ran unattended on a schedule, using the UAMI
           federated to CROSS_TENANT_APP_ID. Granting that shared identity
@@ -230,7 +230,7 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
           that one app registration (discovery, rotation, owner_sync) gained
           standing, tenant-wide write over App Registration ownership — a real
           permission-scope problem flagged before v3 was built.
-
+ 
           v4 removed that entirely — no service principal, no federated
           credential, no Application.ReadWrite.All grant on the shared app
           registration anywhere in this script. It authenticates as YOU, using
@@ -238,7 +238,7 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
           script makes is attributed to your own individually-accountable
           account, subject to whatever role, Conditional Access, and MFA
           already govern you.
-
+ 
           CHANGES IN v4.1 (fixing the "Apps Checked: 0 / Apps Skipped: 243"
           issue seen on first real run):
             - v4 silently lumped THREE different skip reasons (blank ObjectID,
@@ -263,7 +263,7 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
               folded into the same bucket as "blank" — these mean different
               things operationally (missing data vs. missing config) and
               should not look identical in the summary.
-
+ 
           CROSS-TENANT SUPPORT — confirmed working as designed:
           This script fully supports the multi-tenant setup already used by
           runbook_discovery.py. It groups every app by its row's TenantID,
@@ -276,7 +276,7 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
           into; a tenant mismatch on your CLI session causes that tenant's
           apps to be skipped and reported, not silently attempted in the
           wrong directory.
-
+ 
           PREREQUISITE — before running this script:
             1. `az login` — sign in as yourself
             2. Your account needs sufficient Entra permission to add owners to
@@ -287,7 +287,7 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
             3. `pip install azure-identity azure-keyvault-secrets tzdata`
                (tzdata is required on Windows — zoneinfo has no OS-level tz
                database to read there, unlike Linux/macOS)
-
+ 
           CONFIG:
           Set ROTATOR_KV_URL to read SHAREPOINT_SITE_ID / SHAREPOINT_LIST_ID /
           CROSS_TENANT_TENANT_IDS from Key Vault using your own az login
@@ -296,9 +296,9 @@ Purpose : Reads the DevSecOpsOwnership column in SharePoint SecretAlertRegistry 
           set SHAREPOINT_SITE_ID / SHAREPOINT_LIST_ID / CROSS_TENANT_TENANT_IDS
           directly as environment variables and skip Key Vault entirely.
 """
-
+ 
 from __future__ import annotations
-
+ 
 import json
 import logging
 import os
@@ -309,19 +309,19 @@ import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
-
+ 
 from azure.identity import AzureCliCredential
-
+ 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                     format="%(levelname)s: %(message)s")
 log = logging.getLogger("owner-sync-local")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # TIMEZONE — optional. Only used for a human-readable timestamp in this
 # script's own console output (not written anywhere), so a missing tzdata
 # package on Windows should never be fatal here — fall back to plain UTC.
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 try:
     from zoneinfo import ZoneInfo
     _EASTERN_TZ = ZoneInfo("America/New_York")
@@ -329,32 +329,32 @@ except Exception:
     _EASTERN_TZ = None
     log.warning("zoneinfo/tzdata not available — falling back to UTC timestamps. "
                 "Run `pip install tzdata` to get US Eastern timestamps instead.")
-
+ 
 def _now_string() -> str:
     now = datetime.now(timezone.utc)
     if _EASTERN_TZ:
         now = now.astimezone(_EASTERN_TZ)
         return now.strftime("%Y-%m-%d %I:%M:%S %p %Z")
     return now.strftime("%Y-%m-%d %H:%M:%S UTC")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 SHAREPOINT_SITE_ID = os.environ.get("SHAREPOINT_SITE_ID", "")
 SHAREPOINT_LIST_ID = os.environ.get("SHAREPOINT_LIST_ID", "")
 CROSS_TENANT_TENANT_IDS = [
     t.strip() for t in os.environ.get("CROSS_TENANT_TENANT_IDS", "").split(",") if t.strip()
 ]
 ROTATOR_KV_URL = os.environ.get("ROTATOR_KV_URL", "")
-
+ 
 SKIP_STATUSES = {"Rotated", "Ignored", "Resolved", "JiraClosed-Unverified"}
 RETRY_MAX     = 3
 RETRY_BACKOFF = 2.0
 ALLOWED_PRODUCT_NAMES_SECRET = "ALLOWED-PRODUCT-NAMES"
 DEVSECOPS_MONITOR_OWNER = "devsecops-secret-governance-monitor"
-
-
+ 
+ 
 def _fail_config(name: str) -> None:
     print(f"\nMissing required config: {name}")
     print(f"Set it as an environment variable before running, e.g.:")
@@ -362,8 +362,8 @@ def _fail_config(name: str) -> None:
     print(f"  set {name}=<value>           (cmd.exe)")
     print(f"  export {name}=<value>        (macOS/Linux)")
     sys.exit(1)
-
-
+ 
+ 
 def get_config_from_keyvault(vault_url: str) -> None:
     global SHAREPOINT_SITE_ID, SHAREPOINT_LIST_ID, CROSS_TENANT_TENANT_IDS, _kv_client
     from azure.keyvault.secrets import SecretClient
@@ -378,22 +378,22 @@ def get_config_from_keyvault(vault_url: str) -> None:
         raw = kv.get_secret("CROSS-TENANT-TENANT-ID").value
     CROSS_TENANT_TENANT_IDS = [t.strip() for t in raw.split(",") if t.strip()]
     log.info("Loaded config from Key Vault using your az login session.")
-
-
+ 
+ 
 _kv_client = None  # set inside get_config_from_keyvault() above, if ROTATOR_KV_URL was provided
-
+ 
 if ROTATOR_KV_URL:
     get_config_from_keyvault(ROTATOR_KV_URL)
-
+ 
 if not SHAREPOINT_SITE_ID:
     _fail_config("SHAREPOINT_SITE_ID")
 if not SHAREPOINT_LIST_ID:
     _fail_config("SHAREPOINT_LIST_ID")
 if not CROSS_TENANT_TENANT_IDS:
     _fail_config("CROSS_TENANT_TENANT_IDS")
-
+ 
 print(f"Configured tenants: {CROSS_TENANT_TENANT_IDS}")
-
+ 
 def get_allowed_product_names() -> set[str]:
     """
     Reads a comma-separated ProductName allowlist from Key Vault.
@@ -427,9 +427,9 @@ def get_allowed_product_names() -> set[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH — YOUR az login session.
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 _cli_credential = AzureCliCredential()
-
+ 
 def _graph_token() -> str:
     """
     Gets a Graph token from your az login session, retrying on transient
@@ -459,10 +459,10 @@ def _graph_token() -> str:
         f"Try running `az account get-access-token --output none` to refresh your session, "
         f"then re-run this script."
     ) from last_exc
-
+ 
 def _auth_hdrs() -> dict:
     return {"Authorization": f"Bearer {_graph_token()}"}
-
+ 
 def get_current_cli_tenant() -> str:
     import base64
     token = _graph_token()
@@ -470,11 +470,11 @@ def get_current_cli_tenant() -> str:
     payload_b64 += "=" * (-len(payload_b64) % 4)
     payload = json.loads(base64.urlsafe_b64decode(payload_b64))
     return payload.get("tid", "")
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def _http(method: str, url: str, headers: dict,
           body: dict | None = None, timeout: int = 30) -> dict:
     data = json.dumps(body).encode("utf-8") if body else None
@@ -486,7 +486,7 @@ def _http(method: str, url: str, headers: dict,
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8")[:300]
         raise RuntimeError(f"HTTP {e.code} {method} {url}: {body_text}") from e
-
+ 
 def _http_with_retry(method: str, url: str, headers: dict,
                      body: dict | None = None, timeout: int = 30) -> dict:
     last_exc: Exception | None = None
@@ -501,18 +501,18 @@ def _http_with_retry(method: str, url: str, headers: dict,
                             attempt, RETRY_MAX, exc, wait)
                 time.sleep(wait)
     raise RuntimeError(f"All {RETRY_MAX} attempts failed: {last_exc}") from last_exc
-
+ 
 def _get(url: str, timeout: int = 30) -> dict:
     return _http("GET", url, _auth_hdrs(), timeout=timeout)
-
+ 
 def _post_retry(url: str, body: dict, timeout: int = 30) -> dict:
     hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
     return _http_with_retry("POST", url, hdrs, body, timeout)
-
+ 
 def _patch_retry(url: str, body: dict, timeout: int = 30) -> dict:
     hdrs = {**_auth_hdrs(), "Content-Type": "application/json"}
     return _http_with_retry("PATCH", url, hdrs, body, timeout)
-
+ 
 def write_devsecops_ownership(item_id: str, ownership_value: str) -> dict:
     """
     Updates ONLY DevSecOpsOwnership.
@@ -539,11 +539,11 @@ def write_devsecops_ownership(item_id: str, ownership_value: str) -> dict:
         return {"success": True}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1 — Read active SharePoint rows
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def get_active_sp_rows() -> list[dict]:
     url = (
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
@@ -555,7 +555,7 @@ def get_active_sp_rows() -> list[dict]:
         b = _get(url, timeout=30)
         all_items.extend(b.get("value", []))
         url = b.get("@odata.nextLink")
-
+ 
     active = [
         item for item in all_items
         if item.get("fields", {}).get("AlertStatus") not in SKIP_STATUSES
@@ -563,12 +563,12 @@ def get_active_sp_rows() -> list[dict]:
     log.info("SharePoint: %d total rows, %d active, %d terminal (skipped)",
              len(all_items), len(active), len(all_items) - len(active))
     return active
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — Entra owners + resolution, scoped to whichever tenant your CLI
 # session is CURRENTLY in.
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def fetch_entra_owners(object_id: str) -> set[str]:
     url = f"https://graph.microsoft.com/v1.0/applications/{object_id}/owners"
     try:
@@ -578,10 +578,10 @@ def fetch_entra_owners(object_id: str) -> set[str]:
     except Exception as e:
         log.warning("fetch_entra_owners failed for %s: %s", object_id, e)
         return set()
-
+ 
 def resolve_identifier(identifier: str) -> list[dict]:
     matches: list[dict] = []
-
+ 
     if "@" in identifier:
         filter_expr = urllib.parse.quote(f"userPrincipalName eq '{identifier}'")
         url = f"https://graph.microsoft.com/v1.0/users?$filter={filter_expr}&$select=id,displayName"
@@ -593,7 +593,7 @@ def resolve_identifier(identifier: str) -> list[dict]:
             log.warning("User lookup failed for %r: %s", identifier, e)
         if matches:
             return matches
-
+ 
     filter_expr = urllib.parse.quote(f"displayName eq '{identifier}'")
     url = f"https://graph.microsoft.com/v1.0/servicePrincipals?$filter={filter_expr}&$select=id,displayName&$count=true"
     try:
@@ -606,7 +606,7 @@ def resolve_identifier(identifier: str) -> list[dict]:
         log.warning("Service principal lookup failed for %r: %s", identifier, e)
     if matches:
         return matches
-
+ 
     import re as _re
     if _re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', identifier, _re.IGNORECASE):
         filter_expr2 = urllib.parse.quote(f"appId eq '{identifier}'")
@@ -617,9 +617,9 @@ def resolve_identifier(identifier: str) -> list[dict]:
                 matches.append({"id": sp["id"], "displayName": sp.get("displayName", identifier), "kind": "servicePrincipal"})
         except Exception as e:
             log.warning("Service principal appId lookup failed for %r: %s", identifier, e)
-
+ 
     return matches
-
+ 
 def add_owner_to_app(app_object_id: str, owner_object_id: str,
                      identifier: str, app_name: str) -> dict:
     url  = f"https://graph.microsoft.com/v1.0/applications/{app_object_id}/owners/$ref"
@@ -633,30 +633,30 @@ def add_owner_to_app(app_object_id: str, owner_object_id: str,
         if "already exist" in err_str.lower():
             return {"status": "already_exists", "identifier": identifier, "error": None}
         return {"status": "failed", "identifier": identifier, "error": err_str[:250]}
-
+ 
 def process_app(app_object_id: str, app_name: str, manual_owners_str: str) -> dict:
     result = {"app_name": app_name, "object_id": app_object_id,
               "added": [], "already": [], "failed": [], "unresolved": [], "ambiguous": []}
-
+ 
     identifiers = [o.strip() for o in manual_owners_str.split(",") if o.strip()]
     if not identifiers:
         return result
-
+ 
     entra_owners_normalised = fetch_entra_owners(app_object_id)
-
+ 
     for identifier in identifiers:
         matches = resolve_identifier(identifier)
-
+ 
         if not matches:
             result["unresolved"].append(identifier)
             log.warning("Could not resolve %r for app %s — skipping.", identifier, app_name)
             continue
-
+ 
         if len(matches) > 1:
             result["ambiguous"].append({"identifier": identifier, "matched": [m["displayName"] for m in matches]})
             log.warning("AMBIGUOUS — %r matched %d objects for app %s: %s. Adding ALL per configured behavior.",
                         identifier, len(matches), app_name, [m["displayName"] for m in matches])
-
+ 
         for match in matches:
             name_lower = match["displayName"].strip().lower()
             if name_lower in entra_owners_normalised:
@@ -669,13 +669,13 @@ def process_app(app_object_id: str, app_name: str, manual_owners_str: str) -> di
             else:
                 result["failed"].append(match["displayName"])
                 log.error("Failed to add %s to %s: %s", match["displayName"], app_name, add_result["error"])
-
+ 
     return result
-
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN — groups by tenant, pauses between tenants for you to switch
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def run() -> dict:
     summary: dict[str, Any] = {
         "rowsScanned": 0, "appsChecked": 0,
@@ -686,7 +686,7 @@ def run() -> dict:
         "ownershipAssigned": 0, "ownershipCleared": 0,
         "changes": [], "ambiguousDetail": [], "unresolvedDetail": [], "errors": [],
     }
-
+ 
     print("Checking current az login session tenant...")
     try:
         current_tenant = get_current_cli_tenant()
@@ -711,7 +711,7 @@ def run() -> dict:
         )
         return summary
             
-
+ 
     apps: dict[str, dict] = {}
     for item in active_rows:
         f             = item.get("fields", {})
@@ -732,7 +732,7 @@ def run() -> dict:
                 app_name,
             )
             continue
-
+ 
         # ProductName is only eligible when it is nonblank and appears in the
         # Key Vault allowlist. Everything else must have blank ownership.
         product_is_allowed = (
@@ -807,15 +807,15 @@ def run() -> dict:
             "app_name": app_name,
             "manual_owners": DEVSECOPS_MONITOR_OWNER,
         }
-
-
+ 
+ 
     summary["appsChecked"] = sum(len(v) for v in apps.values())
-
+ 
     for tenant_id, tenant_apps in apps.items():
         print("=" * 60)
         print(f"TENANT {tenant_id} — {len(tenant_apps)} app(s) to process")
         print("=" * 60)
-
+ 
         if tenant_id != current_tenant:
             print(f"\n  Your CLI session is NOT currently in this tenant.")
             print(f"  Run this in another terminal, or here after Ctrl+C:")
@@ -827,7 +827,7 @@ def run() -> dict:
                 summary["errors"].append(f"Tenant {tenant_id}: CLI session never switched — skipped")
                 continue
             print(f"  Confirmed — now signed into {tenant_id}.\n")
-
+ 
         for object_id, info in tenant_apps.items():
             try:
                 result = process_app(object_id, info["app_name"], info["manual_owners"])
@@ -846,16 +846,16 @@ def run() -> dict:
                     summary["errors"].append(f"Failed to add {f_owner} to {info['app_name']} (tenant {tenant_id})")
             except Exception as e:
                 summary["errors"].append(f"process_app failed for {info['app_name']}: {e}")
-
+ 
     return summary
-
+ 
 def main():
     print(f"owner_sync_local.py v4.1 — run manually, writes to Entra as YOU")
     print(f"Started: {_now_string()}\n")
     t0 = time.time()
     summary = run()
     elapsed = time.time() - t0
-
+ 
     print("\n" + "=" * 60)
     print("OWNER SYNC (LOCAL) — SUMMARY")
     print("=" * 60)
@@ -872,7 +872,7 @@ def main():
     print(f"  Failed             : {summary['ownersFailed']}")
     print(f"  Unresolved         : {summary['unresolved']}")
     print(f"  Ambiguous          : {summary['ambiguousCount']}")
-
+ 
     skip_total = (
         summary["skippedBlankObjectId"]
         + summary["skippedBlankTenant"]
@@ -886,22 +886,22 @@ def main():
             print(f"    Blank TenantID (multi-tenant, can't guess) : {summary['skippedBlankTenant']}")
         if summary['skippedTenantNotConfigured']:
             print(f"    TenantID not in CROSS_TENANT_TENANT_IDS    : {summary['skippedTenantNotConfigured']}")
-
+ 
     if summary["changes"]:
         print(f"\n  Changes made:")
         for c in summary["changes"]:
             print(f"    {c['app']} (tenant {c['tenant']}) — added: {', '.join(c['added'])}")
-
+ 
     if summary["ambiguousDetail"]:
         print(f"\n  ⚠ AMBIGUOUS — verify these were intended:")
         for a in summary["ambiguousDetail"]:
             print(f"    {a['app']} (tenant {a['tenant']}) — {a['identifier']!r} matched: {', '.join(a['matched'])}")
-
+ 
     if summary["unresolvedDetail"]:
         print(f"\n  Unresolved:")
         for u in summary["unresolvedDetail"]:
             print(f"    {u['app']} (tenant {u['tenant']}) — {u['identifier']!r} not found")
-
+ 
     if summary["errors"]:
         print(f"\n  ERRORS ({len(summary['errors'])}):")
         for err in summary["errors"][:15]:
@@ -909,8 +909,8 @@ def main():
         sys.exit(1)
     else:
         print(f"\n  Done.")
-
+ 
 if __name__ == "__main__":
     main()
-
+ 
 ```

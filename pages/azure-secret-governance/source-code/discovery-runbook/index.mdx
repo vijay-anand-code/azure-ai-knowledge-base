@@ -3,21 +3,31 @@ title: Discovery Runbook
 description: Azure Automation Runbook that scans all App Registrations and writes to SharePoint
 ---
 
+import { Callout } from 'nextra/components'
+
 # Discovery Runbook
 
+<Callout type="warning">
+  **Not currently in use.** Unlike owner-sync, monitoring, and rotation, this runbook is not part
+  of the active weekly schedule in this deployment. It was used for initial onboarding/setup and
+  is retained here for reference. Don't assume it's running on the schedule described below;
+  confirm current runbook schedules in Azure Automation before relying on anything that depends
+  on discovery having run recently.
+</Callout>
+
 **File:** `devsecops-secret-governance-discovery.py`
-**Runtime:** Python 3.10 — Azure Automation Account
-**Schedule:** Weekly Monday 00:00
+**Runtime:** Python 3.10, Azure Automation Account
+**Schedule (as designed, not currently active):** Weekly Monday 00:00
 
 Scans ALL App Registrations, across every configured tenant, from Entra ID, fetches their owners
 in parallel, classifies every secret into an expiry bucket, and batch-writes active rows to the
 `DevSecOpsSecretMonitoringRegistry` SharePoint list and expired-8+-day rows to
-`IgnoredSecretRegistry` — snapshotting both lists' pre-run state into their backup lists first.
+`IgnoredSecretRegistry`, snapshotting both lists' pre-run state into their backup lists first.
 
 | File | Purpose |
 |------|---------|
-| [devsecops-secret-governance-discovery.py](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery) | Main discovery runbook — scans all apps and writes to SharePoint |
-| [devsecops-secret-governance-sharepoint-cleanup.py](/azure-secret-governance/source-code/discovery-runbook/cleanup-sharepoint) | Utility — deletes all rows from the main active registry list, for a fresh test run |
-| [devsecops-secret-governance-ignore-registry-sharepoint-cleanup.py](/azure-secret-governance/source-code/discovery-runbook/cleanup-sharepoint) | Utility — same cleanup, but empties `IgnoredSecretRegistry` instead |
-| [count.mdx](/azure-secret-governance/source-code/discovery-runbook/count) | Utility — CLI command to count total App Registrations and secrets via Graph, for cross-checking against runbook output |
-| [Excel Bulk Sync](/azure-secret-governance/source-code/discovery-runbook/excel-bulk-sync) | Utility — bulk-imports a corrected CSV into the main registry list after it has been emptied (e.g. after the sharepoint-cleanup script) |
+| [devsecops-secret-governance-discovery.py](/azure-secret-governance/source-code/discovery-runbook/runbook-discovery) | Main discovery runbook, scans all apps and writes to SharePoint |
+| [devsecops-secret-governance-sharepoint-cleanup.py](/azure-secret-governance/source-code/discovery-runbook/cleanup-sharepoint) | Utility, deletes all rows from the main active registry list, for a fresh test run |
+| [devsecops-secret-governance-ignore-registry-sharepoint-cleanup.py](/azure-secret-governance/source-code/discovery-runbook/cleanup-sharepoint) | Utility, same cleanup, but empties `IgnoredSecretRegistry` instead |
+| [count.mdx](/azure-secret-governance/source-code/discovery-runbook/count) | Utility, CLI command to count total App Registrations and secrets via Graph, for cross-checking against runbook output |
+| [Excel Bulk Sync](/azure-secret-governance/source-code/discovery-runbook/excel-bulk-sync) | Utility, bulk-imports a corrected CSV into the main registry list after it has been emptied (e.g. after the sharepoint-cleanup script) |

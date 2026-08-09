@@ -1,15 +1,15 @@
 ---
 title: main.py (Container 1)
-description: LangChain Agent — FastAPI app with GPT-4o, all tool definitions, and governance cycle orchestration
+description: LangChain Agent, FastAPI app with GPT-4o, all tool definitions, and governance cycle orchestration
 ---
 
 import { Callout } from 'nextra/components'
 
-# main.py — Container 1 (LangChain Agent)
+# main.py: Container 1 (LangChain Agent)
 
 **Location:** `secret-governance-app/container-1/main.py`
 
-**Runtime:** Python 3.11 — Azure Container App (public port 8000)
+**Runtime:** Python 3.11, Azure Container App (public port 8000)
 
 **What it does:** Hosts the LangChain agent (GPT-4o) that orchestrates the full governance cycle. Defines all tools that call Container 2, manages per-session chat memory, and exposes FastAPI endpoints for the runbook trigger, chat, the Jira status-update proxy, and (when enabled) the Teams bot.
 
@@ -20,14 +20,14 @@ import { Callout } from 'nextra/components'
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/health` | GET | Liveness probe |
-| `/run` | POST | Trigger governance cycle as background task — returns immediately |
+| `/run` | POST | Trigger governance cycle as background task, returns immediately |
 | `/chat` | POST | Conversational endpoint with per-session memory |
-| `/jira-status-update` | POST | Plain proxy to Container 2's `/tools/jira-status-update` — gives the Jira automation rule one stable externally-reachable URL, regardless of which container ingress currently points at |
-| `/teams-webhook` | POST | Receives Teams Bot messages — routes through LangChain agent |
+| `/jira-status-update` | POST | Plain proxy to Container 2's `/tools/jira-status-update`, gives the Jira automation rule one stable externally-reachable URL, regardless of which container ingress currently points at |
+| `/teams-webhook` | POST | Receives Teams Bot messages, routes through LangChain agent |
 
 <Callout type="warning">
   The Teams bot integration (the `from teams_bot import ...` block near the bottom of the file)
-  is currently **commented out** in the deployed source — the Teams bot has been removed from
+  is currently **commented out** in the deployed source. The Teams bot has been removed from
   this deployment for now. `/teams-webhook` is still named in the module docstring and in the
   table above because that's what the docstring itself claims, but with the import/router lines
   commented out, `app.include_router(teams_router)` never runs, so this route does not actually
@@ -36,7 +36,7 @@ import { Callout } from 'nextra/components'
 </Callout>
 
 <Callout type="info">
-  `/jira-webhook` was retired from this container — it only ever recognized 3 status names and
+  `/jira-webhook` was retired from this container: it only ever recognized 3 status names and
   did nothing for the rest. It has **not** been replaced by Jira calling Container 2 directly.
   Instead, Container 1 now exposes `/jira-status-update`, a thin proxy that forwards straight to
   Container 2's `/tools/jira-status-update`, added specifically because a Container App only
@@ -50,17 +50,17 @@ import { Callout } from 'nextra/components'
 
 | Decision | Reason |
 |----------|--------|
-| `/run` returns immediately | Prevents 504 timeout on the Azure Automation runbook side — agent runs in background via `asyncio.create_task` |
+| `/run` returns immediately | Prevents 504 timeout on the Azure Automation runbook side; agent runs in background via `asyncio.create_task` |
 | Per-session `InMemoryChatMessageHistory` | Multi-turn conversations (chat, or Teams bot if re-enabled) maintain context across messages in the same session |
-| UAMI for Key Vault auth | No client secrets in environment variables — identity-based authentication only |
+| UAMI for Key Vault auth | No client secrets in environment variables, identity-based authentication only |
 | `max_iterations=30` on AgentExecutor | Prevents infinite loops on complex monitoring cycles with many tool calls |
-| Container 1 does NOT call Graph API | All Graph, SharePoint, Jira, and Teams calls go through Container 2 — Container 1 only orchestrates |
-| `/jira-status-update` is a plain proxy | No status-mapping logic lives in Container 1 — it just forwards the request body to Container 2's `/tools/jira-status-update` over `_call_monitor`, so there is a single source of truth for the status mapping |
+| Container 1 does NOT call Graph API | All Graph, SharePoint, Jira, and Teams calls go through Container 2; Container 1 only orchestrates |
+| `/jira-status-update` is a plain proxy | No status-mapping logic lives in Container 1: it just forwards the request body to Container 2's `/tools/jira-status-update` over `_call_monitor`, so there is a single source of truth for the status mapping |
 
 <Callout type="info">
   The Teams bot is enabled by uncommenting 6 lines near the bottom of this file (the
   `from teams_bot import ...` block). Today those lines are commented out, so the bot is disabled
-  and `/teams-webhook` does not exist on the running app — re-enabling it is just uncommenting
+  and `/teams-webhook` does not exist on the running app, so re-enabling it is just uncommenting
   those lines and redeploying, no other code changes needed.
 </Callout>
 
@@ -68,7 +68,7 @@ import { Callout } from 'nextra/components'
 
 ## LangChain tools defined
 
-All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls Graph API directly:
+All tools POST to Container 2 `/tools/*` endpoints; Container 1 never calls Graph API directly:
 
 | Tool | Container 2 endpoint | Purpose |
 |------|---------------------|---------|
@@ -84,7 +84,7 @@ All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls G
 <Callout type="warning">
   The current source's docstrings for `get_sharepoint_state` and `write_sharepoint_row` (and the
   `SYSTEM_PROMPT` string below) call the list `DevSecOpsSecretMonitoringRegistry`. That name is
-  stale inside this file itself — the actual SharePoint list Container 2 reads and writes is
+  stale inside this file itself: the actual SharePoint list Container 2 reads and writes is
   `SecretAlertRegistry` (see the [SharePoint Setup](/azure-secret-governance/sharepoint) page).
   This doc mirrors the source as written; the mismatch is a leftover in the source's own comments,
   not something this page invented.
@@ -110,10 +110,10 @@ All tools POST to Container 2 `/tools/*` endpoints — Container 1 never calls G
 
 <Callout type="info">
   `BOT-APP-ID`, `BOT-APP-SECRET`, and `BOT-TENANT-ID` are only read if the Teams bot integration
-  block is uncommented (see above) — with it commented out, as it currently is, `_kv_get()` is
+  block is uncommented (see above); with it commented out, as it currently is, `_kv_get()` is
   never called for those three secrets and Container 1 only actually needs Key Vault access for
   the three Azure OpenAI secrets above. All Graph API, SharePoint, and Jira credentials are loaded
-  separately by Container 2. The UAMI only needs `Key Vault Secrets User` role — no Graph
+  separately by Container 2. The UAMI only needs `Key Vault Secrets User` role, no Graph
   permissions needed here.
 </Callout>
 

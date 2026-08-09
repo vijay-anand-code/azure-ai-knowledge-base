@@ -158,7 +158,7 @@ the background and can take several minutes across a large tenant.
 
 1. Fetches every App Registration's secrets, across every configured tenant, and reads
    `SecretAlertRegistry`
-2. Backs up both `SecretAlertRegistry` and `IgnoredSecretRegistry` — archiving whatever was
+2. Backs up both `SecretAlertRegistry` and `IgnoredSecretRegistry`, archiving whatever was
    previously in each backup list to Storage as CSV first, then writing a fresh snapshot, then
    deleting the old backup rows. This runs before anything else touches either list. If backup
    fails, the whole run aborts without touching anything further. See the
@@ -169,7 +169,7 @@ the background and can take several minutes across a large tenant.
 4. For any secret that's new to SharePoint and matches an existing row's `NewSecretKeyId` (meaning
    it's the freshly-rotated replacement for that row), copies `TeamName`, `ProductName`, and
    `ProductTeamsKeyVaultName` from that parent row automatically, see "Lineage tracking" on the
-   `decision_engine.py` source page — **note:** the current code actually writes this last field
+   `decision_engine.py` source page. **Note:** the current code actually writes this last field
    under the misspelled column name `ProductTeamkeyVaultName` (missing the "s"), a real bug; see
    the warning on the [SharePoint Setup](/azure-secret-governance/sharepoint) page
 5. For any app where `DevSecOpsOwnership` is filled in on at least one row (directly, from the
@@ -178,7 +178,7 @@ the background and can take several minutes across a large tenant.
 6. Re-stamps `AppOwners`, `TenantID`, and `ObjectID` from live Entra data on every row it touches,
    not just at first discovery
 7. For P1, P2, and P3, and for ExpiredManualReview, raises a Jira ticket if one does not already
-   exist — this fires on severity/bucket alone now, regardless of whether `DevSecOpsOwnership` is
+   exist, this fires on severity/bucket alone now, regardless of whether `DevSecOpsOwnership` is
    set. An app with no ownership set still gets tickets and alerts; ownership no longer gates
    ticket/alert creation, only whether monitoring keeps actively working the row afterward (see
    the note below)
@@ -192,10 +192,10 @@ the background and can take several minutes across a large tenant.
 <Callout type="warning">
   An earlier version of this system gated ticket and Teams alert creation on `DevSecOpsOwnership`
   (then `ManualAppOwners`) being set, and step 6 above used to read "filters to only secrets whose
-  app has ownership set — everything else is skipped." That gate has been removed, per an explicit
+  app has ownership set, everything else is skipped." That gate has been removed, per an explicit
   client requirement: severity alone now decides whether a ticket or Teams alert gets raised, for
   both brand-new and existing rows. `DevSecOpsOwnership` being blank no longer blocks self-heal,
-  escalation, or first-time ticket creation in monitoring — it's tracked only as an informational
+  escalation, or first-time ticket creation in monitoring; it's tracked only as an informational
   count. Rotation is a separate story: it still will not touch a secret whose app has no
   `DevSecOpsOwnership` set.
 </Callout>
@@ -218,11 +218,11 @@ would risk hiding a secret someone is actively rotating right now. The actual de
 `SHAREPOINT-IGNORED-LIST-ID`, `SHAREPOINT-BACKUP-LIST-ID`, `SHAREPOINT-IGNORED-BACKUP-LIST-ID`,
 `CROSS-TENANT-APP-ID`, `CROSS-TENANT-TENANT-IDS`, `JIRA-BASE-URL`,
 `JIRA-API-TOKEN`, `JIRA-USER-EMAIL`, `JIRA-PROJECT-KEY`, `JIRA-ISSUE-TYPE`,
-`TEAMS-WEBHOOK-URL`, `TEAMS-TAG-EMAIL`, `BACKUP-STORAGE-ACCOUNT-URL` (optional — archival only)
+`TEAMS-WEBHOOK-URL`, `TEAMS-TAG-EMAIL`, `BACKUP-STORAGE-ACCOUNT-URL` (optional, archival only)
 
 <Callout type="warning">
   `OWNER-EMAILS` and the older singular `OWNER-EMAIL` are not used to decide which secrets get
-  monitored anymore, and neither is `DevSecOpsOwnership` (renamed from `ManualAppOwners`) —
+  monitored anymore, and neither is `DevSecOpsOwnership` (renamed from `ManualAppOwners`);
   tickets and Teams alerts now fire on bucket/severity alone. If a secret is not getting alerts or
   tickets and you expect it to, ownership is not the first thing to check anymore; look at its
   bucket and whether a Jira ticket already exists instead. `DevSecOpsOwnership` still matters for
@@ -365,10 +365,10 @@ under the runbook's own Schedules tab:
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| A secret never gets a ticket or alert | The secret is in bucket P4 (safe) — the only bucket that never gets one — or it's an unrecognized/unparseable expiry date | Check `ExpiryBucket` on the row. Tickets and Teams alerts fire on severity alone now, not on `DevSecOpsOwnership` |
+| A secret never gets a ticket or alert | The secret is in bucket P4 (safe), the only bucket that never gets one, or it's an unrecognized/unparseable expiry date | Check `ExpiryBucket` on the row. Tickets and Teams alerts fire on severity alone now, not on `DevSecOpsOwnership` |
 | A secret gets tickets/alerts but rotation never touches it | `DevSecOpsOwnership` is blank for that app | Fill it in on any one row for the app (directly, or via `ProductName`), monitoring propagates it to the rest automatically on the next run, and rotation only acts once it's set |
 | Discovery reconciliation totals do not match | A write failed partway through | Check the run's error list, the summary always prints total apps and secrets seen, separate from what actually got written |
 | Backup rows look wrong or missing | Check whether the backup was written before or after the purge | The backup step always writes this run's snapshot first, then deletes the previous run's rows. A number that looks low is usually the previous run's smaller starting count, not a bug |
-| A Jira status change does not reach SharePoint | The automation rule's trigger list is missing that status | See the Jira automation page — the live KAN project workflow has four real statuses (To Do, In Progress, Waiting for Customer, Resolved), the trigger needs to watch all four |
+| A Jira status change does not reach SharePoint | The automation rule's trigger list is missing that status | See the Jira automation page: the live KAN project workflow has four real statuses (To Do, In Progress, Waiting for Customer, Resolved), the trigger needs to watch all four |
 | Rotation skips a secret that looks eligible | `DevSecOpsOwnership` is blank, or the secret's bucket is P4 | P4 (61+ days, safe) is never rotation eligible by design. Everything else needs `DevSecOpsOwnership` set |
 | Secrets from only one tenant show up | `CROSS-TENANT-TENANT-IDS` is missing a tenant, or still set to the old singular `CROSS-TENANT-TENANT-ID` with only one value | Set the plural secret with every tenant ID, comma separated |

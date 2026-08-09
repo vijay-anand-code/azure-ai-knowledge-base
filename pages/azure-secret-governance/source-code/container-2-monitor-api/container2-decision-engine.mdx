@@ -1,17 +1,17 @@
 ---
 title: decision_engine.py
-description: Async orchestrator — classifies secrets, raises Jira tickets, sends Teams alerts, and updates SharePoint
+description: Async orchestrator that classifies secrets, raises Jira tickets, sends Teams alerts, and updates SharePoint
 ---
 
 import { Callout } from 'nextra/components'
 
-# decision_engine.py — Container 2
+# decision_engine.py (Container 2)
 
 **Location:** `secret-governance-app/container-2/decision_engine.py`
 
-**Runtime:** Python 3.11 — imported by `main.py` in Container 2
+**Runtime:** Python 3.11, imported by `main.py` in Container 2
 
-**What it does:** Pure orchestration logic — no HTTP wiring. Receives injectable async functions from `main.py` and uses them to snapshot/back up SharePoint state, classify secrets, raise Jira tickets, send Teams alerts, and write SharePoint rows. All I/O happens in batches to stay within API rate limits.
+**What it does:** Pure orchestration logic, with no HTTP wiring. Receives injectable async functions from `main.py` and uses them to snapshot/back up SharePoint state, classify secrets, raise Jira tickets, send Teams alerts, and write SharePoint rows. All I/O happens in batches to stay within API rate limits.
 
 ---
 
@@ -34,7 +34,7 @@ run_secret_monitoring(
 decision_engine.py: backs up both SharePoint lists, then orchestrates every phase
 ```
 
-The injection pattern means the engine has no knowledge of HTTP, Key Vault, or Azure — it can be unit-tested by passing in mock functions. The full parameter list is considerably longer than shown above (roughly thirty callables/values); see the signature in Source below.
+The injection pattern means the engine has no knowledge of HTTP, Key Vault, or Azure, so it can be unit-tested by passing in mock functions. The full parameter list is considerably longer than shown above (roughly thirty callables/values); see the signature in Source below.
 
 ---
 
@@ -45,11 +45,11 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 | Backup rotation (before anything else touches either list) | Snapshots `SecretAlertRegistry` and `IgnoredSecretRegistry` into their own backup lists, archiving whatever was already in each backup list to a Storage Account first if one is configured. Aborts the whole run if a configured Storage upload actually fails. See [Backup rotation](#backup-rotation) below |
 | `ProductName` lookup | Resolves `DevSecOpsOwnership` from a Key Vault secret named after each row's `ProductName`, always overwriting whatever was already there |
 | `DevSecOpsOwnership` propagation | Backfills `DevSecOpsOwnership` onto every sibling row for the same app, before filtering |
-| Phase 1 — new secrets, Jira | Create Jira tickets in batches of 5, for every bucket except P4/Ignore |
-| Phase 2 — new secrets, SharePoint + Teams | Write SharePoint rows and send Teams alerts (P1/P2 only) in batches of 10 |
-| Phase 3 — new P4 secrets (61+ days, safe) | Written to SharePoint with `AlertStatus=Discovered`, no alert, no ticket. An earlier version of this phase only logged these to the console with no SharePoint row at all, inconsistent with how an already-existing P4 row was treated — fixed so both paths write the same way |
-| Phase 3a — new Ignore-bucket secrets (-8+ days, brand new to monitoring) | Written straight to `IgnoredSecretRegistry`, never touching the master list at all. Falls back to a plain `Discovered` row in the master list if `create_ignored_row` isn't wired up or the write fails, so the secret is never silently dropped |
-| Phase 4 — existing secrets | Escalate or update existing rows based on current bucket vs. recorded status, purely on severity — ownership is not a factor |
+| Phase 1: new secrets, Jira | Create Jira tickets in batches of 5, for every bucket except P4/Ignore |
+| Phase 2: new secrets, SharePoint + Teams | Write SharePoint rows and send Teams alerts (P1/P2 only) in batches of 10 |
+| Phase 3: new P4 secrets (61+ days, safe) | Written to SharePoint with `AlertStatus=Discovered`, no alert, no ticket. An earlier version of this phase only logged these to the console with no SharePoint row at all, inconsistent with how an already-existing P4 row was treated, so it was fixed so both paths write the same way |
+| Phase 3a: new Ignore-bucket secrets (-8+ days, brand new to monitoring) | Written straight to `IgnoredSecretRegistry`, never touching the master list at all. Falls back to a plain `Discovered` row in the master list if `create_ignored_row` isn't wired up or the write fails, so the secret is never silently dropped |
+| Phase 4: existing secrets | Escalate or update existing rows based on current bucket vs. recorded status, purely on severity; ownership is not a factor |
 
 ---
 
@@ -76,21 +76,21 @@ a ticket.
 
 | Bucket | Days | `AlertStatus` set | Jira priority | Jira ticket | Teams alert |
 |--------|------|-----------------|--------------|-------------|-------------|
-| P1, 0 to 3 days | 0–3 | `CriticalTagged` | `P1` | Yes | Yes — CRITICAL, tags a specific person |
-| P1, 4 to 7 days | 4–7 | `Escalated` | `P1` | Yes | Yes — CRITICAL, no tagging |
-| P2 | 8–30 | `TeamsAlerted` | `P2` | Yes | Yes — WARNING |
+| P1, 0 to 3 days | 0–3 | `CriticalTagged` | `P1` | Yes | Yes, CRITICAL, tags a specific person |
+| P1, 4 to 7 days | 4–7 | `Escalated` | `P1` | Yes | Yes, CRITICAL, no tagging |
+| P2 | 8–30 | `TeamsAlerted` | `P2` | Yes | Yes, WARNING |
 | P3 | 31–60 | `JiraRaised` | `P3` | Yes | No |
 | P4 | 61+ | `Discovered` when newly written; refreshed in place on every later touch | none, never ticketed | No | No |
 | ExpiredManualReview | -7 to -1 | `ExpiredManualReview` | `P1` (literal) | Yes | **No** |
 | Ignore, existing row | -8 and older | `OverdueManualReview` if the row's Jira ticket is still open, otherwise the row is moved out to `IgnoredSecretRegistry` | none | No new ticket is raised; an existing one is left alone | No |
-| Ignore, brand-new secret | -8 and older | n/a — written straight to `IgnoredSecretRegistry`, no `SecretAlertRegistry` row at all | none | No | No |
+| Ignore, brand-new secret | -8 and older | n/a, written straight to `IgnoredSecretRegistry`, no `SecretAlertRegistry` row at all | none | No | No |
 
 <Callout type="warning">
   `ExpiredManualReview` never actually sends a Teams alert, even though `TEAMS_HEADERS` defines an
   `"EXPIRED"` header and `_teams_text()` has a dedicated `EXPIRED` branch for the message copy.
   `send_teams_alert()` is only ever called when `bucket in TEAMS_ALERT_BUCKETS`, and
   `TEAMS_ALERT_BUCKETS = {"P1", "P2"}` does not include `ExpiredManualReview`. The `EXPIRED`
-  message-building code exists but is unreachable through this path — don't assume an
+  message-building code exists but is unreachable through this path, so don't assume an
   already-expired secret pages anyone in Teams; it only ever gets a Jira ticket.
 </Callout>
 
@@ -116,7 +116,7 @@ a ticket.
   The Ignore bucket is handled by two different code paths depending on whether the secret is
   brand new to monitoring or already has a `SecretAlertRegistry` row. A brand-new secret that's
   already 8+ days expired (Phase 3a) is written straight into `IgnoredSecretRegistry` with
-  `IgnoreReason: "Expired8Plus"` and no `JiraTicketKey` — there was never a ticket for it. An
+  `IgnoreReason: "Expired8Plus"` and no `JiraTicketKey`, since there was never a ticket for it. An
   *existing* row crossing into Ignore (Phase 4) goes through the -8-day abandonment check instead:
   it's only moved if there's no ticket at all, or the ticket is Canceled; if the ticket is still
   genuinely open, the row stays in `SecretAlertRegistry` as `OverdueManualReview` and its
@@ -129,24 +129,24 @@ a ticket.
 
 ## Ownership no longer gates tickets or alerts
 
-Earlier versions of this file required an app to already have an owner set — first as an
-`OWNER-EMAILS` match against `AppOwners`, later as a `DevSecOpsOwnership`-non-blank check — before
+Earlier versions of this file required an app to already have an owner set, first as an
+`OWNER-EMAILS` match against `AppOwners`, later as a `DevSecOpsOwnership`-non-blank check, before
 a secret's Jira ticket or Teams alert would fire, for both brand-new secrets (`_is_owned_new()` /
 `sp_app_owners`) and existing rows (an "unowned row, quiet refresh only" branch in
 `_handle_existing_secret()`). Both of those gates have been removed entirely, per an explicit
 client requirement: tickets and Teams alerts fire purely on severity/bucket, the same way
 regardless of whether `DevSecOpsOwnership` is filled in yet. P4 and Ignore still never get a
-ticket or alert — that's bucket-based, not ownership-based.
+ticket or alert, since that's bucket-based, not ownership-based.
 
 `DevSecOpsOwnership` still exists as a column, is still resolved (manually, via the `ProductName`
 lookup below, or by the separate `devsecops-secret-governance-sync.py` script), and is still
-propagated app-wide — but within this file it no longer blocks anything from happening. The
+propagated app-wide, but within this file it no longer blocks anything from happening. The
 `skippedNotOwned` counter in the run summary is tracked purely as a visibility metric now; it has
 no effect on which rows get processed, ticketed, or alerted.
 
 <Callout type="warning">
   This is worth double-checking against any other page that describes `DevSecOpsOwnership` as
-  gating whether monitoring "works" a row at all — as of the current `decision_engine.py`, every
+  gating whether monitoring "works" a row at all: as of the current `decision_engine.py`, every
   row `sp_index` can match is escalated/self-healed/refreshed on every run regardless of
   `DevSecOpsOwnership`, and every new secret outside P4/Ignore gets a ticket/alert regardless of
   ownership too. If rotation (`runbook_rotation.py`, a separate file outside this page's scope)
@@ -165,7 +165,7 @@ separate `devsecops-secret-governance-sync.py` script resolves it the same way b
 If `ProductName` is filled in, `get_product_service_principal()` looks up a Key Vault secret
 literally named after that product (a secret called `ProductA` for a row with `ProductName`
 `ProductA`) and writes its value, a service principal name, into `DevSecOpsOwnership` for that
-row — with **no allowlist gate** on this path. This always overwrites whatever was there already,
+row, with **no allowlist gate** on this path. This always overwrites whatever was there already,
 `ProductName` is meant to be the team's single source of truth going forward. A `ProductName` with
 no matching Key Vault secret leaves `DevSecOpsOwnership` untouched rather than failing the run.
 
@@ -174,18 +174,17 @@ still reach every sibling row for the same app in the same run. Lookups are cach
 name within a single run, so a product used across many rows only costs one Key Vault read.
 
 <Callout type="info">
-  `ProductTeamkeyVaultName` (note the exact casing used by this file), a separate column, is
-  unrelated to this lookup. It controls where `runbook_rotation.py` stores a newly rotated
-  secret's value, not where `DevSecOpsOwnership` comes from.
+  `ProductTeamsKeyVaultName`, a separate column, is unrelated to this lookup. It controls where
+  `runbook_rotation.py` stores a newly rotated secret's value, not where `DevSecOpsOwnership` comes
+  from.
 </Callout>
 
-<Callout type="warning">
-  `main.py`'s `/tools/jira-status-update` handler backfills a differently-spelled column,
-  `ProductTeamsKeyVaultName` (with an "s" after "Team"), from a Jira custom field. This file's own
-  lineage tracking (below) reads and writes `ProductTeamkeyVaultName` (no "s"). These are two
-  distinct SharePoint column names as the source currently stands — a value backfilled through one
-  path does not automatically appear in the other's column. Confirm which spelling the live
-  SharePoint list schema actually uses before assuming the two are kept in sync.
+<Callout type="info">
+  `main.py`'s `/tools/jira-status-update` handler and this file's own lineage tracking (below) both
+  read and write the same column, `ProductTeamsKeyVaultName`. An earlier version of this file
+  spelled it without the "s" (`ProductTeamkeyVaultName`), so a value backfilled through one path
+  never showed up through the other; that mismatch has since been fixed, and both paths now agree
+  on the same column name.
 </Callout>
 
 ---
@@ -194,15 +193,15 @@ name within a single run, so a product used across many rows only costs one Key 
 
 `fetch_app_owners()` (now genuinely wired up from `main.py`, keyed by `(tenant_id, app_object_id)`
 rather than the legacy unused single-arg signature) is called once per unique app per run, and its
-result is stamped onto the `AppOwners` column — a live, read-only snapshot of who Entra actually
+result is stamped onto the `AppOwners` column, a live, read-only snapshot of who Entra actually
 lists as the App Registration's owners. This is separate from `DevSecOpsOwnership`, which is the
 admin-controlled column monitoring actually reasons about.
 
 Unlike `DevSecOpsOwnership`, `AppOwners` (and the paired `ObjectID` column, holding the app's Graph
-object id — required because `fetch_app_owners()`'s Graph call needs the object id, not the
+object id, required because `fetch_app_owners()`'s Graph call needs the object id, not the
 `appId`/client id) is **unconditionally re-stamped every time monitoring touches a row**, not just
-the first time the row is created. Every write path in this file — new-secret writes, P4 quiet
-writes, paused/skip-status refreshes, escalations, and plain refreshes — includes
+the first time the row is created. Every write path in this file (new-secret writes, P4 quiet
+writes, paused/skip-status refreshes, escalations, and plain refreshes) includes
 `AppOwners`/`ObjectID` in its field set. An empty owner list from Entra is treated as real, current
 data, not a gap worth protecting a previous value from.
 
@@ -210,7 +209,7 @@ data, not a gap worth protecting a previous value from.
 
 ## Lineage tracking
 
-`TeamName`, `ProductName`, and `ProductTeamkeyVaultName` are filled in by hand, once, the first
+`TeamName`, `ProductName`, and `ProductTeamsKeyVaultName` are filled in by hand, once, the first
 time an app is onboarded. When that secret later rotates, rotation creates a brand-new Entra
 secret (a new `SecretID`) and records that new ID in the *old* row's `NewSecretKeyId` column.
 Without anything else happening, the new secret would show up here as a completely fresh row
@@ -220,14 +219,14 @@ rotation cycle.
 Lineage tracking closes that gap. Before processing new secrets, this builds a lookup of every
 existing row's `NewSecretKeyId`, keyed by that ID. Any secret that's new to this run (not yet in
 `SecretAlertRegistry`) has its own `SecretID` checked against that lookup, if it matches, the new
-row copies `TeamName`, `ProductName`, and `ProductTeamkeyVaultName` straight from the matching
+row copies `TeamName`, `ProductName`, and `ProductTeamsKeyVaultName` straight from the matching
 parent row, so the team never has to fill them in again for the same app.
 
 <Callout type="info">
   The parent row's own `NewSecretKeyId` is left untouched afterward, it stays as history, not
   cleared once the match is made. Only `runbook_discovery.py` ever creates a row for a genuinely
   new secret ahead of monitoring seeing it, and discovery deliberately never writes to
-  `TeamName`/`ProductName`/`ProductTeamkeyVaultName` on any row, new or existing, so this lineage
+  `TeamName`/`ProductName`/`ProductTeamsKeyVaultName` on any row, new or existing, so this lineage
   copy is the only mechanism that ever fills them in automatically. If discovery creates a new
   secret's row before monitoring's own scan runs, monitoring will see it as an existing row
   instead of a new one, and this lineage match won't fire for it, the fields stay blank until a
@@ -238,8 +237,8 @@ parent row, so the team never has to fill them in again for the same app.
 
 ## Backup rotation
 
-Before anything else touches `SecretAlertRegistry` or `IgnoredSecretRegistry` — including the
-`ProductName` lookup and propagation steps, which already write to the master list — both lists
+Before anything else touches `SecretAlertRegistry` or `IgnoredSecretRegistry`, including the
+`ProductName` lookup and propagation steps, which already write to the master list, both lists
 are snapshotted into their own dedicated backup lists via `_rotate_backup_list()`. This is
 deliberately the very first thing `run_secret_monitoring()` does, so the snapshot captures
 genuinely pre-run state.
@@ -251,15 +250,15 @@ backup is never deleted before the new one is safely in place:
 2. If it's non-empty and a Storage upload function is configured (`upload_backup_to_storage`,
    wired from `main.py`'s `BACKUP-STORAGE-ACCOUNT-URL` Key Vault secret), archive it there first as
    a CSV blob. A Storage upload that's configured but actually **fails aborts the whole
-   monitoring run** — this is a real failure of something expected to work, not a
+   monitoring run**: this is a real failure of something expected to work, not a
    "not configured" case. If Storage genuinely isn't configured, the old content is simply not
-   archived — not an error.
+   archived, which is not an error.
 3. Write a fresh snapshot of the current items into the backup list as new rows, batched the same
    way every other bulk write in this file is (`SP_WRITE_BATCH`). If this fails partway, the new
    rows already created are deleted (reverting the backup list to exactly how it looked before this
-   run touched it) and the run aborts — nothing downstream runs this cycle.
+   run touched it) and the run aborts, so nothing downstream runs this cycle.
 4. Only once the new snapshot is fully and successfully written are the old backup-list rows
-   deleted. A failure here is logged but not fatal — the data-safety goal (archived old + new
+   deleted. A failure here is logged but not fatal: the data-safety goal (archived old + new
    snapshot present) is already met.
 
 If `backup_list_id`/`ignored_backup_list_id` aren't configured, or `get_list_state`/
@@ -270,7 +269,7 @@ list is skipped entirely (not an abort). The run summary's `masterListBackedUp` 
 
 <Callout type="info">
   The actual HTTP/Storage calls behind `get_list_state`, `create_list_row`, `delete_list_row`, and
-  `upload_backup_to_storage` live in `main.py` — see that page's Backup and archive helpers
+  `upload_backup_to_storage` live in `main.py`; see that page's Backup and archive helpers
   section for the Storage Blob upload and CSV-flattening details.
 </Callout>
 
@@ -280,17 +279,17 @@ list is skipped entirely (not an abort). The run summary's `masterListBackedUp` 
 
 | Decision | Reason |
 |----------|--------|
-| Injected callables | Decouples orchestration from I/O — engine is testable without Azure |
+| Injected callables | Decouples orchestration from I/O, so the engine is testable without Azure |
 | `asyncio.gather` in batches | Concurrent writes without flooding Graph or Jira APIs |
 | Backup rotation before any write | Both master lists are snapshotted (and optionally archived to Storage) before a single row is touched, aborting the run rather than risking data loss if the snapshot itself can't be trusted |
 | Escalation stage check | `BUCKET_STAGE` vs `STATUS_STAGE` prevents sending duplicate alerts for the same severity |
 | Self-heal missing Jira ticket | If an existing SP row has no `JiraTicketKey`, the engine creates a new ticket rather than silently skipping |
-| `MONITOR_SKIP_STATUSES` | `Rotated`, `Ignored`, `Resolved`, and `RotatedPendingDeployment` rows are never re-alerted. `Blocked` and `AwaitingReporter` rows are also skipped, but only while paused — they resume once the Jira ticket moves to a different status |
-| Ownership is not a gate | `DevSecOpsOwnership` no longer blocks ticket/Teams-alert creation for new or existing rows — severity/bucket alone decides. See [Ownership no longer gates tickets or alerts](#ownership-no-longer-gates-tickets-or-alerts) above |
+| `MONITOR_SKIP_STATUSES` | `Rotated`, `Ignored`, `Resolved`, and `RotatedPendingDeployment` rows are never re-alerted. `Blocked` and `AwaitingReporter` rows are also skipped, but only while paused; they resume once the Jira ticket moves to a different status |
+| Ownership is not a gate | `DevSecOpsOwnership` no longer blocks ticket/Teams-alert creation for new or existing rows, since severity/bucket alone decides. See [Ownership no longer gates tickets or alerts](#ownership-no-longer-gates-tickets-or-alerts) above |
 | `should_tag_p1()` | Whether a P1 Teams alert tags someone is a day-count decision within the bucket, not a separate bucket membership check |
-| `ProductName` lookup, cached per run, no allowlist | Resolves `DevSecOpsOwnership` from a Key Vault secret named after the product, always overwriting — the allowlist gate lives only in the separate sync script, not here |
-| `AppOwners`/`ObjectID` re-stamped on every touch | Every write path — not just first discovery — refreshes these from the current run's live Entra data |
-| Lineage tracking via `NewSecretKeyId` | A rotated secret's brand-new row automatically inherits `TeamName`/`ProductName`/`ProductTeamkeyVaultName` from its parent row, so the team fills these in once per app, not once per rotation cycle |
+| `ProductName` lookup, cached per run, no allowlist | Resolves `DevSecOpsOwnership` from a Key Vault secret named after the product, always overwriting; the allowlist gate lives only in the separate sync script, not here |
+| `AppOwners`/`ObjectID` re-stamped on every touch | Every write path, not just first discovery, refreshes these from the current run's live Entra data |
+| Lineage tracking via `NewSecretKeyId` | A rotated secret's brand-new row automatically inherits `TeamName`/`ProductName`/`ProductTeamsKeyVaultName` from its parent row, so the team fills these in once per app, not once per rotation cycle |
 | `OverdueManualReview`, distinct from `ExpiredManualReview` | A secret past -8 days with a still-open Jira ticket needs its own status, someone is actively engaged, so it must stay visible and never auto-rotate, but it's a different state from a freshly-expired secret |
 | `IgnoredSecretRegistry.JiraTicketKey` | Stamped whenever the -8-day abandonment check moves an existing row that already had a ticket, so a later reopen of that ticket can find the row again |
 | `sp_index` keyed by `SecretID` alone, never gated by ownership | `SecretID` (Entra's `keyId`) is already a globally unique GUID, no need for a composite key. Indexing every existing row regardless of `DevSecOpsOwnership` fixed a real duplication bug, see the callout below |
@@ -305,7 +304,7 @@ list is skipped entirely (not an abort). The run summary's `masterListBackedUp` 
   having filled in ownership for it, had its existing P4 row invisible to `sp_index` every run,
   looked "new" every run, and got a duplicate row created every single run, forever. `sp_index` was
   fixed to include every row unconditionally. Since then, the separate `_is_owned_new`/
-  `sp_app_owners` gate on new-secret creation has also been removed entirely (see above) — so today
+  `sp_app_owners` gate on new-secret creation has also been removed entirely (see above), so today
   neither check exists, ownership only affects the `skippedNotOwned` count, nothing else.
 </Callout>
 
@@ -1230,7 +1229,7 @@ async def run_secret_monitoring(
     # When a secret rotates, rotation creates a brand-new Entra secret (new
     # SecretID) and records that new ID in the OLD row's NewSecretKeyId
     # column. The team fills TeamName, ProductName, and
-    # ProductTeamkeyVaultName in BY HAND only once, the first time an app is
+    # ProductTeamsKeyVaultName in BY HAND only once, the first time an app is
     # onboarded 1 every year after that, when the new secret shows up here
     # as a "new" secret with no row of its own yet, this checks whether its
     # ID matches some EXISTING row's NewSecretKeyId. If it does, that
@@ -1251,7 +1250,7 @@ async def run_secret_monitoring(
             lineage_by_new_secret_id[new_id] = {
                 "TeamName":                f.get("TeamName", ""),
                 "ProductName":              f.get("ProductName", ""),
-                "ProductTeamkeyVaultName":  f.get("ProductTeamkeyVaultName", ""),
+                "ProductTeamsKeyVaultName":  f.get("ProductTeamsKeyVaultName", ""),
             }
  
     lineage_matches_found = 0
@@ -1262,7 +1261,7 @@ async def run_secret_monitoring(
             lineage_matches_found += 1
             print(f"[INFO] Lineage match - secret {c['secret_id']} for {c['app_name']} matches a "
                  f"parent row's NewSecretKeyId, copying TeamName/ProductName/"
-                 f"ProductTeamkeyVaultName onto the new row")
+                 f"ProductTeamsKeyVaultName onto the new row")
     summary["lineageMatchesFound"] = lineage_matches_found
 
     # -- PHASE 1: Create Jira tickets for new secrets (batched) ------------------
@@ -1373,7 +1372,7 @@ async def run_secret_monitoring(
         if lineage:
             fields["TeamName"]               = lineage["TeamName"]
             fields["ProductName"]            = lineage["ProductName"]
-            fields["ProductTeamkeyVaultName"] = lineage["ProductTeamkeyVaultName"]
+            fields["ProductTeamsKeyVaultName"] = lineage["ProductTeamsKeyVaultName"]
  
         teams_sent = False
         if bucket in TEAMS_ALERT_BUCKETS:
@@ -1471,13 +1470,13 @@ async def run_secret_monitoring(
                 fields["TenantID"]   = c["tenant_id"]
             # Same lineage carry-over as the ticket/alert path above, so a
             # quietly-written row still gets TeamName/ProductName/
-            # ProductTeamkeyVaultName copied over if it matched a parent
+            # ProductTeamsKeyVaultName copied over if it matched a parent
             # row's NewSecretKeyId.
             lineage = c.get("lineage_fields")
             if lineage:
                 fields["TeamName"]               = lineage["TeamName"]
                 fields["ProductName"]            = lineage["ProductName"]
-                fields["ProductTeamkeyVaultName"] = lineage["ProductTeamkeyVaultName"]
+                fields["ProductTeamsKeyVaultName"] = lineage["ProductTeamsKeyVaultName"]
             try:
                 await write_sharepoint_row(None, fields)
                 return {"error": None}

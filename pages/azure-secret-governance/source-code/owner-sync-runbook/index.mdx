@@ -6,12 +6,12 @@ description: Local script that gates DevSecOpsOwnership on a ProductName allowli
 # Owner Sync Runbook
 
 **File:** `devsecops-secret-governance-sync.py`
-**Runtime:** Python 3.10+ — run locally, from a laptop, not Azure Automation
+**Runtime:** Python 3.10+, run locally from a laptop, not Azure Automation
 **Schedule:** Manual, run whenever the `ALLOWED-PRODUCT-NAMES` Key Vault allowlist or a row's `ProductName` has changed
 
 For every active `SecretAlertRegistry` row with a non-blank `TenantID`, sets `DevSecOpsOwnership`
 to the fixed identity `devsecops-secret-governance-monitor` if the row's `ProductName` is on the
-`ALLOWED-PRODUCT-NAMES` Key Vault allowlist, or clears it if not — overwriting whatever was there
+`ALLOWED-PRODUCT-NAMES` Key Vault allowlist, or clears it if not, overwriting whatever was there
 either way. For rows where the product is allowed, it also resolves that identity in Entra ID and
 adds it as a real owner on the matching App Registration, using the operator's own signed in
 `az login` session instead of the shared automation identity.

@@ -417,7 +417,7 @@ The UAMI is only used to assert identity, it holds no direct Graph permissions o
 | `JIRA-ISSUE-TYPE` | `Incident` | Monitoring |
 | `TEAMS-WEBHOOK-URL` | Teams incoming webhook URL | Monitoring |
 | `TEAMS-TAG-EMAIL` | example account to mention on P1 (0-3 day) Teams alerts | Monitoring |
-| `BACKUP-STORAGE-ACCOUNT-URL` | `https://example.blob.core.windows.net` | Monitoring. Deliberately optional — archives the previous `SecretAlertRegistryBackup`/`IgnoredSecretRegistryBackup` snapshot as CSV before it's overwritten each run. If unset, the old snapshot is simply discarded (with a warning) instead of archived, rather than blocking the run |
+| `BACKUP-STORAGE-ACCOUNT-URL` | `https://example.blob.core.windows.net` | Monitoring. Deliberately optional; archives the previous `SecretAlertRegistryBackup`/`IgnoredSecretRegistryBackup` snapshot as CSV before it's overwritten each run. If unset, the old snapshot is simply discarded (with a warning) instead of archived, rather than blocking the run |
 | `OWNER-EMAILS` | kept for backwards compatibility only, not used to gate anything by default | Monitoring and rotation |
 | `AZURE-OPENAI-ENDPOINT` | `https://example.openai.azure.com` | Container 1 |
 | `AZURE-OPENAI-API-KEY` | key value | Container 1 |
@@ -430,7 +430,7 @@ The UAMI is only used to assert identity, it holds no direct Graph permissions o
   (renamed from `ManualAppOwners`), filled in directly by a person, resolved automatically via a
   `ProductName` Key Vault lookup, or set by the separate local sync script. Discovery never writes
   to that column, and monitoring propagates it to every other row belonging to the same app
-  automatically. Ownership no longer gates whether a Jira ticket or Teams alert gets raised —
+  automatically. Ownership no longer gates whether a Jira ticket or Teams alert gets raised,
   only whether monitoring/rotation actively work a row. See the Ownership model section on the
   main page for the full picture.
 </Callout>
