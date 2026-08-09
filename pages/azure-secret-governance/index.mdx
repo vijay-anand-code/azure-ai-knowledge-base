@@ -15,8 +15,17 @@ app before that app's secrets get touched.
 The system runs as two containers inside a single Azure Container App, triggered weekly by
 Azure Automation Runbooks. Credentials are handled through a User-Assigned Managed Identity, so
 there are no client secrets sitting in code or config files. A secret only becomes eligible for
-monitoring and rotation once someone fills in the `ManualAppOwners` column for its App
-Registration in SharePoint. More on that in the ownership model section below.
+monitoring and rotation once its App Registration's `DevSecOpsOwnership` column in SharePoint is
+filled in — either directly, or resolved automatically via `ProductName`. More on that in the
+ownership model section below.
+
+<Callout type="warning">
+  `ManualAppOwners` was renamed to `DevSecOpsOwnership` and the Jira custom fields were
+  restructured (`TeamName`/`ProductName` recreated as dropdowns, `DevSecOpsOwnership` removed
+  from Jira entirely, four new fields added: `ProductTeamsKeyVaultName`, `NewSecretVaultName`,
+  `NewSecretKeyId`, `NewSecretPresent`). If you're reading an older printout or screenshot with
+  `ManualAppOwners`, treat it as `DevSecOpsOwnership` — same column, same purpose, new name.
+</Callout>
 
 ---
 
@@ -28,22 +37,32 @@ Registration in SharePoint. More on that in the ownership model section below.
   the literal bucket name (P1, P2, or P3)
 - Sends Teams alerts to the configured channel with days remaining. Within P1, the 0 to 3 day
   half additionally tags a specific person, the 4 to 7 day half sends a plain alert with no tag
-- Rotates secrets for P1 through P3 apps automatically once `ManualAppOwners` is set, and stores
-  the new values in Key Vault with a configurable validity period. If a row's
-  `ProductTeamkeyVaultName` is filled in, the rotated value goes into that specific Key Vault
-  instead of the shared rotation vault
+- Rotates secrets for P1 through P3 apps automatically once `DevSecOpsOwnership` is set, and
+  stores the new values in Key Vault with a configurable validity period. If a row's
+  `ProductTeamsKeyVaultName` is filled in, the rotated value goes into that specific Key Vault
+  instead of the shared rotation vault. If `NewSecretKeyId` already has a value when rotation
+  reaches that row — meaning an engineer already generated and recorded the new secret manually
+  via Jira's `NewSecretPresent` field — rotation skips generating a second, conflicting one
 - Looks up a Key Vault secret named after a row's `ProductName` column, if filled in, and writes
-  that secret's value into `ManualAppOwners` automatically, overwriting whatever was there
+  that secret's value into `DevSecOpsOwnership` automatically, overwriting whatever was there.
+  The local `sync.py` script does a related but distinct lookup — see the ownership model
+  section below for the difference
+- Populates `AppOwners`, `TenantID`, and `ObjectID` from live Entra data on every row it touches,
+  not just at first discovery — a manually-corrected or stale value self-heals back to whatever
+  Entra actually reports on the next run
 - Keeps a SharePoint audit trail across two lists: `SecretAlertRegistry` for anything actionable,
   `IgnoredSecretRegistry` for secrets that are genuinely expired and abandoned
-- Backs up both lists before every discovery run. The new snapshot gets written before the old
-  one is deleted, so there's never a window with zero backup if a run fails partway through
+- Backs up both lists before every monitoring run touches them: the current state is snapshotted
+  into a dedicated backup list, and whatever was previously in that backup list is archived to a
+  Storage Account as CSV first, before being overwritten. See the SharePoint page for details
 - Checks for abandoned secrets. A secret past 8 days expired with no open Jira ticket, or with a
   canceled one, moves to `IgnoredSecretRegistry`. One that's still being worked stays visible and
   gets marked overdue instead of disappearing
-- Closes the loop through a Jira automation rule watching all six workflow statuses: To Do, In
-  Progress, Done, Canceled, Blocked, and Awaiting Reporter. SharePoint updates on every
-  transition, not only when a ticket closes
+- Closes the loop through a Jira automation rule. The live workflow currently has four statuses
+  (To Do, In Progress, Waiting for Customer, Resolved) — SharePoint updates on every one of them,
+  not only when a ticket resolves. A second workflow validator, separate from the field-required
+  gate on Resolved, now also requires `TeamName`/`ProductName`/`ProductTeamsKeyVaultName`/
+  `NewSecretPresent` before a ticket can even leave To Do
 
 ---
 
@@ -51,10 +70,15 @@ Registration in SharePoint. More on that in the ownership model section below.
 
 ```
 Azure Automation Runbooks (weekly schedule)
-  00:00  Discovery    scans both tenants, classifies P1 through P4, backs up both lists
-  00:15  Owner Sync   run manually from a laptop, under the operator's own signed in session
-  00:30  Monitoring   raises Jira tickets and Teams alerts, propagates ManualAppOwners
-  01:00  Rotation     rotates secrets for P1 through P3, updates SharePoint
+  00:00  Discovery    scans both tenants, classifies P1 through P4
+  00:15  Owner Sync   run manually from a laptop, under the operator's own signed in session —
+                       resolves DevSecOpsOwnership via a per-product Key Vault lookup AND adds
+                       the resolved identity as a real Entra owner
+  00:30  Monitoring   backs up both SharePoint lists first, then raises Jira tickets and Teams
+                       alerts, propagates DevSecOpsOwnership, re-stamps AppOwners/TenantID/
+                       ObjectID from live Entra data on every row it touches
+  01:00  Rotation     rotates secrets for P1 through P3 (skips any row where NewSecretKeyId is
+                       already manually provided), updates SharePoint
         |
         v
 Container App: secret governance
@@ -65,20 +89,24 @@ Container App: secret governance
 |                              GPT-4o and per-session      |
 |                              memory                     |
 |    POST /teams-webhook      Teams platform messages     |
+|    POST /jira-status-update proxy to Container 2, so    |
+|                              Jira Automation has one     |
+|                              stable external URL         |
 |                                                         |
 |  Container 2: Monitor REST API (port 8001, internal)    |
 |    POST /tools/run_secret_monitoring                    |
 |    POST /tools/fetch_azure_secrets                      |
 |    POST /tools/write_sharepoint_row                     |
 |    POST /tools/create_jira_ticket                       |
-|    POST /tools/jira-status-update   handles all 6 statuses |
+|    POST /tools/jira-status-update   handles every live  |
+|                                       workflow status     |
 +-------------------------------------------------------+
-        |                         |
-        v                         v
-Microsoft Graph API           Azure Key Vault
-  App Registrations             Config secrets
-  (2 tenants)                   Rotated secret values
-  SharePoint lists (4)
+        |                         |              |
+        v                         v              v
+Microsoft Graph API      Azure Key Vault    Storage Account
+  App Registrations        Config secrets     Backup-list archive
+  (2 tenants)               Rotated values      (CSV, previous
+  SharePoint lists                                snapshot only)
   Teams alerts
 ```
 
@@ -164,26 +192,45 @@ rather than a shared service principal.
 
 ## Ownership model
 
-The system uses one explicit gate, filled in one of two ways.
+The system uses one explicit gate, `DevSecOpsOwnership`, filled in one of three ways — two run
+inside the container app automatically, one is a separate local script with a materially
+different design.
 
-A human can fill in `ManualAppOwners` directly on any single secret row belonging to an app.
-Discovery never writes to this column, so whatever's typed in stays untouched. Monitoring then
-copies that value onto every other row for the same app automatically. If `ManualAppOwners` is
-blank for an app, every one of its secrets is skipped entirely, both by monitoring and by
-rotation.
+**Directly.** A human fills in `DevSecOpsOwnership` on any single secret row belonging to an
+app. Discovery never writes to this column, so whatever's typed in stays untouched. Monitoring
+then copies that value onto every other row for the same app automatically. If
+`DevSecOpsOwnership` is blank for an app, every one of its secrets is skipped by monitoring and
+rotation — but no longer by ticket/alert creation, see the note below.
 
-The second way is indirect: a row can have `ProductName` filled in instead. If it is, monitoring
-looks up a Key Vault secret named exactly after that product and writes the secret's value, a
-service principal name, into `ManualAppOwners` for that row, always overwriting whatever was
-there. This runs before the propagation step above, so a value set this way still reaches every
-sibling row for the same app in the same run. A `ProductName` with no matching Key Vault secret
-just leaves `ManualAppOwners` as it was, it doesn't fail the run.
+**Via `ProductName`, resolved by monitoring.** `decision_engine.py`'s `get_product_service_principal()`
+looks up a Key Vault secret named exactly after the row's `ProductName` and writes the secret's
+value into `DevSecOpsOwnership`, always overwriting whatever was there. Any `ProductName` value
+is tried directly — there's no allowlist gate on this path. A `ProductName` with no matching Key
+Vault secret just leaves `DevSecOpsOwnership` as it was, it doesn't fail the run.
 
-`AppOwners`, which discovery stamps in automatically from Entra, is a separate column kept for
-reference only. It doesn't gate anything. An earlier version of this system gated on `AppOwners`
-matching a fixed list of emails configured in Key Vault. That filter has been fully replaced by
-`ManualAppOwners`, which reflects an actual human decision (typed directly, or resolved from
-`ProductName`) instead of whatever Entra happens to report.
+**Via `ProductName`, resolved by the local `sync.py` script.** A separate, deliberately different
+mechanism: `resolve_product_ownership()` first checks whether `ProductName` is in the
+`ALLOWED-PRODUCT-NAMES` Key Vault allowlist before doing the same per-product secret lookup. If
+the product is allowed but has no matching secret yet, the row is left completely untouched
+(not cleared) and counted as `ownershipMisconfigured` — a config gap to fix, not a rejection. If
+`ProductName` is blank or not in the allowlist, `DevSecOpsOwnership` is actively cleared if it
+currently has a value. This script also does something the container-app path never does: it
+adds the resolved identity (or identities — the per-product secret's value can be a
+comma-separated list) as a **real Entra owner** on the App Registration, using the operator's own
+signed-in `az login` session rather than the shared automation identity.
+
+<Callout type="warning">
+  Ownership no longer gates whether a Jira ticket or Teams alert gets raised — only whether
+  monitoring/rotation actively work a row. This was an explicit client requirement: severity
+  alone decides whether something gets a ticket, ownership only decides whether it's actively
+  chased afterward.
+</Callout>
+
+`AppOwners`, re-stamped from live Entra data on every row monitoring touches (not just at first
+discovery), is a separate column kept for reference only — it shows the *actual* current Entra
+owners of the App Registration, as display names rather than emails for user owners, and never
+gates anything. An earlier version of this system gated on `AppOwners` matching a fixed list of
+emails configured in Key Vault; that filter has been fully replaced by `DevSecOpsOwnership`.
 
 ---
 
