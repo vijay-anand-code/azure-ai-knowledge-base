@@ -223,14 +223,26 @@ Add an action: **Send web request**
   "jira_key":                     "{{issue.key}}",
   "to_status":                    "{{destinationStatus.name}}",
   "today":                        "{{now.jiraDate}}",
-  "team_name":                    "{{issue.customfield_10147}}",
-  "product_name":                 "{{issue.customfield_10148}}",
-  "product_teams_key_vault_name": "{{issue.customfield_10149}}",
+  "team_name":                    "{{issue.customfield_10147.value}}",
+  "product_name":                 "{{issue.customfield_10148.value}}",
+  "product_teams_key_vault_name": "{{issue.customfield_10149.value}}",
   "new_secret_vault_name":        "{{issue.customfield_10150}}",
   "new_secret_key_id":            "{{issue.customfield_10151}}",
-  "new_secret_present":           "{{issue.customfield_10152}}"
+  "new_secret_present":           "{{issue.customfield_10152.value}}"
 }
 ```
+
+<Callout type="warning">
+  **Dropdown fields need `.value`, plain-text fields don't.** `TeamName`, `ProductName`,
+  `ProductTeamsKeyVaultName`, and `NewSecretPresent` are all Jira select-list (dropdown) fields,
+  which the API returns as an object (`{id, value, self}`), not a plain string. Interpolating
+  `{{issue.customfield_10147}}` bare into the JSON body sends that object through empty or
+  malformed, so the SharePoint backfill silently receives nothing even though the ticket's
+  dropdown clearly has a value selected. Appending `.value` pulls out just the text
+  (`{{issue.customfield_10147.value}}`). `NewSecretVaultName` (`customfield_10150`) and
+  `NewSecretKeyId` (`customfield_10151`) are genuine free-text fields and must **not** get
+  `.value`, since they're already plain strings.
+</Callout>
 
 <Callout type="info">
   **No `/tools/` prefix.** This hits `/jira-status-update` on Container 1, not
@@ -359,6 +371,7 @@ Next steps:
 | SharePoint not updating on any transition | Wrong smart value in the request body | Use `{{destinationStatus.name}}`, not `{{issue.status.name}}`, and send all nine fields (`jira_key`, `to_status`, `today`, plus the six custom fields) flat, not nested under an `issue` object |
 | `today` silently missing / whole request never arrives | `{{now.format('yyyy-MM-dd')}}` failing to render in this Jira environment | Use `{{now.jiraDate}}` instead |
 | Backfilled fields (TeamName, ProductName, etc.) never show up in SharePoint | Custom field IDs in the rule body don't match this project's actual field IDs, or the SharePoint column already had a value | Check `customfield_10147`&ndash;`10152` against your project's current field list; they're not portable across Jira projects. Remember the backfill only fills blank columns, it won't overwrite an existing value |
+| Webhook returns 200 and the container logs confirm it processed the row, but TeamName/ProductName/etc. still stay blank | Missing `.value` on a dropdown field's smart value. `{{issue.customfield_10147}}` on a select-list field resolves to nothing usable; the request arrives with an empty string for that field even though the ticket clearly has a value selected | Add `.value`: `{{issue.customfield_10147.value}}`. Applies to TeamName, ProductName, ProductTeamsKeyVaultName, and NewSecretPresent, since those are dropdowns. NewSecretVaultName/NewSecretKeyId are plain text fields and must not get `.value` |
 
 ---
 
