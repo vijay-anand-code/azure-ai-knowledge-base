@@ -244,7 +244,7 @@ Add an action: **Send web request**
 ```json
 {
   "jira_key":                     "{{issue.key}}",
-  "to_status":                    "{{destinationStatus.name}}",
+  "to_status":                    "{{issue.status.name}}",
   "today":                        "{{now.jiraDate}}",
   "team_name":                    "{{issue.customfield_10185.value}}",
   "product_name":                 "{{issue.customfield_10186.value}}",
@@ -280,9 +280,19 @@ Add an action: **Send web request**
   **Smart value gotchas.** Use `{{now.jiraDate}}` for `today`, not
   `{{now.format('yyyy-MM-dd')}}`: the single-quoted-arg form has been observed to fail with
   "Unable to render smart values" in some Jira environments, which silently kills the whole
-  request before it's ever sent. `{{destinationStatus.name}}` is the correct smart value for
-  `to_status`, since the endpoint needs to know which status the ticket is moving to, not simply
-  that it changed.
+  request before it's ever sent.
+</Callout>
+
+<Callout type="warning">
+  **Use `{{issue.status.name}}` for `to_status`, not `{{destinationStatus.name}}`.**
+  `destinationStatus` looks like the more semantically "correct" smart value for a transition
+  trigger, and it's the one Atlassian's own examples typically use, but it does not reliably
+  resolve in this rule's automation builder: it came through as an empty string on every real
+  transition tested, confirmed via raw request logging on the backend, while every `{{issue.*}}`
+  value in the same body (all six custom fields, plus `{{now.jiraDate}}`) resolved correctly
+  every time. Since a rule's actions run *after* its transition has already completed,
+  `{{issue.status.name}}` already reflects the new status by the time this request is built, and
+  it's proven reliable here where `destinationStatus` isn't.
 </Callout>
 
 <Callout type="warning">
@@ -333,7 +343,7 @@ Add a second branch after the web request action above, so a failed sync doesn't
           },
           {
             "type": "TextBlock",
-            "text": "Status was {{webhookResponse.status}} when moving to {{destinationStatus.name}}. Check container logs for jira-status-update.",
+            "text": "Status was {{webhookResponse.status}} when moving to {{issue.status.name}}. Check container logs for jira-status-update.",
             "wrap": true
           }
         ]
@@ -445,7 +455,7 @@ Next steps:
 | HTTP 400 on ticket creation | Jira API token expired, or a P1 to P3 priority name is missing from the project | Regenerate the token, or add the missing priority name to the Jira priority scheme |
 | HTTP 403 on ticket creation | Wrong `JIRA-USER-EMAIL` | Must match the account that owns the API token |
 | Web request returns 404 | Wrong Container App FQDN, or still pointing at the retired `/jira-webhook` path, or at `/tools/jira-status-update` (Container 2's internal-only path) | Verify the FQDN with the `az containerapp show` command above, and confirm the URL is `/jira-status-update` on Container 1, with no `/tools/` prefix |
-| SharePoint not updating on any transition | Wrong smart value in the request body | Use `{{destinationStatus.name}}`, not `{{issue.status.name}}`, and send all nine fields (`jira_key`, `to_status`, `today`, plus the six custom fields) flat, not nested under an `issue` object |
+| SharePoint not updating on any transition, `to_status` logs as an empty string on the backend | `{{destinationStatus.name}}` used for `to_status` instead of `{{issue.status.name}}` | `destinationStatus` doesn't reliably resolve in this automation builder, confirmed via raw request logging. Use `{{issue.status.name}}` instead, and send all nine fields (`jira_key`, `to_status`, `today`, plus the six custom fields) flat, not nested under an `issue` object |
 | `today` silently missing / whole request never arrives | `{{now.format('yyyy-MM-dd')}}` failing to render in this Jira environment | Use `{{now.jiraDate}}` instead |
 | Backfilled fields (TeamName, ProductName, etc.) never show up in SharePoint | Custom field IDs in the rule body don't match this project's actual field IDs, or the SharePoint column already had a value | Check `customfield_10185`&ndash;`10191` against your project's current field list; they're not portable across Jira projects, and they change every time a field is deleted and recreated. Remember the backfill only fills blank columns, it won't overwrite an existing value |
 | Webhook returns 200 and the container logs confirm it processed the row, but TeamName/ProductName/etc. still stay blank | Missing `.value` on a dropdown field's smart value. `{{issue.customfield_10185}}` on a select-list field resolves to nothing usable; the request arrives with an empty string for that field even though the ticket clearly has a value selected | Add `.value`: `{{issue.customfield_10185.value}}`. Applies to TeamName, ProductName, ProductTeamsKeyVaultName, and NewSecretPresent, since those are dropdowns. NewSecretVaultName/NewSecretKeyId are plain text fields and must not get `.value` |
