@@ -29,6 +29,7 @@ run_secret_monitoring(
     get_product_service_principal = ...,   ← ProductName → DevSecOpsOwnership lookup
     fetch_app_owners = ...,                ← live Entra owners → AppOwners column
     backup_list_id = ..., upload_backup_to_storage = ...,  ← pre-run backup rotation
+    move_secret_from_ignored = ...,        ← Feature 2: Ignored → master-list manual restore
 )
       ↓
 decision_engine.py: backs up both SharePoint lists, then orchestrates every phase
@@ -43,13 +44,14 @@ The injection pattern means the engine has no knowledge of HTTP, Key Vault, or A
 | Step | What it does |
 |-------|-------------|
 | Backup rotation (before anything else touches either list) | Snapshots `SecretAlertRegistry` and `IgnoredSecretRegistry` into their own backup lists, archiving whatever was already in each backup list to a Storage Account first if one is configured. Aborts the whole run if a configured Storage upload actually fails. See [Backup rotation](#backup-rotation) below |
+| Feature 2: Ignored → master-list restore loop (right after backup rotation, before `sp_index` is built) | For every `IgnoredSecretRegistry` row whose `AlertStatus` is non-blank and not `"Ignored"`, moves that row back to the master list with `AlertStatus: "Discovered"`. See [Manual Ignore/Restore](#manual-ignorerestore) below |
 | `ProductName` lookup | Resolves `DevSecOpsOwnership` from a Key Vault secret named after each row's `ProductName`, always overwriting whatever was already there |
 | `DevSecOpsOwnership` propagation | Backfills `DevSecOpsOwnership` onto every sibling row for the same app, before filtering |
 | Phase 1: new secrets, Jira | Create Jira tickets in batches of 5, for every bucket except P4/Ignore |
 | Phase 2: new secrets, SharePoint + Teams | Write SharePoint rows and send Teams alerts (P1/P2 only) in batches of 10 |
 | Phase 3: new P4 secrets (61+ days, safe) | Written to SharePoint with `AlertStatus=Discovered`, no alert, no ticket. An earlier version of this phase only logged these to the console with no SharePoint row at all, inconsistent with how an already-existing P4 row was treated, so it was fixed so both paths write the same way |
 | Phase 3a: new Ignore-bucket secrets (-8+ days, brand new to monitoring) | Written straight to `IgnoredSecretRegistry`, never touching the master list at all. Falls back to a plain `Discovered` row in the master list if `create_ignored_row` isn't wired up or the write fails, so the secret is never silently dropped |
-| Phase 4: existing secrets | Escalate or update existing rows based on current bucket vs. recorded status, purely on severity; ownership is not a factor |
+| Phase 4: existing secrets | Escalate or update existing rows based on current bucket vs. recorded status, purely on severity; ownership is not a factor. Also runs Feature 1: a row found with `AlertStatus == "Ignored"` set directly is moved to `IgnoredSecretRegistry` before any of the normal skip/bucket logic runs |
 
 ---
 
@@ -275,6 +277,65 @@ list is skipped entirely (not an abort). The run summary's `masterListBackedUp` 
 
 ---
 
+## Manual Ignore/Restore
+
+A new two-way manual override sits on top of the automatic Ignore machinery already described
+above: a human can move a row into `IgnoredSecretRegistry` or back out of it just by editing
+`AlertStatus`, without going through Jira at all.
+
+**Feature 1 (manual master-list → Ignored trigger).** Inside `_handle_existing_secret()`, right
+after the per-row `result` dict is built and *before* the `MONITOR_SKIP_STATUSES` check, a new
+check looks for `alert_status == "Ignored"`. If found, and `move_secret_to_ignored` was supplied,
+the row is moved to `IgnoredSecretRegistry` with `IgnoreReason: "ManuallySetIgnored - AlertStatus
+set to Ignored directly on master list row"`, and the function returns immediately. This closes a
+real bug: `"Ignored"` is a member of `MONITOR_SKIP_STATUSES`, so before this check existed, a human
+setting `AlertStatus = Ignored` directly on a master-list row did nothing at all, monitoring just
+silently skipped the row forever without ever moving it, since the skip check ran first and never
+looked any further.
+
+**Feature 2 (Ignored → master-list restore loop).** A new block runs early in
+`run_secret_monitoring()`, right after backup rotation and before `sp_index` is built (deliberately
+before the new-vs-existing split, since restored rows should not also be evaluated as "new" in the
+same run). If `move_secret_from_ignored` and `get_ignored_sharepoint_state` were both supplied, it
+reads `IgnoredSecretRegistry`, and for every row whose `AlertStatus` is non-blank and not exactly
+`"Ignored"`, moves that row back to the master list with `AlertStatus: "Discovered"` and an
+`ExpiryNotice` explaining the restore (e.g. `"Restored from IgnoredSecretRegistry - AlertStatus
+manually changed to 'X'"`). A blank `AlertStatus` is deliberately *not* treated as a restore
+signal, it just means the row predates this column, or was correctly stamped `"Ignored"` by one of
+the move-to-Ignored call sites. Restored `SecretID`s are collected into `restored_secret_ids` and
+explicitly filtered out of `new_secrets` right after the real new-vs-existing split further down
+(this file has two near-identical split blocks, a pre-existing duplicate; only the second one's
+output is actually used downstream, and the `restored_secret_ids` filter sits immediately after
+it), so a row Feature 2 just restored doesn't also get treated as "new" and double-processed in the
+same run. `summary["manuallyRestored"]` counts successful restores.
+
+**Feature 3 (consistent `AlertStatus` stamping).** Every code path that moves a row into
+`IgnoredSecretRegistry` now stamps `"AlertStatus": "Ignored"` onto it as part of the move, not just
+whatever fields were already being written: the 8-day-abandonment auto-move inside
+`_handle_existing_secret()`'s `bucket == "Ignore"` branch, `_write_ignore_new()`'s ignored_fields
+(a brand-new secret already 8+ days expired), and (in `main.py`, not this file)
+`/tools/jira-status-update`'s Canceled-ticket branch. This is what makes Feature 2 possible at all:
+Feature 2 relies on `AlertStatus` reliably reading `"Ignored"` on every row that got there
+normally, so any other non-`"Ignored"` value can be trusted as a genuine manual restore signal.
+
+`summary["manuallyIgnored"]` and `summary["manuallyRestored"]` are both new counters, added near
+`movedToIgnored`/`newlyIgnored` in the summary dict initializer. `run_secret_monitoring()`'s
+signature gained a matching `move_secret_from_ignored: Callable[..., Awaitable[dict]] | None =
+None` parameter, next to `get_ignored_sharepoint_state`; `main.py`'s `/tools/run_secret_monitoring`
+now wires it through (see that page's Two-way sync section).
+
+<Callout type="warning">
+  Feature 2 depends on `IgnoredSecretRegistry` having its own `AlertStatus` column (single line of
+  text, same type as the master list's own `AlertStatus` column), a manual SharePoint schema
+  change, not something either container provisions automatically. Without that column, Feature 3's
+  stamping still writes `AlertStatus` fine (SharePoint just drops an unknown field on create,
+  silently), but Feature 2 has no column to read on the reverse pass, so `get_ignored_sharepoint_state()`
+  never sees a non-blank, non-`"Ignored"` value to restore on, and the restore loop is effectively a
+  permanent no-op until the column is added.
+</Callout>
+
+---
+
 ## Key design decisions
 
 | Decision | Reason |
@@ -292,6 +353,9 @@ list is skipped entirely (not an abort). The run summary's `masterListBackedUp` 
 | Lineage tracking via `NewSecretKeyId` | A rotated secret's brand-new row automatically inherits `TeamName`/`ProductName`/`ProductTeamsKeyVaultName` from its parent row, so the team fills these in once per app, not once per rotation cycle |
 | `OverdueManualReview`, distinct from `ExpiredManualReview` | A secret past -8 days with a still-open Jira ticket needs its own status, someone is actively engaged, so it must stay visible and never auto-rotate, but it's a different state from a freshly-expired secret |
 | `IgnoredSecretRegistry.JiraTicketKey` | Stamped whenever the -8-day abandonment check moves an existing row that already had a ticket, so a later reopen of that ticket can find the row again |
+| Feature 1 check runs before `MONITOR_SKIP_STATUSES` | `"Ignored"` is itself a member of `MONITOR_SKIP_STATUSES`; the manual-Ignore trigger has to intercept it first or the skip check swallows it silently, which is exactly the bug this feature fixes |
+| Feature 2 runs before `sp_index` is built | Restored rows are deliberately invisible to this run's own new-vs-existing split, so they're picked up as a normal existing row on the *next* run instead of being partially processed twice in the same one |
+| `AlertStatus: "Ignored"` stamped on every move to `IgnoredSecretRegistry` | Feature 2's restore loop trusts any other value as a genuine manual signal; without this consistent stamping, a row that reached Ignored automatically could look identical to one a human explicitly restored |
 | `sp_index` keyed by `SecretID` alone, never gated by ownership | `SecretID` (Entra's `keyId`) is already a globally unique GUID, no need for a composite key. Indexing every existing row regardless of `DevSecOpsOwnership` fixed a real duplication bug, see the callout below |
 | `LastChecked`/`AlertSentDate`/`RotationDetectedDate`/`JiraTicketCreatedDate`/`ExpirationDate` as EST strings | All five go through `_format_datetime_est()`/`_now_est_string()`, matching `runbook_discovery.py`'s format exactly, instead of a bare UTC date or a raw Entra ISO string |
 
@@ -913,6 +977,7 @@ async def run_secret_monitoring(
     # upload_backup_to_storage skips archival but still rotates the
     # SharePoint-side backup list. See _rotate_backup_list() below.
     get_ignored_sharepoint_state: Callable[[], Awaitable[dict]] | None = None,
+    move_secret_from_ignored:  Callable[..., Awaitable[dict]] | None = None,  # NEW - Feature 2 manual restore trigger
     backup_list_id:            str = "",
     ignored_backup_list_id:    str = "",
     get_list_state:             Callable[[str], Awaitable[dict]] | None = None,
@@ -941,6 +1006,8 @@ async def run_secret_monitoring(
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "newlyIgnored": 0,             # NEW - brand-new secrets already 8+ days expired, written straight to IgnoredSecretRegistry
         "alreadyIgnoredSkipped": 0,    # FIX - secrets already sitting in IgnoredSecretRegistry, correctly recognized and not re-added
+        "manuallyIgnored":  0,   # NEW - rows manually set to AlertStatus=Ignored on the master list, moved to IgnoredSecretRegistry
+        "manuallyRestored": 0,   # NEW - IgnoredSecretRegistry rows manually un-Ignored, moved back to the master list
         "masterListBackedUp": False,   # NEW - SecretAlertRegistry successfully snapshotted before this run touched it
         "ignoredListBackedUp": False,  # NEW - IgnoredSecretRegistry successfully snapshotted before this run touched it
         "errors": [],
@@ -989,6 +1056,68 @@ async def run_secret_monitoring(
                 return summary
     else:
         print("[INFO] Backup rotation: get_list_state/create_list_row/delete_list_row not wired up - skipping backup entirely.")
+
+    # ── NEW - FEATURE 2: Ignored -> master-list restore loop ─────────────────
+    # Runs early - right after backup rotation, before sp_index is built and
+    # before candidates are split into new_secrets/existing_secrets (both
+    # still based on the sp_data snapshot fetched above). A human can change
+    # IgnoredSecretRegistry's AlertStatus column to anything OTHER than
+    # "Ignored" to signal "put this back". Blank/missing AlertStatus is
+    # deliberately NOT treated as a restore signal - it only means the row
+    # predates this column, or is a freshly-Ignored row correctly stamped
+    # "Ignored" by one of the move-to-Ignored call sites (FEATURE 3).
+    #
+    # Restored rows land in SecretAlertRegistry with AlertStatus reset to
+    # "Discovered" so the NEXT run picks them up fresh (correct bucket,
+    # ticket status, etc. - none of Ignored's stale state carries over).
+    # Deliberately does NOT try to fully re-evaluate the row THIS run -
+    # sp_data/sp_index (built below) were already snapshotted before this
+    # loop ran, so a restored row is invisible to this run's new-vs-existing
+    # split. Its SecretID is added to restored_secret_ids and explicitly
+    # excluded from new_secrets after the real split block below, so this
+    # run doesn't ALSO try to create a duplicate "new secret" row for
+    # something this loop just created in the master list.
+    restored_secret_ids: set[str] = set()
+    if move_secret_from_ignored is not None and get_ignored_sharepoint_state is not None:
+        try:
+            ignored_state_for_restore = await get_ignored_sharepoint_state()
+        except Exception as e:
+            summary["errors"].append(f"Could not read IgnoredSecretRegistry for restore check: {e}")
+            ignored_state_for_restore = {"items": []}
+
+        for item in ignored_state_for_restore.get("items", []):
+            f_ignored = item.get("fields", {})
+            ignored_alert_status = (f_ignored.get("AlertStatus") or "").strip()
+            # Blank (pre-existing rows, or the column not added yet) is NOT
+            # a restore signal - only an explicit non-"Ignored" value is.
+            if not ignored_alert_status or ignored_alert_status == "Ignored":
+                continue
+
+            secret_id = f_ignored.get("SecretID", "")
+            master_fields = {
+                "Title":             f_ignored.get("Title", ""),
+                "AppName":           f_ignored.get("AppName", ""),
+                "SecretID":          secret_id,
+                "SecretDescription": f_ignored.get("SecretDescription", ""),
+                "ExpirationDate":    f_ignored.get("ExpirationDate", ""),
+                "AlertStatus":       "Discovered",
+                "ExpiryNotice":      (f"Restored from IgnoredSecretRegistry - AlertStatus manually "
+                                      f"changed to '{ignored_alert_status}'"),
+                "LastChecked":       today,
+                "JiraTicketKey":     f_ignored.get("JiraTicketKey", ""),
+                "TenantID":          f_ignored.get("TenantID", ""),
+            }
+            move_result = await move_secret_from_ignored(
+                item.get("id"), master_fields,
+                f"AlertStatus manually changed to '{ignored_alert_status}' in IgnoredSecretRegistry")
+            if move_result.get("success"):
+                summary["manuallyRestored"] += 1
+                if secret_id:
+                    restored_secret_ids.add(secret_id)
+            else:
+                summary["errors"].append(
+                    f"move_secret_from_ignored (manual restore) failed for SecretID={secret_id}: "
+                    f"{move_result.get('error')}")
 
     # ── ProductName lookup, BEFORE propagation and BEFORE filtering ───────────
     # A row can have ProductName filled in instead of DevSecOpsOwnership being
@@ -1218,14 +1347,20 @@ async def run_secret_monitoring(
     # ── Split into new vs existing ────────────────────────────────────────────
     new_secrets      = []
     existing_secrets = []
- 
+
     for c in candidates:
         existing = sp_index.get(c["secret_id"])  # SecretID alone, already globally unique
         if existing is None:
             new_secrets.append(c)
         else:
             existing_secrets.append((c, existing))
- 
+
+    # NEW - FEATURE 2 cont'd: exclude secrets that were JUST restored above
+    # from new_secrets this run - see the FEATURE 2 comment near the top of
+    # this function for why. Picked up as a normal "existing" row next run.
+    if restored_secret_ids:
+        new_secrets = [c for c in new_secrets if c["secret_id"] not in restored_secret_ids]
+
     # ── Lineage tracking 1 same secret, new version after rotation ───────────
     # When a secret rotates, rotation creates a brand-new Entra secret (new
     # SecretID) and records that new ID in the OLD row's NewSecretKeyId
@@ -1552,6 +1687,7 @@ async def run_secret_monitoring(
                 "TenantID":          c.get("tenant_id", ""),
                 "LoggedDate":        today,
                 "IgnoreReason":      "Expired8Plus",
+                "AlertStatus":       "Ignored",
             }
             if create_ignored_row is not None:
                 try:
@@ -1634,6 +1770,7 @@ async def run_secret_monitoring(
             if res.get("jira_comment"):   summary["jiraComments"]           += 1
             if res.get("teams_sent"):     summary["newTeamsAlerts"]         += 1
             if res.get("moved_to_ignored"): summary["movedToIgnored"]       += 1
+            if res.get("manually_ignored"): summary["manuallyIgnored"]      += 1
  
 
     # NEW - print a per-tenant breakdown at the end of every run, same spirit
@@ -1670,7 +1807,42 @@ async def _handle_existing_secret(
     result       = {"sp_updated": False, "jira_created": False,
                     "jira_comment": False, "teams_sent": False,
                     "moved_to_ignored": False, "error": None}
- 
+
+    # NEW - FEATURE 1: manual master-list -> Ignored trigger. A human can set
+    # AlertStatus="Ignored" directly on a SecretAlertRegistry row (as opposed
+    # to this happening automatically via the -8-day abandonment check
+    # below). Previously this silently no-op'd: "Ignored" is a member of
+    # MONITOR_SKIP_STATUSES, so the check just below unconditionally
+    # returned without ever moving the row - the exact bug this closes.
+    # This check MUST run before the MONITOR_SKIP_STATUSES check. Fires
+    # regardless of bucket/day-count - a human's explicit AlertStatus edit
+    # overrides the normal 8-day-abandonment gating entirely.
+    if alert_status == "Ignored" and move_secret_to_ignored is not None:
+        ignored_fields = {
+            "Title":             c["app_id"],
+            "AppName":           c["app_name"],
+            "SecretID":          c["secret_id"],
+            "SecretDescription": c["secret_desc"],
+            "ExpirationDate":    c["expiration"],
+            "DaysExpired":       abs(c["days"]),
+            "TenantID":          c.get("tenant_id", ""),
+            "LoggedDate":        today,
+            "IgnoreReason":      "ManuallySetIgnored - AlertStatus set to Ignored directly on master list row",
+            "JiraTicketKey":     jira_key,
+            "AlertStatus":       "Ignored",
+        }
+        move_result = await move_secret_to_ignored(
+            item_id, ignored_fields, "AlertStatus manually set to Ignored")
+        if move_result.get("success"):
+            result["moved_to_ignored"]  = True
+            result["manually_ignored"]  = True
+            result["sp_updated"]        = True
+        else:
+            result["error"] = (f"move_secret_to_ignored (manual trigger) failed for "
+                               f"AppID={c['app_id']} SecretID={c['secret_id']}: "
+                               f"{move_result.get('error')}")
+        return result
+
     if alert_status in MONITOR_SKIP_STATUSES:
         # RotatedPendingDeployment and the PAUSED_STATUSES (Blocked,
         # AwaitingReporter) still get their ExpiryNotice/LastChecked
@@ -1844,6 +2016,7 @@ async def _handle_existing_secret(
             # had a ticket to begin with (the "no ticket at all" abandonment
             # case), which is correct, there's nothing to look up for those.
             "JiraTicketKey":     jira_key,
+            "AlertStatus":       "Ignored",
         }
         move_result = await move_secret_to_ignored(item_id, ignored_fields, move_reason)
         if move_result.get("success"):

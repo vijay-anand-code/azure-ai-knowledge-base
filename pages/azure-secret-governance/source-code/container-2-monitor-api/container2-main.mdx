@@ -106,10 +106,10 @@ implemented here:
 
 | Function | Direction | Called from |
 |---|---|---|
-| `move_secret_to_ignored()` | master list → Ignored (create in Ignored, then delete from master) | `decision_engine.py`'s -8-day abandonment check; `/tools/jira-status-update`'s Canceled handling |
+| `move_secret_to_ignored()` | master list → Ignored (create in Ignored, then delete from master) | `decision_engine.py`'s -8-day abandonment check and its Feature 1 manual-Ignore trigger; `/tools/jira-status-update`'s Canceled handling |
 | `create_ignored_row()` | straight into Ignored, no master-list row ever existed | `decision_engine.py`'s Phase 3a (brand-new secret already 8+ days expired) |
-| `move_secret_from_ignored()` | Ignored → master list (create in master, then delete from Ignored) | `/tools/jira-status-update`, when a ticket not found in the master list is found in `IgnoredSecretRegistry` instead, i.e. a Canceled ticket got reopened |
-| `get_ignored_sharepoint_state()` | read-only | both of the above reverse-lookup paths |
+| `move_secret_from_ignored()` | Ignored → master list (create in master, then delete from Ignored) | `/tools/jira-status-update`, when a ticket not found in the master list is found in `IgnoredSecretRegistry` instead (a Canceled ticket got reopened); also now wired into `/tools/run_secret_monitoring`'s call, for `decision_engine.py`'s Feature 2 manual-restore loop |
+| `get_ignored_sharepoint_state()` | read-only | all of the above reverse-lookup and restore paths |
 
 Every move is create-first, delete-second, so a failure partway through leaves a row duplicated
 across both lists (visible, safe to fix by hand) rather than vanishing from both entirely.
@@ -120,6 +120,24 @@ across both lists (visible, safe to fix by hand) rather than vanishing from both
   reopened ticket can be matched back to its row. Rows moved into `IgnoredSecretRegistry` before
   this column existed have no `JiraTicketKey` recorded and cannot be found by this reverse lookup
   even if their ticket is later reopened; only rows ignored from this point forward are covered.
+</Callout>
+
+<Callout type="warning">
+  `move_secret_from_ignored` was already defined here before today but was never actually passed
+  into `run_secret_monitoring()` at `/tools/run_secret_monitoring`'s call site, so
+  `decision_engine.py`'s Feature 2 (Ignored → master-list manual restore loop, see that page) had
+  no way to call it even though the parameter existed on the engine's signature. That wiring gap is
+  now closed; `api_run_monitoring()` passes `move_secret_from_ignored=move_secret_from_ignored`
+  alongside the existing arguments.
+</Callout>
+
+<Callout type="warning">
+  `decision_engine.py`'s Feature 2 (Ignored → master-list restore) reads `AlertStatus` on
+  `IgnoredSecretRegistry` rows to decide whether to restore them. This requires `AlertStatus` to
+  exist as a column on `IgnoredSecretRegistry` itself (single line of text, same type as the
+  master list's own `AlertStatus` column), a manual SharePoint schema change, not something this
+  file provisions. Without it, every move-to-Ignored call site here still stamps `AlertStatus:
+  "Ignored"` on write, but Feature 2's restore check has nothing to read and never fires.
 </Callout>
 
 ---
@@ -153,12 +171,28 @@ page's Backup rotation section for the full sequence).
 ## Jira transition handling
 
 `/tools/jira-status-update` is called once per real transition by a single Jira automation rule.
-The request body carries `jira_key`, `to_status`, `today`, and six custom fields: `team_name`,
-`product_name`, `product_teams_key_vault_name`, `new_secret_vault_name`, `new_secret_key_id`, and
-`new_secret_present`. A seventh field, `devsecops_ownership`, is still accepted on the request
-model for backwards compatibility but is never sent by the current automation rule and never acted
-on, since the old `DevSecOpsOwnership` Jira custom field was removed from Jira entirely; ownership is
-resolved from `ProductName` via Key Vault instead.
+The request body carries `jira_key`, `to_status`, `today`, and seven custom fields: `team_name`,
+`product_name`, `product_teams_key_vault_name`, `new_secret_vault_name`, `new_secret_key_id`,
+`new_secret_present`, and `new_secret_updated_reference_inventory`. An eighth field,
+`devsecops_ownership`, is still accepted on the request model for backwards compatibility but is
+never sent by the current automation rule and never acted on, since the old `DevSecOpsOwnership`
+Jira custom field was removed from Jira entirely; ownership is resolved from `ProductName` via Key
+Vault instead.
+
+`new_secret_updated_reference_inventory` is a comments field paired with Jira's
+`NewSecretUpdatedReferenceInventoryPresent` Yes/No gate (`customfield_10225`), the same pattern
+`new_secret_present` follows against its own gate: the gate itself stays Jira-only and is never
+sent to this endpoint, only the underlying value syncs, here into SharePoint's
+`NewSecretUpdatedReferenceInventory` column.
+
+A separate `overwrite` boolean on the request body, set by a distinct "field value changed" Jira
+automation rule (not the status-transition rule this section otherwise describes), makes
+`TeamName`/`ProductName`/`ProductTeamsKeyVaultName`/`NewSecretVaultName`/`NewSecretKeyId`/
+`NewSecretUpdatedReferenceInventory` overwrite the SharePoint column unconditionally whenever Jira
+carries a non-empty value, rather than only filling a blank column the way the normal transition
+backfill does. This fires for any non-Resolved status, on the theory that an engineer correcting a
+field after the fact should see that correction take effect immediately; the Resolved case is
+re-checked server-side too, defensively.
 
 Full setup instructions, the exact custom field IDs, and the real-vs-defensive status breakdown
 live on the [Jira Automation](/azure-secret-governance/jira) page. In brief, this endpoint:
@@ -168,17 +202,30 @@ live on the [Jira Automation](/azure-secret-governance/jira) page. In brief, thi
 - Also recognizes Done, Canceled/Cancelled, Blocked, and "Awaiting Reporter: Needs more
   information" defensively, in case this endpoint ever serves a different Jira project with a
   fuller workflow. Canceled specifically triggers a physical move to `IgnoredSecretRegistry`
-  rather than an in-place status change.
-- Backfills `TeamName`, `ProductName`, `ProductTeamsKeyVaultName`, `NewSecretVaultName`, and
-  `NewSecretKeyId` onto the matching row on both the In Progress and Resolved transitions, but
-  only into columns that are still blank, never overwriting a value already set directly in
-  SharePoint.
+  rather than an in-place status change, and stamps `AlertStatus: "Ignored"` onto the row as part
+  of that move, matching the same stamp every other move-to-Ignored call site in this system now
+  applies.
+- Backfills `TeamName`, `ProductName`, `ProductTeamsKeyVaultName`, `NewSecretVaultName`,
+  `NewSecretKeyId`, and `NewSecretUpdatedReferenceInventory` onto the matching row on both the In
+  Progress and Resolved transitions, but only into columns that are still blank, never overwriting
+  a value already set directly in SharePoint (unless `overwrite` is set, see above).
 - Posts an acknowledgment comment on the ticket immediately at the In Progress transition if the
   engineer marked `new_secret_present` as `"No"`, rather than leaving them with no confirmation
   until the rotation runbook actually runs, which could be much later.
 - If the ticket isn't found in the master list and the transition isn't Canceled, checks
   `IgnoredSecretRegistry` too, and moves any match back to the master list, covering a
   previously-Canceled ticket that's been reopened.
+
+<Callout type="warning">
+  The Jira automation rule body previously read `new_secret_present` from
+  `{{issue.customfield_10187.value}}`, which is actually `NewSecretKeyIDPresent`, a different
+  Yes/No gate than the one this field is meant to answer. It has been fixed to read
+  `{{issue.customfield_10191.value}}`, the real `NewSecretPresent` field, and the automation rule
+  body now also carries `new_secret_updated_reference_inventory` from `customfield_10224`. As
+  always, these customfield IDs are only valid until a field is deleted and recreated in Jira
+  (Jira never reuses a `customfield_NNNNN` number); check them against the project's current field
+  list before trusting this callout on a later date.
+</Callout>
 
 ---
 
@@ -928,10 +975,9 @@ async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_
     if JIRA_EPIC_KEY and JIRA_EPIC_KEY != "CSD-123": payload["fields"]["parent"] = {"key": JIRA_EPIC_KEY}
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{JIRA_BASE_URL}/rest/api/2/issue", headers={"Authorization": _jira_auth(), "Content-Type": "application/json"}, content=json.dumps(payload), timeout=20)
+        if not r.is_success:
+            log.error("create_jira_ticket failed [%s] for app_id=%s: %s", r.status_code, app_id, r.text[:500])
         r.raise_for_status()
-        # if not r.is_success:
-        #     log.error("create_jira_ticket failed [%s]: %s", r.status_code, r.text[:500])
-        #     r.raise_for_status()
         return {"issue_key": r.json()["key"]}
  
 async def get_jira_issue(issue_key: str) -> dict:
@@ -1061,6 +1107,7 @@ async def api_run_monitoring():
         add_jira_comment              = add_jira_comment,
         send_teams_alert              = send_teams_alert,
         move_secret_to_ignored        = move_secret_to_ignored,
+        move_secret_from_ignored      = move_secret_from_ignored,  # NEW — Feature 2: Ignored -> master restore trigger
         create_ignored_row            = create_ignored_row,  # NEW — brand-new secret already 8+ days expired, straight to IgnoredSecretRegistry
         get_product_service_principal = get_product_service_principal,  # NEW — ProductName -> ManualAppOwners lookup
         fetch_app_owners              = fetch_app_owners,   # NEW — wires up real AppOwners population from Entra (was previously dead)
@@ -1112,7 +1159,8 @@ class JiraStatusUpdateReq(BaseModel):
     # Populated from the Jira issue's custom fields (see automation rule body
     # below). Backfilled into the matching SharePoint row on In Progress AND
     # Resolved (a "second check" at Resolve), only when that row's own
-    # column is empty — never overwrites an existing value.
+    # column is empty — never overwrites an existing value. Unless
+    # overwrite=True, see below.
     team_name:           Optional[str] = None
     product_name:        Optional[str] = None
     devsecops_ownership: Optional[str] = None  # DEPRECATED — DevSecOpsOwnership was
@@ -1126,6 +1174,21 @@ class JiraStatusUpdateReq(BaseModel):
     new_secret_vault_name:        Optional[str] = None
     new_secret_key_id:            Optional[str] = None
     new_secret_present:           Optional[str] = None  # "Yes"/"No" from Jira's NewSecretPresent field
+    # NEW — comments field paired with Jira's NewSecretUpdatedReferenceInventoryPresent
+    # Yes/No gate (Jira-only, not sent here — same pattern as new_secret_present
+    # above). Syncs to SharePoint's NewSecretUpdatedReferenceInventory column only.
+    new_secret_updated_reference_inventory: Optional[str] = None
+    # NEW — set True by a separate "field value changed" Jira automation rule
+    # (not the status-transition rule above), fired when an engineer edits
+    # TeamName/ProductName/ProductTeamsKeyVaultName/NewSecretVaultName/
+    # NewSecretKeyId directly, with no status transition involved. Unlike the
+    # status-transition path, this OVERWRITES the SharePoint column
+    # unconditionally rather than only filling blanks — explicit client
+    # requirement: an engineer correcting a field after the fact should see
+    # that correction actually take effect. The Jira-side rule's own
+    # condition already restricts this to non-Resolved tickets; status is
+    # re-checked server-side too, defensively, before honoring this flag.
+    overwrite: bool = False
 
 @app.post("/tools/jira-status-update")
 async def api_jira_status_update(req: JiraStatusUpdateReq):
@@ -1173,7 +1236,8 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                    "product_teams_key_vault_name": "{{issue.customfield_10190.value}}",
                    "new_secret_vault_name":        "{{issue.customfield_10189}}",
                    "new_secret_key_id":            "{{issue.customfield_10188}}",
-                   "new_secret_present":           "{{issue.customfield_10187.value}}"
+                   "new_secret_present":           "{{issue.customfield_10191.value}}",
+                   "new_secret_updated_reference_inventory": "{{issue.customfield_10224}}"
                  }
         NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
         to fail with "Unable to render smart values" in some Jira
@@ -1208,10 +1272,25 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         the field arrives empty even though the ticket has one selected.
         NewSecretVaultName/NewSecretKeyId are plain free-text fields and
         must NOT get ".value" - they're already a string.
-        NOTE: there is also a customfield_10191 (NewSecretVaultPresent) on
-        this issue type now - a Jira-only Yes/No gate deciding whether
-        NewSecretVaultName is required, enforced entirely by Jira Automation
-        rules, not sent in this body since the backend has no use for it.
+        NOTE: there is also a customfield_10187 (NewSecretKeyIDPresent) and
+        customfield_10191 (NewSecretPresent) on this issue type - Jira-only
+        Yes/No gates deciding whether NewSecretKeyId/NewSecretVaultName are
+        required, enforced entirely by Jira Automation rules. NewSecretPresent
+        (10191) IS sent above as "new_secret_present" (used for the intake
+        acknowledgment comment below - it answers "is a new secret already
+        present in the vault", not "is a key ID present", so it must read
+        10191, not 10187 - a stale-ID bug caught and fixed here after the
+        NewSecretKeyIDPresent/NewSecretPresent field split).
+        NewSecretKeyIDPresent (10187) is not sent since the backend has no
+        use for it.
+        NOTE: customfield_10224 (NewSecretUpdatedReferenceInventory, a
+        paragraph/free-text field) and customfield_10225
+        (NewSecretUpdatedReferenceInventoryPresent, its Yes/No gate) were
+        added later. Only 10224 is sent here - same pattern as
+        NewSecretPresent/NewSecretVaultName: the gate stays Jira-only, only
+        the actual value syncs to SharePoint (into a column of the same
+        name, NewSecretUpdatedReferenceInventory - comments only, no
+        "Present" column exists in SharePoint by design).
 
     SharePoint AlertStatus mapping:
       Done                                        -> Rotated
@@ -1247,6 +1326,16 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     reverse lookup even if their ticket is later reopened - only rows
     ignored from this point forward are covered.
     """
+    log.info(
+        "jira-status-update: RAW request received: jira_key=%r to_status=%r today=%r "
+        "team_name=%r product_name=%r product_teams_key_vault_name=%r "
+        "new_secret_vault_name=%r new_secret_key_id=%r new_secret_present=%r "
+        "new_secret_updated_reference_inventory=%r",
+        req.jira_key, req.to_status, req.today, req.team_name, req.product_name,
+        req.product_teams_key_vault_name, req.new_secret_vault_name,
+        req.new_secret_key_id, req.new_secret_present,
+        req.new_secret_updated_reference_inventory,
+    )
     today  = req.today
     status = req.to_status.strip().lower()
 
@@ -1343,6 +1432,7 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     "LoggedDate":        today,
                     "IgnoreReason":      f"Jira ticket {req.jira_key} canceled",
                     "JiraTicketKey":     req.jira_key,
+                    "AlertStatus":       "Ignored",
                 }
                 move_result = await move_secret_to_ignored(
                     item["id"], ignored_fields, f"Jira ticket {req.jira_key} canceled")
@@ -1358,7 +1448,39 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     "LastChecked":  today,
                     **extra_fields,
                 }
-                if status in DONE_STATUSES or status in REOPEN_STATUSES:
+                if req.overwrite and status not in DONE_STATUSES:
+                    # NEW - explicit field-edit sync, fired by a separate
+                    # "field value changed" Jira automation rule rather than
+                    # the status-transition rule. Unlike the fill-blanks
+                    # backfill below, this OVERWRITES the SharePoint column
+                    # unconditionally whenever Jira carries a non-empty
+                    # value for it - an engineer correcting a field after
+                    # the fact must see that correction actually take
+                    # effect. Deliberately allowed for ANY non-Resolved
+                    # status (To Do, In Progress, Waiting for Customer), not
+                    # just In Progress - the Jira-side rule's own condition
+                    # already restricts this to non-Resolved tickets, and
+                    # "status not in DONE_STATUSES" re-checks that here too,
+                    # defensively, in case that condition is ever removed or
+                    # misconfigured on the Jira side.
+                    #
+                    # This can overwrite a value rotation itself already
+                    # wrote (NewSecretVaultName/NewSecretKeyId) - by explicit
+                    # client instruction, engineers are expected to make all
+                    # corrections before rotation runs, not after.
+                    if req.team_name:
+                        fields["TeamName"] = req.team_name
+                    if req.product_name:
+                        fields["ProductName"] = req.product_name
+                    if req.product_teams_key_vault_name:
+                        fields["ProductTeamsKeyVaultName"] = req.product_teams_key_vault_name
+                    if req.new_secret_vault_name:
+                        fields["NewSecretVaultName"] = req.new_secret_vault_name
+                    if req.new_secret_key_id:
+                        fields["NewSecretKeyId"] = req.new_secret_key_id
+                    if req.new_secret_updated_reference_inventory:
+                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
+                elif status in DONE_STATUSES or status in REOPEN_STATUSES:
                     # Backfill only — never overwrites a value someone already
                     # set in SharePoint. Fires on BOTH In Progress and
                     # Resolved now (Resolved acts as a "second check" per
@@ -1379,6 +1501,8 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
                     if not f.get("NewSecretKeyId") and req.new_secret_key_id:
                         fields["NewSecretKeyId"] = req.new_secret_key_id
+                    if not f.get("NewSecretUpdatedReferenceInventory") and req.new_secret_updated_reference_inventory:
+                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
                     # NOTE: new_secret_present is deliberately NOT written to
                     # SharePoint - there's no column for it. It only exists
                     # to trigger the "scheduled for autorotation" Jira
@@ -1455,6 +1579,4 @@ async def api_update_on_jira_reopen(req: JiraReopenReq):
     )
  
 log.info("REST API Server ready — GET /health | POST /tools/*")
- 
- 
 ```
