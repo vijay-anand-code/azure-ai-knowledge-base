@@ -120,16 +120,21 @@ Update every master-list row whose JiraTicketKey matches jira_key
 ### Field backfill on In Progress and Resolved
 
 On the In Progress and Resolved transitions, the endpoint backfills `TeamName`, `ProductName`,
-`ProductTeamsKeyVaultName`, `NewSecretVaultName`, and `NewSecretKeyId` from the Jira custom
-fields onto the matching SharePoint row, but only for columns that are still empty; it never
-overwrites a value someone already set directly in SharePoint. It fires at both transitions
-rather than only In Progress, per an explicit client requirement: a field cleared out after In
-Progress would otherwise never get re-synced before the ticket closes.
+`ProductTeamsKeyVaultName`, `NewSecretVaultName`, `NewSecretKeyId`, and
+`NewSecretUpdatedReferenceInventory` from the Jira custom fields onto the matching SharePoint
+row, but only for columns that are still empty; it never overwrites a value someone already set
+directly in SharePoint through this path (a separate rule can force an overwrite, see
+[Keeping field edits in sync](#keeping-field-edits-in-sync-after-in-progress) below). It fires at
+both transitions rather than only In Progress, per an explicit client requirement: a field
+cleared out after In Progress would otherwise never get re-synced before the ticket closes.
 
-`NewSecretPresent` itself is never written to SharePoint, since there's no column for it. It
-exists only to trigger the acknowledgment comment below. The rotation runbook infers the same
-Yes/No distinction later by checking whether `NewSecretKeyId` is already non-empty, so a separate
-column was never needed.
+`NewSecretPresent` and `NewSecretUpdatedReferenceInventoryPresent` are never written to
+SharePoint themselves, since there's no column for either. They exist only to trigger the
+acknowledgment comment below (`NewSecretPresent`) and to gate whether
+`NewSecretUpdatedReferenceInventory` is required (see the workflow gate below). The rotation
+runbook infers the same present/not-present distinction for the secret itself later by checking
+whether `NewSecretKeyId` is already non-empty, so a separate SharePoint column was never needed
+for that one.
 
 <Callout type="info">
   **`NewSecretPresent = No` gets an immediate acknowledgment.** If an engineer marks it at the In
@@ -145,41 +150,106 @@ The custom fields sent in the web request body only carry real data if Jira actu
 engineer to fill them in before the ticket can move. Application code never enforces this: the
 endpoint only reads whatever Jira sends it. Enforcement is entirely on the Jira side, via a
 combination of a field-required validator and, since KAN is a **team-managed** project (which
-has no native "required only if another field equals X" validator), two automation rules doing
-conditional validation reactively.
+has no native "required only if another field equals X" validator), one automation rule
+("Validate intake fields on In Progress") doing conditional validation reactively across five
+separate checks.
 
-**On the To Do &rarr; In Progress transition, required unconditionally:**
+**On the To Do &rarr; In Progress transition, required unconditionally** (checked by the rule's
+first block, which bounces the ticket back to To Do if *any* of these is still blank):
 
-- `TeamName` (customfield_10185) and `ProductName` (customfield_10186) must be set before the
-  ticket can leave To Do. Without this, the backfill has nothing to write and the row's
-  `TeamName`/`ProductName` stay blank indefinitely.
-- `NewSecretPresent` (customfield_10187) must be answered, and `NewSecretVaultPresent`
-  (customfield_10191) must be answered. Both are `Yes`/`No` dropdowns; a value of `No` on either
-  is a complete, valid answer on its own.
+- `TeamName` (customfield_10185) and `ProductName` (customfield_10186) must be set. Without this,
+  the backfill has nothing to write and the row's `TeamName`/`ProductName` stay blank
+  indefinitely.
+- `ProductTeamsKeyVaultName` (customfield_10190) must be set.
+- `NewSecretKeyIDPresent` (customfield_10187), `NewSecretPresent` (customfield_10191), and
+  `NewSecretUpdatedReferenceInventoryPresent` (customfield_10225) must each be answered. All
+  three are `Yes`/`No` dropdowns; a value of `No` on any of them is a complete, valid answer on
+  its own.
 
-**Conditionally required, enforced by two separate automation rules** (since a plain field-required
-validator can't express "only if another field is Yes" in a team-managed project):
+<Callout type="warning">
+  **`NewSecretKeyIDPresent` and `NewSecretPresent` are two independent Yes/No questions, not the
+  same field under two names.** `NewSecretKeyIDPresent` (customfield_10187) asks "do you already
+  know the new secret's Entra `keyId`?" and gates `NewSecretKeyId`. `NewSecretPresent`
+  (customfield_10191) asks "has a replacement secret already been generated and stored in Key
+  Vault under a known name?" and gates `NewSecretVaultName`/`NewSecretName` (the field is called
+  `NewSecretName` in Jira's own field picker; see the naming note in the request body section
+  below). An engineer can legitimately know one without the other yet.
+</Callout>
 
-1. If `NewSecretPresent` (customfield_10187) is `Yes`, then `NewSecretKeyId` (customfield_10188)
-   must be non-blank **and** match the Entra client secret ID format (a GUID:
-   `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`), not an
+**Conditionally required, enforced by the remaining four blocks of that same rule** (since a
+plain field-required validator can't express "only if another field is Yes" in a team-managed
+project):
+
+1. If `NewSecretKeyIDPresent` (customfield_10187) is `Yes`, then `NewSecretKeyId`
+   (customfield_10188) must be non-blank **and** match the Entra client secret ID format (a
+   GUID: `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`), not an
    arbitrary string.
-2. If `NewSecretVaultPresent` (customfield_10191) is `Yes`, then `NewSecretVaultName`
-   (customfield_10189) must be non-blank.
+2. If `NewSecretPresent` (customfield_10191) is `Yes`, then `NewSecretName`
+   (customfield_10189, the SharePoint-side name `NewSecretVaultName`) must be non-blank.
+3. If `NewSecretUpdatedReferenceInventoryPresent` (customfield_10225) is `Yes`, then
+   `NewSecretUpdatedReferenceInventory` (customfield_10224) must be non-blank.
 
-These two are intentionally independent: an engineer can know the target vault before the secret
-itself exists (`NewSecretVaultPresent = Yes`, `NewSecretPresent = No`), or vice versa.
+These are intentionally independent: an engineer can know the target vault name before the
+secret itself exists (`NewSecretPresent = Yes` before `NewSecretKeyIDPresent`), or vice versa.
 
 <Callout type="warning">
   Team-managed projects can't block a save the way a true field validator does in a
-  company-managed project. These two rules are reactive: they trigger on field value changed,
-  check the condition, and if it fails, revert the ticket's status and add an explanatory
-  comment, rather than preventing the invalid save from happening in the first place.
+  company-managed project. This rule is reactive: it triggers on the To Do &rarr; In Progress
+  transition, checks all five conditions, and for any that fail, bounces the ticket's status back
+  to To Do and adds an explanatory private comment, rather than preventing the invalid save from
+  happening in the first place.
+</Callout>
+
+<Callout type="warning">
+  **Jira-side validation alone does not stop a bad value from reaching SharePoint.** The GUID
+  check above only gates this rule's own action (reverting the ticket's status). It has no
+  authority over the separate rule that syncs fields to SharePoint (see
+  [Keeping field edits in sync](#keeping-field-edits-in-sync-after-in-progress) below) — that
+  rule fires independently off the same transition and will push whatever is in `NewSecretKeyId`
+  regardless of whether Jira's validator caught it. This was found as a live bug: a garbage
+  `NewSecretKeyId` value, correctly flagged by this validator, still landed in SharePoint. Fixed
+  by adding the same GUID check server-side in Container 2's `/tools/jira-status-update` handler
+  (see that page's Key design decisions table) — Jira-side validation is now a UX nicety that
+  gives fast feedback, not the only thing standing between a typo and SharePoint.
 </Callout>
 
 Without all of this in place, tickets can sit in In Progress with any of these fields blank or
 malformed, and the backfill simply has nothing valid to copy: it's a silent no-op per field, not
 an error.
+
+### Keeping field edits in sync after In Progress
+
+A second automation rule, **"Sync field edits after In Progress"**, handles what happens when an
+engineer edits `TeamName`, `ProductName`, `ProductTeamsKeyVaultName`, `NewSecretKeyId`,
+`NewSecretUpdatedReferenceInventory`, `NewSecretName`, `NewSecretUpdatedReferenceInventoryPresent`,
+`NewSecretPresent`, or `NewSecretKeyIDPresent` directly, without necessarily changing the
+ticket's status. It branches on the ticket's current status:
+
+- **If the ticket is Resolved:** editing any of those fields reverts it back to its pre-edit
+  value and posts a private comment ("This field is locked while the ticket is Resolved. Move
+  the status to In Progress or To Do to make changes."), so a correction after rotation has
+  already run doesn't silently diverge from what SharePoint has on record.
+- **If the ticket is anything else** (To Do, In Progress, Waiting for Customer): the rule sends
+  the same web request described above, but with `"overwrite": true` set in the body. This makes
+  Container 2 write the field unconditionally, even over a value already set in SharePoint,
+  rather than only filling a blank column — an explicit client requirement, since an engineer
+  correcting a field after the fact needs to see that correction actually take effect.
+
+<Callout type="info">
+  This rule is what the `overwrite` field on `/tools/jira-status-update`'s request model exists
+  for. See that endpoint's own page (Container 2's `main.py`) for the exact field-by-field
+  overwrite logic.
+</Callout>
+
+<Callout type="warning">
+  When building this rule's Resolved-branch blocks, reference each field's changelog entry by its
+  **current** Jira field name, not by the SharePoint column name it happens to map to. The field
+  backing `NewSecretVaultName` in SharePoint is named `NewSecretName` in Jira itself — a block
+  that accidentally references `{{changelog.NewSecretVaultName...}}` instead of
+  `{{changelog.NewSecretName...}}` will silently never fire, since Jira has no field by that name.
+  This exact mismatch was found and fixed in the live rule; double-check field names against
+  Project Settings &rarr; Fields if a block seems to do nothing.
+</Callout>
 
 ---
 
@@ -251,7 +321,8 @@ Add an action: **Send web request**
   "product_teams_key_vault_name": "{{issue.customfield_10190.value}}",
   "new_secret_vault_name":        "{{issue.customfield_10189}}",
   "new_secret_key_id":            "{{issue.customfield_10188}}",
-  "new_secret_present":           "{{issue.customfield_10187.value}}"
+  "new_secret_present":           "{{issue.customfield_10191.value}}",
+  "new_secret_updated_reference_inventory": "{{issue.customfield_10224}}"
 }
 ```
 
@@ -262,11 +333,13 @@ Add an action: **Send web request**
   `{{issue.customfield_10185}}` bare into the JSON body sends that object through empty or
   malformed, so the SharePoint backfill silently receives nothing even though the ticket's
   dropdown clearly has a value selected. Appending `.value` pulls out just the text
-  (`{{issue.customfield_10185.value}}`). `NewSecretVaultName` (`customfield_10189`) and
-  `NewSecretKeyId` (`customfield_10188`) are genuine free-text fields and must **not** get
-  `.value`, since they're already plain strings. `NewSecretVaultPresent` (`customfield_10191`) is
-  a dropdown too, but it's a Jira-only validation gate: it's never sent in this body at all, since
-  the backend has no use for it.
+  (`{{issue.customfield_10185.value}}`). `NewSecretName` (`customfield_10189`, the field this
+  syncs into SharePoint's `NewSecretVaultName` column) and `NewSecretKeyId` (`customfield_10188`)
+  are genuine free-text fields and must **not** get `.value`, since they're already plain strings
+  — same for `NewSecretUpdatedReferenceInventory` (`customfield_10224`), a paragraph field.
+  `NewSecretKeyIDPresent` (`customfield_10187`) and `NewSecretUpdatedReferenceInventoryPresent`
+  (`customfield_10225`) are dropdowns too, but both are Jira-only validation gates: neither is
+  ever sent in this body, since the backend has no use for them.
 </Callout>
 
 <Callout type="info">
@@ -289,7 +362,7 @@ Add an action: **Send web request**
   trigger, and it's the one Atlassian's own examples typically use, but it does not reliably
   resolve in this rule's automation builder: it came through as an empty string on every real
   transition tested, confirmed via raw request logging on the backend, while every `{{issue.*}}`
-  value in the same body (all six custom fields, plus `{{now.jiraDate}}`) resolved correctly
+  value in the same body (all seven custom fields, plus `{{now.jiraDate}}`) resolved correctly
   every time. Since a rule's actions run *after* its transition has already completed,
   `{{issue.status.name}}` already reflects the new status by the time this request is built, and
   it's proven reliable here where `destinationStatus` isn't.
@@ -297,20 +370,33 @@ Add an action: **Send web request**
 
 <Callout type="warning">
   **Field IDs are project-specific, and they change every time a field is recreated.**
-  `customfield_10185`&ndash;`customfield_10191` are this KAN project's *current* field IDs
-  (TeamName / ProductName / NewSecretPresent / NewSecretKeyId / NewSecretVaultName /
-  ProductTeamsKeyVaultName / NewSecretVaultPresent). These fields were fully deleted and
-  recreated at least once during setup, and every recreation assigns brand-new IDs: Jira never
-  reuses an old `customfield_NNNNN` number. Don't reuse IDs from an older version of this rule,
-  an older screenshot, or an older doc revision without checking them against your project's
-  *current* field list (Project Settings, Fields, or by inspecting a real ticket via the API).
-  There used to be a field for DevSecOpsOwnership (`customfield_10112` in an earlier iteration);
-  it has been removed from Jira entirely and must **not** be sent; ownership is resolved from
-  `ProductName` via Key Vault instead (see the
-  [Ownership model](/azure-secret-governance#ownership-model) section). All six fields in the
-  body are sent on every transition, including ones where they're irrelevant, which is harmless,
-  since the endpoint only reads them on In Progress and Resolved. `NewSecretVaultPresent` is
-  never sent; it's a Jira-only validation gate, see the workflow gate section above.
+  `customfield_10185`&ndash;`customfield_10191`, plus `10224`&ndash;`10225` for the two newer
+  fields, are this KAN project's *current* field IDs:
+
+  | Field ID | Jira field name | Type |
+  |----------|-----------------|------|
+  | `customfield_10185` | TeamName | dropdown |
+  | `customfield_10186` | ProductName | dropdown |
+  | `customfield_10187` | NewSecretKeyIDPresent | dropdown, Jira-only gate |
+  | `customfield_10188` | NewSecretKeyId | free text |
+  | `customfield_10189` | NewSecretName (syncs to SharePoint's `NewSecretVaultName`) | free text |
+  | `customfield_10190` | ProductTeamsKeyVaultName | dropdown |
+  | `customfield_10191` | NewSecretPresent | dropdown |
+  | `customfield_10224` | NewSecretUpdatedReferenceInventory | paragraph/free text |
+  | `customfield_10225` | NewSecretUpdatedReferenceInventoryPresent | dropdown, Jira-only gate |
+
+  These fields were fully deleted and recreated at least once during setup, and every recreation
+  assigns brand-new IDs: Jira never reuses an old `customfield_NNNNN` number. Don't reuse IDs from
+  an older version of this rule, an older screenshot, or an older doc revision without checking
+  them against your project's *current* field list (Project Settings, Fields, or by inspecting a
+  real ticket via the API). There used to be a field for DevSecOpsOwnership (`customfield_10112`
+  in an earlier iteration); it has been removed from Jira entirely and must **not** be sent;
+  ownership is resolved from `ProductName` via Key Vault instead (see the
+  [Ownership model](/azure-secret-governance#ownership-model) section). All seven custom fields
+  in the body are sent on every transition, including ones where they're irrelevant, which is
+  harmless, since the endpoint only reads them on In Progress and Resolved. `NewSecretKeyIDPresent`
+  and `NewSecretUpdatedReferenceInventoryPresent` are never sent; both are Jira-only validation
+  gates, see the workflow gate section above.
 </Callout>
 
 ### Alert Teams if the web request fails
@@ -319,7 +405,7 @@ Add a second branch after the web request action above, so a failed sync doesn't
 
 | Field | Value |
 |-------|-------|
-| **Condition** | `{{webhookResponse.status}}` does not equal `200` |
+| **Condition** | `{{webResponse.status}}` does not equal `200` |
 | **Action** | Send web request |
 | **URL** | your `TEAMS-WEBHOOK-URL` Key Vault secret value |
 | **HTTP method** | POST |
@@ -343,7 +429,7 @@ Add a second branch after the web request action above, so a failed sync doesn't
           },
           {
             "type": "TextBlock",
-            "text": "Status was {{webhookResponse.status}} when moving to {{issue.status.name}}. Check container logs for jira-status-update.",
+            "text": "Status was {{webResponse.status}} when moving to {{issue.status.name}}. Check container logs for jira-status-update.",
             "wrap": true
           }
         ]
@@ -352,6 +438,16 @@ Add a second branch after the web request action above, so a failed sync doesn't
   ]
 }
 ```
+
+<Callout type="warning">
+  **Use `{{webResponse.status}}` consistently, in both the condition and the alert text.** The
+  live rule this system currently runs uses `{{webResponse.status}}` (no "hook") in its
+  condition, which is what actually gates whether the alert fires, but its alert text was built
+  with `{{webhookResponse.status}}` instead — a different smart value name. The condition still
+  works, but that specific portion of the alert text likely renders blank rather than the real
+  status code, since Jira has no smart value by that exact name. Use `{{webResponse.status}}`
+  everywhere in this action to avoid reproducing that mismatch.
+</Callout>
 
 <Callout type="info">
   This body matches the same Adaptive Card shape `send_teams_alert()` already posts with, so it
@@ -455,11 +551,11 @@ Next steps:
 | HTTP 400 on ticket creation | Jira API token expired, or a P1 to P3 priority name is missing from the project | Regenerate the token, or add the missing priority name to the Jira priority scheme |
 | HTTP 403 on ticket creation | Wrong `JIRA-USER-EMAIL` | Must match the account that owns the API token |
 | Web request returns 404 | Wrong Container App FQDN, or still pointing at the retired `/jira-webhook` path, or at `/tools/jira-status-update` (Container 2's internal-only path) | Verify the FQDN with the `az containerapp show` command above, and confirm the URL is `/jira-status-update` on Container 1, with no `/tools/` prefix |
-| SharePoint not updating on any transition, `to_status` logs as an empty string on the backend | `{{destinationStatus.name}}` used for `to_status` instead of `{{issue.status.name}}` | `destinationStatus` doesn't reliably resolve in this automation builder, confirmed via raw request logging. Use `{{issue.status.name}}` instead, and send all nine fields (`jira_key`, `to_status`, `today`, plus the six custom fields) flat, not nested under an `issue` object |
+| SharePoint not updating on any transition, `to_status` logs as an empty string on the backend | `{{destinationStatus.name}}` used for `to_status` instead of `{{issue.status.name}}` | `destinationStatus` doesn't reliably resolve in this automation builder, confirmed via raw request logging. Use `{{issue.status.name}}` instead, and send all ten fields (`jira_key`, `to_status`, `today`, plus the seven custom fields) flat, not nested under an `issue` object |
 | `today` silently missing / whole request never arrives | `{{now.format('yyyy-MM-dd')}}` failing to render in this Jira environment | Use `{{now.jiraDate}}` instead |
-| Backfilled fields (TeamName, ProductName, etc.) never show up in SharePoint | Custom field IDs in the rule body don't match this project's actual field IDs, or the SharePoint column already had a value | Check `customfield_10185`&ndash;`10191` against your project's current field list; they're not portable across Jira projects, and they change every time a field is deleted and recreated. Remember the backfill only fills blank columns, it won't overwrite an existing value |
-| Webhook returns 200 and the container logs confirm it processed the row, but TeamName/ProductName/etc. still stay blank | Missing `.value` on a dropdown field's smart value. `{{issue.customfield_10185}}` on a select-list field resolves to nothing usable; the request arrives with an empty string for that field even though the ticket clearly has a value selected | Add `.value`: `{{issue.customfield_10185.value}}`. Applies to TeamName, ProductName, ProductTeamsKeyVaultName, and NewSecretPresent, since those are dropdowns. NewSecretVaultName/NewSecretKeyId are plain text fields and must not get `.value` |
-| `NewSecretKeyId` accepted with an obviously wrong value like `1234` | The conditional format-validation rule (`NewSecretPresent = Yes` &rarr; `NewSecretKeyId` must match the GUID pattern) isn't set up yet, or its regex condition is misconfigured | Add the rule described in the To Do &rarr; In Progress workflow gate section above, matching against `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$` |
+| Backfilled fields (TeamName, ProductName, etc.) never show up in SharePoint | Custom field IDs in the rule body don't match this project's actual field IDs, or the SharePoint column already had a value | Check `customfield_10185`&ndash;`10191` (plus `10224`&ndash;`10225`) against your project's current field list; they're not portable across Jira projects, and they change every time a field is deleted and recreated. Remember the backfill only fills blank columns unless `overwrite` is set, it won't otherwise touch an existing value |
+| Webhook returns 200 and the container logs confirm it processed the row, but TeamName/ProductName/etc. still stay blank | Missing `.value` on a dropdown field's smart value. `{{issue.customfield_10185}}` on a select-list field resolves to nothing usable; the request arrives with an empty string for that field even though the ticket clearly has a value selected | Add `.value`: `{{issue.customfield_10185.value}}`. Applies to TeamName, ProductName, ProductTeamsKeyVaultName, and NewSecretPresent, since those are dropdowns. NewSecretName/NewSecretKeyId/NewSecretUpdatedReferenceInventory are plain text fields and must not get `.value` |
+| `NewSecretKeyId` accepted with an obviously wrong value, and it actually shows up in SharePoint | The Jira-side format-validation rule (`NewSecretKeyIDPresent = Yes` &rarr; `NewSecretKeyId` must match the GUID pattern) only blocks that ticket's own status transition — it has no authority over the separate rule that syncs fields to SharePoint, so a bad value can still land there even when Jira's validator correctly caught it | Confirm the Jira-side rule is set up (see the To Do &rarr; In Progress workflow gate section above). More importantly, confirm Container 2's `/tools/jira-status-update` has its own server-side GUID check (`_AZURE_SECRET_ID_RE`) — that's the actual backstop, not the Jira rule |
 
 ---
 

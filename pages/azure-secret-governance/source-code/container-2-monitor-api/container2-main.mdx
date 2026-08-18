@@ -57,6 +57,7 @@ import { Callout } from 'nextra/components'
 | `get_product_service_principal()` | Looks up a Key Vault secret named exactly after a row's `ProductName` and returns its value, or `None` if no such secret exists. A missing secret is expected, not an error, so one unrecognized product doesn't fail the whole run. Passed into `decision_engine.py` as `get_product_service_principal`; no allowlist gate on this path (the separate sync script's `ALLOWED-PRODUCT-NAMES` gate is not part of this file) |
 | `fetch_app_owners()` prefers display names | Returns a comma-separated list of Entra display names now (falling back to UPN/email only when Entra has no display name for that user), per an explicit client requirement ("names, not emails"). An earlier version always returned the UPN |
 | Backup rotation wired here, executed there | `get_list_state`/`create_list_row`/`delete_list_row`/`upload_backup_to_storage` are the actual HTTP/Storage calls; the ordering and abort logic that calls them lives in `decision_engine.py`'s `_rotate_backup_list()` |
+| `NewSecretKeyId` validated as a GUID before every write | Jira's own regex check (in the "Validate intake fields on In Progress" automation rule) only gated the ticket's own status transition, not this endpoint — an invalid value could still reach SharePoint through the separate sync rules. `_AZURE_SECRET_ID_RE` now runs before both the `overwrite` and backfill write sites; a non-matching value is logged and skipped rather than written, and an explicit blank in the `overwrite` branch now actually clears the SharePoint column instead of being silently skipped |
 
 <Callout type="info">
   Most `/tools/*` endpoints are only ever called by Container 1. `/tools/jira-status-update`
@@ -209,6 +210,11 @@ live on the [Jira Automation](/azure-secret-governance/jira) page. In brief, thi
   `NewSecretKeyId`, and `NewSecretUpdatedReferenceInventory` onto the matching row on both the In
   Progress and Resolved transitions, but only into columns that are still blank, never overwriting
   a value already set directly in SharePoint (unless `overwrite` is set, see above).
+- Validates `new_secret_key_id` against Azure's GUID `keyId` format (`_AZURE_SECRET_ID_RE`) before
+  either write site puts it into SharePoint. A non-matching value is logged and skipped rather than
+  written. In the `overwrite` branch specifically, an explicit blank (the engineer clearing the
+  field back out in Jira) is now treated as a real clear and writes `""` to SharePoint, rather than
+  being skipped the way any other falsy value used to be.
 - Posts an acknowledgment comment on the ticket immediately at the In Progress transition if the
   engineer marked `new_secret_present` as `"No"`, rather than leaving them with no confirmation
   until the rotation runbook actually runs, which could be much later.
@@ -227,6 +233,33 @@ live on the [Jira Automation](/azure-secret-governance/jira) page. In brief, thi
   list before trusting this callout on a later date.
 </Callout>
 
+<Callout type="warning">
+  Until this fix, `new_secret_key_id` reached SharePoint with **no format validation on this
+  endpoint's side at all** — the GUID check lived only in the Jira automation rule ("Validate
+  intake fields on In Progress"), which could bounce the ticket's own status back to `To Do` and
+  comment, but had no way to stop the separate "Sync ticket status to SharePoint" / "Sync field
+  edits after In Progress" rules from pushing whatever was typed into the field regardless. A
+  garbage value typed into `NewSecretKeyId`, even one immediately caught by the Jira-side
+  validator, still landed in SharePoint. Clearing the field back to blank in Jira didn't help
+  either: the `overwrite` branch's `if req.new_secret_key_id:` check treated an empty string as
+  "nothing to sync" rather than "sync a blank," so the stale value stayed stuck. Both are fixed
+  here: an invalid value is rejected before either write site, and an explicit blank in the
+  `overwrite` branch now actually clears the SharePoint column.
+</Callout>
+
+<Callout type="warning">
+  `NewSecretUpdatedReferenceInventory` is written to SharePoint under a different internal name
+  than its display name: SharePoint truncated the column's REST/internal name to
+  `NewSecretUpdatedReferenceInvento` (missing the trailing "ry") when the column was first created,
+  and Graph's `fields` PATCH requires that exact internal name, not the display name shown in the
+  SharePoint UI. Both write sites (the `overwrite` branch and the plain backfill branch) write to
+  `fields["NewSecretUpdatedReferenceInvento"]`, not `fields["NewSecretUpdatedReferenceInventory"]`
+  — easy to miss since every other reference to this field, including this endpoint's own
+  request-body field name (`new_secret_updated_reference_inventory`), uses the full, correctly
+  spelled name. This is a pre-existing quirk in the source, not something introduced by the
+  `NewSecretKeyId` fix above — noted here because it wasn't reflected anywhere in this page before.
+</Callout>
+
 ---
 
 ## Source
@@ -243,6 +276,7 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
  
@@ -634,10 +668,16 @@ async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> d
     async with httpx.AsyncClient() as c:
         if item_id is None:
             r = await c.post(base, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+            if not r.is_success:
+                log.error("write_sharepoint_row: create failed (%s) fields=%r body=%s",
+                          r.status_code, fields, r.text)
             r.raise_for_status()
             return {"action": "created", "item_id": r.json().get("id"), "fields": fields}
         else:
             r = await c.patch(f"{base}/{item_id}", headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+            if not r.is_success:
+                log.error("write_sharepoint_row: update failed (%s) item_id=%s fields=%r body=%s",
+                          r.status_code, item_id, fields, r.text)
             r.raise_for_status()
             return {"action": "updated", "item_id": item_id, "fields": fields}
  
@@ -1152,6 +1192,13 @@ async def api_update_on_jira_close(req: JiraCloseReq):
     log.info("update_on_jira_close: %s rows updated for %s", updated, req.jira_key)
     return {"updated": updated, "jira_key": req.jira_key}
  
+# An Azure AD passwordCredential keyId is always a GUID - anything else typed
+# into Jira's NewSecretKeyId field is a typo, not a real secret ID. Checked
+# before either write site below ever puts a value into SharePoint.
+_AZURE_SECRET_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
 class JiraStatusUpdateReq(BaseModel):
     jira_key:  str
     to_status: str   # Jira destination status name, exact text from the workflow
@@ -1476,10 +1523,28 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                         fields["ProductTeamsKeyVaultName"] = req.product_teams_key_vault_name
                     if req.new_secret_vault_name:
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
-                    if req.new_secret_key_id:
-                        fields["NewSecretKeyId"] = req.new_secret_key_id
+                    if req.new_secret_key_id is not None:
+                        candidate = req.new_secret_key_id.strip()
+                        if not candidate:
+                            # Explicit clear - engineer blanked the field back
+                            # out in Jira, so blank it in SharePoint too.
+                            fields["NewSecretKeyId"] = ""
+                        elif _AZURE_SECRET_ID_RE.match(candidate):
+                            fields["NewSecretKeyId"] = candidate
+                        else:
+                            log.warning(
+                                "jira-status-update: new_secret_key_id %r for %s is not a "
+                                "valid Azure secret ID (expected "
+                                "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) - not writing to SharePoint",
+                                candidate, req.jira_key,
+                            )
                     if req.new_secret_updated_reference_inventory:
-                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
+                        # SharePoint truncated this column's internal REST name
+                        # to "NewSecretUpdatedReferenceInvento" (missing "ry")
+                        # at creation time - the display name in the UI is the
+                        # full "NewSecretUpdatedReferenceInventory", but Graph's
+                        # fields PATCH requires the actual internal name.
+                        fields["NewSecretUpdatedReferenceInvento"] = req.new_secret_updated_reference_inventory
                 elif status in DONE_STATUSES or status in REOPEN_STATUSES:
                     # Backfill only — never overwrites a value someone already
                     # set in SharePoint. Fires on BOTH In Progress and
@@ -1500,9 +1565,22 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     if not f.get("NewSecretVaultName") and req.new_secret_vault_name:
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
                     if not f.get("NewSecretKeyId") and req.new_secret_key_id:
-                        fields["NewSecretKeyId"] = req.new_secret_key_id
-                    if not f.get("NewSecretUpdatedReferenceInventory") and req.new_secret_updated_reference_inventory:
-                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
+                        candidate = req.new_secret_key_id.strip()
+                        if _AZURE_SECRET_ID_RE.match(candidate):
+                            fields["NewSecretKeyId"] = candidate
+                        else:
+                            log.warning(
+                                "jira-status-update: new_secret_key_id %r for %s is not a "
+                                "valid Azure secret ID (expected "
+                                "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) - not backfilling into SharePoint",
+                                candidate, req.jira_key,
+                            )
+                    if not f.get("NewSecretUpdatedReferenceInvento") and req.new_secret_updated_reference_inventory:
+                        # See the NOTE above the overwrite branch's equivalent
+                        # line - "NewSecretUpdatedReferenceInvento" (no "ry")
+                        # is the real internal column name, truncated by
+                        # SharePoint at creation time.
+                        fields["NewSecretUpdatedReferenceInvento"] = req.new_secret_updated_reference_inventory
                     # NOTE: new_secret_present is deliberately NOT written to
                     # SharePoint - there's no column for it. It only exists
                     # to trigger the "scheduled for autorotation" Jira
@@ -1579,4 +1657,6 @@ async def api_update_on_jira_reopen(req: JiraReopenReq):
     )
  
 log.info("REST API Server ready — GET /health | POST /tools/*")
+ 
+ 
 ```
