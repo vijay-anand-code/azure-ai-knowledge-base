@@ -1,0 +1,218 @@
+---
+title: Sync ticket status to SharePoint
+description: The main status-transition rule that keeps SharePoint's AlertStatus in sync with Jira, with a Teams failure alert
+---
+
+import { Callout } from 'nextra/components'
+
+# Sync ticket status to SharePoint
+
+**Rule ID:** 3711027 &middot; **UUID:** `019ef2da-a7a3-7663-b9cf-8cb696bf6800` &middot; **State:** Enabled
+
+**Trigger:** `jira.issue.event.trigger:transitioned`, destination status one of `Resolved`,
+`In Progress`, `To Do`, `Waiting for Customer` &mdash; confirms these are the four real live
+statuses in the KAN workflow.
+
+**What it does:**
+
+1. POSTs to Container 1's `/jira-status-update` proxy with `jira_key`, `to_status`, `today`, and
+   the seven custom fields (`team_name`, `product_name`, `product_teams_key_vault_name`,
+   `new_secret_vault_name`, `new_secret_key_id`, `new_secret_present`,
+   `new_secret_updated_reference_inventory`). No `overwrite` flag &mdash; this is the blank-fill-only
+   counterpart to [Sync field edits after In Progress](/azure-secret-governance/source-code/jira-automation-rules/sync-field-edits-after-in-progress)'s
+   `overwrite: true` branch.
+2. If `{{webResponse.status}}` does not equal `200`, POSTs a failure Adaptive Card to a
+   Power Automate HTTP-trigger endpoint (relays into Teams), reporting the sync failure for that
+   ticket.
+
+<Callout type="warning">
+  **The condition and the alert text use two different smart value names.** The gating condition
+  (component 2 below) correctly uses `{{webResponse.status}}`, but the alert card's own text
+  (component 3) was built with `{{webhookResponse.status}}` &mdash; a name Jira doesn't resolve.
+  The alert still fires correctly (the condition works), but the status-code portion of its text
+  likely renders blank rather than the real HTTP status. See the
+  [Jira Automation](/azure-secret-governance/jira#alert-teams-if-the-web-request-fails) page for
+  the corrected example.
+</Callout>
+
+## Source
+
+Raw export from Jira Automation, `automation-rule-019ef2da-a7a3-7663-b9cf-8cb696bf6800-202608190940.json`
+&mdash; unchanged since this rule's first review, copied byte-for-byte from the exported file and
+pretty-printed for readability (Jira exports it as a single minified line).
+
+```json
+{
+    "cloud": true,
+    "rules": [
+        {
+            "id": 3711027,
+            "clientKey": "5a7215a0-a25d-49e3-9af6-84fa103dc312",
+            "name": "Sync ticket status to SharePoint",
+            "state": "ENABLED",
+            "description": "",
+            "authorAccountId": "712020:a88f08cf-322d-493f-9e2e-35195ac99051",
+            "actor": {
+                "type": "ACCOUNT_ID",
+                "value": "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077"
+            },
+            "created": 1782190876579,
+            "updated": 1786625688639,
+            "trigger": {
+                "id": "cc99562d-bdce-4cdb-a899-0e3580e57d8d",
+                "parentId": null,
+                "conditionParentId": null,
+                "component": "TRIGGER",
+                "type": "jira.issue.event.trigger:transitioned",
+                "value": {
+                    "eventFilters": [
+                        "ari:cloud:jira:c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f:project/10001"
+                    ],
+                    "fromStatus": [],
+                    "toStatus": [
+                        {
+                            "type": "NAME",
+                            "value": "Resolved"
+                        },
+                        {
+                            "type": "NAME",
+                            "value": "In Progress"
+                        },
+                        {
+                            "type": "NAME",
+                            "value": "To Do"
+                        },
+                        {
+                            "type": "NAME",
+                            "value": "Waiting for Customer"
+                        }
+                    ],
+                    "eventKey": "jira:issue_updated",
+                    "issueEvent": "issue_generic"
+                },
+                "conditions": [],
+                "children": [],
+                "schemaVersion": 1,
+                "connectionId": null,
+                "checksum": null
+            },
+            "components": [
+                {
+                    "id": "409b567e-3c86-4c68-9032-ba2325c21c1c",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "ACTION",
+                    "type": "jira.issue.outgoing.webhook",
+                    "value": {
+                        "url": "https://secret-governance-v2.whitebeach-12a8e3b9.southindia.azurecontainerapps.io/jira-status-update",
+                        "urlSecure": false,
+                        "headers": [
+                            {
+                                "id": "_header_1782119794611",
+                                "name": "",
+                                "value": "",
+                                "headerSecure": false
+                            }
+                        ],
+                        "sendIssue": false,
+                        "contentType": "custom",
+                        "customBody": "{\n  \"jira_key\":                     \"{{issue.key}}\",\n  \"to_status\":                    \"{{issue.status.name}}\",\n  \"today\":                        \"{{now.jiraDate}}\",\n  \"team_name\":                    \"{{issue.customfield_10185.value}}\",\n  \"product_name\":                 \"{{issue.customfield_10186.value}}\",\n  \"product_teams_key_vault_name\": \"{{issue.customfield_10190.value}}\",\n  \"new_secret_vault_name\":        \"{{issue.customfield_10189}}\",\n  \"new_secret_key_id\":            \"{{issue.customfield_10188}}\",\n  \"new_secret_present\":           \"{{issue.customfield_10191.value}}\",\n  \"new_secret_updated_reference_inventory\": \"{{issue.customfield_10224}}\"\n}",
+                        "method": "POST",
+                        "responseEnabled": false,
+                        "continueOnErrorEnabled": false
+                    },
+                    "conditions": [],
+                    "children": [],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                },
+                {
+                    "id": "b7ff2f7d-46cb-4a14-b1b1-ee77a6d38908",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "CONDITION",
+                    "type": "jira.comparator.condition",
+                    "value": {
+                        "first": "{{webResponse.status}}",
+                        "second": "200",
+                        "operator": "NOT_EQUALS"
+                    },
+                    "conditions": [],
+                    "children": [],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                },
+                {
+                    "id": "0609a0ac-e9c2-4dc4-a6bb-107557e7ebdb",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "ACTION",
+                    "type": "jira.issue.outgoing.webhook",
+                    "value": {
+                        "url": "https://default70afdd805f5b4a09a90d383f126e8c.33.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/c407f151b77c44a6bc06f8d51f3c0383/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=_kpkM-DdApj20MH2044ujFQIg8IAoqokW2N5HMp4rTg",
+                        "urlSecure": false,
+                        "headers": [
+                            {
+                                "id": "_header_1786452946403",
+                                "name": "Content-Type",
+                                "value": "application/json",
+                                "headerSecure": false
+                            }
+                        ],
+                        "sendIssue": false,
+                        "contentType": "custom",
+                        "customBody": "{\n  \"attachments\": [\n    {\n      \"contentType\": \"application/vnd.microsoft.card.adaptive\",\n      \"content\": {\n        \"type\": \"AdaptiveCard\",\n        \"$schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",\n        \"version\": \"1.4\",\n        \"body\": [\n          { \"type\": \"TextBlock\", \"text\": \"Jira Automation failed to sync ticket {{issue.key}} to SharePoint\", \"weight\": \"bolder\", \"wrap\": true },\n          { \"type\": \"TextBlock\", \"text\": \"Status was {{webhookResponse.status}} when moving to {{destinationStatus.name}}. Check container logs for jira-status-update.\", \"wrap\": true }\n        ]\n      }\n    }\n  ]\n}",
+                        "method": "POST",
+                        "responseEnabled": false,
+                        "continueOnErrorEnabled": false
+                    },
+                    "conditions": [],
+                    "children": [],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                }
+            ],
+            "canOtherRuleTrigger": false,
+            "notifyOnError": "FIRSTERROR",
+            "projects": [],
+            "labels": [],
+            "tags": [
+                {
+                    "id": 10097880,
+                    "ruleIdUuid": "019ef2da-a7a3-7663-b9cf-8cb696bf6800",
+                    "tagType": "IS_RULE_UPDATED",
+                    "tagValue": "true"
+                }
+            ],
+            "ruleScope": {
+                "resources": [
+                    "ari:cloud:jira:c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f:project/10001"
+                ]
+            },
+            "ruleHome": {
+                "ruleLifecycleHome": {
+                    "locationARI": "ari:cloud:jira:c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f:project/10001"
+                },
+                "ruleBillingHome": {
+                    "locationARI": "ari:cloud:jira-software::site/c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f"
+                }
+            },
+            "writeAccessType": "OWNER_ONLY",
+            "collaborators": [],
+            "billingType": "NORMAL",
+            "idUuid": "019ef2da-a7a3-7663-b9cf-8cb696bf6800",
+            "partitionId": "5a7215a0-a25d-49e3-9af6-84fa103dc312",
+            "checksum": {
+                "version": 3,
+                "value": "34b882537ecf2dbc9c9c0f3cecb4cc483981f7aa55764e7710aa4673a243aa66"
+            },
+            "currentVersionId": null,
+            "ruleArchetype": null,
+            "editRestrictions": null
+        }
+    ]
+}
+```

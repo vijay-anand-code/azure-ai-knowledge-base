@@ -32,3 +32,14 @@ Azure Automation and the container files that power the monitoring API.
 |------|-------------|
 | [main.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-main) | FastAPI app, all tool implementations and HTTP endpoints |
 | [decision_engine.py](/azure-secret-governance/source-code/container-2-monitor-api/container2-decision-engine) | Async orchestrator, classifies secrets, raises tickets, sends alerts |
+
+## Jira Automation Rules
+
+Raw rule exports from the KAN project, kept as a ground-truth reference alongside the
+[Jira Automation](/azure-secret-governance/jira) page's prose walkthrough.
+
+| Rule | Trigger | What it does |
+|------|---------|-------------|
+| [Sync field edits after In Progress](/azure-secret-governance/source-code/jira-automation-rules/sync-field-edits-after-in-progress) | Any edit to 9 named custom fields | Locks fields while Resolved; overwrite-syncs to SharePoint otherwise |
+| [Sync ticket status to SharePoint](/azure-secret-governance/source-code/jira-automation-rules/sync-ticket-status-to-sharepoint) | Transition to Resolved/In Progress/To Do/Waiting for Customer | The main status-transition sync, with a Teams failure alert |
+| [Validate intake fields on In Progress](/azure-secret-governance/source-code/jira-automation-rules/validate-intake-fields-on-in-progress) | Transition to In Progress or Resolved | Bounces the ticket back to To Do if required fields are missing/invalid |

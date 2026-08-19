@@ -1,0 +1,846 @@
+---
+title: Validate intake fields on In Progress
+description: Bounces a ticket back to To Do if required intake fields are missing or NewSecretKeyId fails GUID validation
+---
+
+import { Callout } from 'nextra/components'
+
+# Validate intake fields on In Progress (v2)
+
+**Rule ID:** 4071692 &middot; **UUID:** `019ffb8f-f2d5-72e5-be00-6596ca234738` &middot; **State:** Enabled
+
+**Trigger:** `jira.issue.event.trigger:transitioned`, destination status **In Progress or
+Resolved**.
+
+<Callout type="warning">
+  **Trigger widened since this rule's first review (2026-08-18).** It originally fired only on
+  transition to In Progress. As of this export it also fires on transition to **Resolved**, so
+  all five checks below now re-run as a final gate before a ticket can resolve, not only when
+  work starts. This closes a real gap: previously, a field cleared out (or never validly filled
+  in) sometime after In Progress had nothing catching it before Resolved.
+</Callout>
+
+**What it does:** five independent condition blocks, each bounces the ticket back to `To Do`
+(status transition + a private, non-public comment) if triggered:
+
+1. **Completeness gate (`ANY` match):** if `TeamName`, `ProductName`, `ProductTeamsKeyVaultName`,
+   `NewSecretPresent`, `NewSecretKeyIDPresent`, or `NewSecretUpdatedReferenceInventoryPresent` is
+   blank, bounce.
+2. `NewSecretKeyIDPresent == Yes` but `NewSecretKeyId` is blank &rarr; bounce, "fill in the actual
+   secret ID."
+3. `NewSecretKeyIDPresent == Yes` and `NewSecretKeyId` is filled but fails a GUID regex
+   (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`) &rarr; bounce,
+   "doesn't look like a valid Azure secret ID."
+4. `NewSecretPresent == Yes` but `NewSecretName` is blank &rarr; bounce, "fill in the name of the
+   new secret in the vault."
+5. `NewSecretUpdatedReferenceInventoryPresent == Yes` but `NewSecretUpdatedReferenceInventory` is
+   blank &rarr; bounce, "add the reference inventory notes."
+
+`NewSecretKeyIDPresent`+`NewSecretKeyId` (blocks 2&ndash;3) and `NewSecretPresent`+`NewSecretName`
+(block 4) are two deliberately separate Yes/No-plus-value pairs, not duplicates of each other:
+"do you know the Entra Key ID" is a different question from "is a replacement secret already
+stored under a given vault name," and an engineer can legitimately answer one without the other.
+
+<Callout type="warning">
+  **This rule's GUID check (block 3) does not, by itself, stop a bad value from reaching
+  SharePoint.** It only gates this rule's own action &mdash; reverting the ticket's status. The
+  separate [Sync field edits after In Progress](/azure-secret-governance/source-code/jira-automation-rules/sync-field-edits-after-in-progress)
+  and [Sync ticket status to SharePoint](/azure-secret-governance/source-code/jira-automation-rules/sync-ticket-status-to-sharepoint)
+  rules fire independently off the same events and push whatever's in `NewSecretKeyId` regardless.
+  This was a real, confirmed bug: a garbage value, correctly caught by this validator, still
+  landed in SharePoint. Fixed server-side in Container 2's `/tools/jira-status-update` handler
+  &mdash; see [that page's Key design decisions table](/azure-secret-governance/source-code/container-2-monitor-api/container2-main).
+</Callout>
+
+## Source
+
+Raw export from Jira Automation, `automation-rule-019ffb8f-f2d5-72e5-be00-6596ca234738-202608190938.json`
+&mdash; latest version reviewed, byte-identical to the 05:05 export the same day, copied
+byte-for-byte from the exported file and pretty-printed for readability (Jira exports it as a
+single minified line).
+
+```json
+{
+    "cloud": true,
+    "rules": [
+        {
+            "id": 4071692,
+            "clientKey": "5a7215a0-a25d-49e3-9af6-84fa103dc312",
+            "name": "Validate intake fields on In Progress (v2)",
+            "state": "ENABLED",
+            "description": "",
+            "authorAccountId": "712020:a88f08cf-322d-493f-9e2e-35195ac99051",
+            "actor": {
+                "type": "ACCOUNT_ID",
+                "value": "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077"
+            },
+            "created": 1786631942869,
+            "updated": 1787070811120,
+            "trigger": {
+                "id": "d14244a1-7bd1-4c96-80d0-046f28cd9e74",
+                "parentId": null,
+                "conditionParentId": null,
+                "component": "TRIGGER",
+                "type": "jira.issue.event.trigger:transitioned",
+                "value": {
+                    "eventFilters": [
+                        "ari:cloud:jira:c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f:project/10001"
+                    ],
+                    "fromStatus": [],
+                    "toStatus": [
+                        {
+                            "type": "NAME",
+                            "value": "In Progress"
+                        },
+                        {
+                            "type": "NAME",
+                            "value": "Resolved"
+                        }
+                    ],
+                    "eventKey": "jira:issue_updated",
+                    "issueEvent": "issue_generic"
+                },
+                "conditions": [],
+                "children": [],
+                "schemaVersion": 1,
+                "connectionId": null,
+                "checksum": null
+            },
+            "components": [
+                {
+                    "id": "bd725a7d-391c-43d6-9578-403cf72453c3",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "CONDITION",
+                    "type": "jira.condition.container.block",
+                    "value": null,
+                    "conditions": [],
+                    "children": [
+                        {
+                            "id": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                            "parentId": "bd725a7d-391c-43d6-9578-403cf72453c3",
+                            "conditionParentId": null,
+                            "component": "CONDITION_BLOCK",
+                            "type": "jira.condition.if.block",
+                            "value": {
+                                "conditionMatchType": "ANY"
+                            },
+                            "conditions": [
+                                {
+                                    "id": "250bd50d-21d7-4e00-bee9-92fc1069cbeb",
+                                    "parentId": null,
+                                    "conditionParentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "TeamName"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "4192d0cb-bb89-4564-adc4-cf06cc75c6ac",
+                                    "parentId": null,
+                                    "conditionParentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "ProductName"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "946a99de-fa22-4b54-8d79-a1e5fd31e0f3",
+                                    "parentId": null,
+                                    "conditionParentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "ProductTeamsKeyVaultName"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "66cc22db-5b30-40fe-b01b-dad7b42e2003",
+                                    "parentId": null,
+                                    "conditionParentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "0e4466bc-35dc-491c-9dc7-9f670007117f",
+                                    "parentId": null,
+                                    "conditionParentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretKeyIDPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "d8b8bf7d-97cd-4c0d-8d33-9d919dd82805",
+                                    "parentId": null,
+                                    "conditionParentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretUpdatedReferenceInventoryPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "children": [
+                                {
+                                    "id": "af3b843c-891b-43aa-b878-1876e1f10034",
+                                    "parentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.transition",
+                                    "value": {
+                                        "operations": [],
+                                        "advancedFields": null,
+                                        "sendNotifications": true,
+                                        "destinationStatus": {
+                                            "type": "NAME",
+                                            "value": "To Do"
+                                        },
+                                        "transitionMatch": ""
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 11,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "4afc720b-8bd0-4643-91c3-77490b92cdf1",
+                                    "parentId": "f2a91d05-f7e3-44cf-aef2-10e865795b51",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.comment",
+                                    "value": {
+                                        "comment": "Moved back to To Do: TeamName, ProductName, ProductTeamsKeyVaultName, NewSecretPresent, NewSecretKeyIDPresent, and NewSecretUpdatedReferenceInventoryPresent must all be answered before this ticket can move to In Progress.",
+                                        "publicComment": false,
+                                        "commentVisibility": null,
+                                        "sendNotifications": true,
+                                        "addCommentOnce": true
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 2,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "schemaVersion": 1,
+                            "connectionId": null,
+                            "checksum": null
+                        }
+                    ],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                },
+                {
+                    "id": "2baad6a1-e827-4342-be64-b22cae1e2b0d",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "CONDITION",
+                    "type": "jira.condition.container.block",
+                    "value": null,
+                    "conditions": [],
+                    "children": [
+                        {
+                            "id": "93893a9a-f0c8-4624-9931-eb750c1b926f",
+                            "parentId": "2baad6a1-e827-4342-be64-b22cae1e2b0d",
+                            "conditionParentId": null,
+                            "component": "CONDITION_BLOCK",
+                            "type": "jira.condition.if.block",
+                            "value": {
+                                "conditionMatchType": "ALL"
+                            },
+                            "conditions": [
+                                {
+                                    "id": "ec91d426-308c-45c4-820a-1227fbcb7e91",
+                                    "parentId": null,
+                                    "conditionParentId": "93893a9a-f0c8-4624-9931-eb750c1b926f",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretKeyIDPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EQUALS",
+                                        "compareValue": {
+                                            "type": "NAME",
+                                            "modifier": null,
+                                            "value": "Yes",
+                                            "multiValue": false,
+                                            "source": null
+                                        }
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "7dd4b76c-c6d0-4d26-908c-4392b311cde8",
+                                    "parentId": null,
+                                    "conditionParentId": "93893a9a-f0c8-4624-9931-eb750c1b926f",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretKeyId"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:textfield",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "children": [
+                                {
+                                    "id": "4d2598e2-2189-4ba3-b766-7f3726668a54",
+                                    "parentId": "93893a9a-f0c8-4624-9931-eb750c1b926f",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.transition",
+                                    "value": {
+                                        "operations": [],
+                                        "advancedFields": null,
+                                        "sendNotifications": true,
+                                        "destinationStatus": {
+                                            "type": "NAME",
+                                            "value": "To Do"
+                                        },
+                                        "transitionMatch": ""
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 11,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "96be36be-f816-4040-813e-0841acc7ca0a",
+                                    "parentId": "93893a9a-f0c8-4624-9931-eb750c1b926f",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.comment",
+                                    "value": {
+                                        "comment": "Moved back to To Do: NewSecretKeyIDPresent is Yes, but NewSecretKeyId is blank. Fill in the actual secret ID (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).",
+                                        "publicComment": false,
+                                        "commentVisibility": null,
+                                        "sendNotifications": true,
+                                        "addCommentOnce": true
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 2,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "schemaVersion": 1,
+                            "connectionId": null,
+                            "checksum": null
+                        }
+                    ],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                },
+                {
+                    "id": "8a8c8aff-c06b-4a16-bd25-6d7687dc4a11",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "CONDITION",
+                    "type": "jira.condition.container.block",
+                    "value": null,
+                    "conditions": [],
+                    "children": [
+                        {
+                            "id": "77ce54a9-b2b2-4941-bbef-c0089afeb8d3",
+                            "parentId": "8a8c8aff-c06b-4a16-bd25-6d7687dc4a11",
+                            "conditionParentId": null,
+                            "component": "CONDITION_BLOCK",
+                            "type": "jira.condition.if.block",
+                            "value": {
+                                "conditionMatchType": "ALL"
+                            },
+                            "conditions": [
+                                {
+                                    "id": "aaf89b46-af82-4177-b944-0e5224175c50",
+                                    "parentId": null,
+                                    "conditionParentId": "77ce54a9-b2b2-4941-bbef-c0089afeb8d3",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretKeyIDPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EQUALS",
+                                        "compareValue": {
+                                            "type": "NAME",
+                                            "modifier": null,
+                                            "value": "Yes",
+                                            "multiValue": false,
+                                            "source": null
+                                        }
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "3fa00d94-a2a3-41e9-8f9f-1a23ee476fb3",
+                                    "parentId": null,
+                                    "conditionParentId": "77ce54a9-b2b2-4941-bbef-c0089afeb8d3",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretKeyId"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:textfield",
+                                        "comparison": "NOT_EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "children": [
+                                {
+                                    "id": "41399ac8-20e0-4f3e-a61d-7d17de71b8bc",
+                                    "parentId": "77ce54a9-b2b2-4941-bbef-c0089afeb8d3",
+                                    "conditionParentId": null,
+                                    "component": "CONDITION",
+                                    "type": "jira.comparator.condition",
+                                    "value": {
+                                        "first": "{{issue.customfield_10188}}",
+                                        "second": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                        "operator": "REGEX_NOT_MATCHES"
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 1,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "0fc4a981-01b9-4edd-9f39-1a90a052d30b",
+                                    "parentId": "77ce54a9-b2b2-4941-bbef-c0089afeb8d3",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.transition",
+                                    "value": {
+                                        "operations": [],
+                                        "advancedFields": null,
+                                        "sendNotifications": true,
+                                        "destinationStatus": {
+                                            "type": "NAME",
+                                            "value": "To Do"
+                                        },
+                                        "transitionMatch": ""
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 11,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "93d65443-4d55-44ef-a0ab-d29e8448097f",
+                                    "parentId": "77ce54a9-b2b2-4941-bbef-c0089afeb8d3",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.comment",
+                                    "value": {
+                                        "comment": "Moved back to To Do: NewSecretKeyId doesn't look like a valid Azure secret ID. Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                                        "publicComment": false,
+                                        "commentVisibility": null,
+                                        "sendNotifications": true,
+                                        "addCommentOnce": true
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 2,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "schemaVersion": 1,
+                            "connectionId": null,
+                            "checksum": null
+                        }
+                    ],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                },
+                {
+                    "id": "57693572-e4fe-419d-be24-3460d4c54b42",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "CONDITION",
+                    "type": "jira.condition.container.block",
+                    "value": null,
+                    "conditions": [],
+                    "children": [
+                        {
+                            "id": "a3b4f8ee-62f2-48b4-908d-e97ef54ac6b7",
+                            "parentId": "57693572-e4fe-419d-be24-3460d4c54b42",
+                            "conditionParentId": null,
+                            "component": "CONDITION_BLOCK",
+                            "type": "jira.condition.if.block",
+                            "value": {
+                                "conditionMatchType": "ALL"
+                            },
+                            "conditions": [
+                                {
+                                    "id": "4b341bb0-d6a7-4df6-8d06-ea05dae6dd2a",
+                                    "parentId": null,
+                                    "conditionParentId": "a3b4f8ee-62f2-48b4-908d-e97ef54ac6b7",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EQUALS",
+                                        "compareValue": {
+                                            "type": "NAME",
+                                            "modifier": null,
+                                            "value": "Yes",
+                                            "multiValue": false,
+                                            "source": null
+                                        }
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "b005f3de-76d8-40f0-b4d9-e9540010885d",
+                                    "parentId": null,
+                                    "conditionParentId": "a3b4f8ee-62f2-48b4-908d-e97ef54ac6b7",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretName"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:textfield",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "children": [
+                                {
+                                    "id": "aaeb9c8c-24ad-4812-a941-1a37eb815ecc",
+                                    "parentId": "a3b4f8ee-62f2-48b4-908d-e97ef54ac6b7",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.transition",
+                                    "value": {
+                                        "operations": [],
+                                        "advancedFields": null,
+                                        "sendNotifications": true,
+                                        "destinationStatus": {
+                                            "type": "NAME",
+                                            "value": "To Do"
+                                        },
+                                        "transitionMatch": ""
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 11,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "1c9b9959-1fbf-4504-b6a3-96b44baafb6b",
+                                    "parentId": "a3b4f8ee-62f2-48b4-908d-e97ef54ac6b7",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.comment",
+                                    "value": {
+                                        "comment": "Moved back to To Do: NewSecretPresent is Yes, but NewSecretName is blank. Fill in the name of the new secret in the vault.",
+                                        "publicComment": false,
+                                        "commentVisibility": null,
+                                        "sendNotifications": true,
+                                        "addCommentOnce": true
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 2,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "schemaVersion": 1,
+                            "connectionId": null,
+                            "checksum": null
+                        }
+                    ],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                },
+                {
+                    "id": "99c2c7d9-04df-4713-8ff9-40ba2f26ac88",
+                    "parentId": null,
+                    "conditionParentId": null,
+                    "component": "CONDITION",
+                    "type": "jira.condition.container.block",
+                    "value": null,
+                    "conditions": [],
+                    "children": [
+                        {
+                            "id": "b147f48f-91bf-477b-be5b-220431d784b7",
+                            "parentId": "99c2c7d9-04df-4713-8ff9-40ba2f26ac88",
+                            "conditionParentId": null,
+                            "component": "CONDITION_BLOCK",
+                            "type": "jira.condition.if.block",
+                            "value": {
+                                "conditionMatchType": "ALL"
+                            },
+                            "conditions": [
+                                {
+                                    "id": "d4d9d888-f878-43e0-a080-4060fcad0b29",
+                                    "parentId": null,
+                                    "conditionParentId": "b147f48f-91bf-477b-be5b-220431d784b7",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretUpdatedReferenceInventoryPresent"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:select",
+                                        "comparison": "EQUALS",
+                                        "compareValue": {
+                                            "type": "NAME",
+                                            "modifier": null,
+                                            "value": "Yes",
+                                            "multiValue": false,
+                                            "source": null
+                                        }
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "114794d9-e336-4de4-8a6e-1410a88a3645",
+                                    "parentId": null,
+                                    "conditionParentId": "b147f48f-91bf-477b-be5b-220431d784b7",
+                                    "component": "CONDITION",
+                                    "type": "jira.issue.condition",
+                                    "value": {
+                                        "selectedField": {
+                                            "type": "NAME",
+                                            "value": "NewSecretUpdatedReferenceInventory"
+                                        },
+                                        "selectedFieldType": "com.atlassian.jira.plugin.system.customfieldtypes:textarea",
+                                        "comparison": "EMPTY",
+                                        "compareValue": null
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 3,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "children": [
+                                {
+                                    "id": "11071124-0ea6-47c3-a36b-9b0b95c9cb9b",
+                                    "parentId": "b147f48f-91bf-477b-be5b-220431d784b7",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.transition",
+                                    "value": {
+                                        "operations": [],
+                                        "advancedFields": null,
+                                        "sendNotifications": true,
+                                        "destinationStatus": {
+                                            "type": "NAME",
+                                            "value": "To Do"
+                                        },
+                                        "transitionMatch": ""
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 11,
+                                    "connectionId": null,
+                                    "checksum": null
+                                },
+                                {
+                                    "id": "88aae9e7-4741-447d-bedb-8f80e3cc0656",
+                                    "parentId": "b147f48f-91bf-477b-be5b-220431d784b7",
+                                    "conditionParentId": null,
+                                    "component": "ACTION",
+                                    "type": "jira.issue.comment",
+                                    "value": {
+                                        "comment": "Moved back to To Do: NewSecretUpdatedReferenceInventoryPresent is Yes, but NewSecretUpdatedReferenceInventory is blank. Please add the reference inventory notes.",
+                                        "publicComment": false,
+                                        "commentVisibility": null,
+                                        "sendNotifications": true,
+                                        "addCommentOnce": true
+                                    },
+                                    "conditions": [],
+                                    "children": [],
+                                    "schemaVersion": 2,
+                                    "connectionId": null,
+                                    "checksum": null
+                                }
+                            ],
+                            "schemaVersion": 1,
+                            "connectionId": null,
+                            "checksum": null
+                        }
+                    ],
+                    "schemaVersion": 1,
+                    "connectionId": null,
+                    "checksum": null
+                }
+            ],
+            "canOtherRuleTrigger": false,
+            "notifyOnError": "FIRSTERROR",
+            "projects": [],
+            "labels": [],
+            "tags": [
+                {
+                    "id": 10184288,
+                    "ruleIdUuid": "019ffb8f-f2d5-72e5-be00-6596ca234738",
+                    "tagType": "IS_RULE_UPDATED",
+                    "tagValue": "true"
+                }
+            ],
+            "ruleScope": {
+                "resources": [
+                    "ari:cloud:jira:c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f:project/10001"
+                ]
+            },
+            "ruleHome": {
+                "ruleLifecycleHome": {
+                    "locationARI": "ari:cloud:jira:c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f:project/10001"
+                },
+                "ruleBillingHome": {
+                    "locationARI": "ari:cloud:jira-software::site/c3a99e6c-dc6b-4ed5-b446-b8baf24ca75f"
+                }
+            },
+            "writeAccessType": "OWNER_ONLY",
+            "collaborators": [],
+            "billingType": "NORMAL",
+            "idUuid": "019ffb8f-f2d5-72e5-be00-6596ca234738",
+            "partitionId": "5a7215a0-a25d-49e3-9af6-84fa103dc312",
+            "checksum": {
+                "version": 3,
+                "value": "de8990262df62cc50dcb3b8213a6c41ca6cfe12fc7980955f1cefb95100d3138"
+            },
+            "currentVersionId": null,
+            "ruleArchetype": null,
+            "editRestrictions": null
+        }
+    ]
+}
+```

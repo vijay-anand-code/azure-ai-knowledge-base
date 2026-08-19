@@ -24,6 +24,13 @@ that forwards internally to Container 2's `/tools/jira-status-update`, which doe
 work.
 
 <Callout type="info">
+  **Raw rule exports.** This page is a prose walkthrough. For the exact, current Jira Automation
+  rule definitions themselves (ground truth if this page and Jira ever disagree), see
+  [Jira Automation Rules](/azure-secret-governance/source-code/jira-automation-rules) under
+  Source Code.
+</Callout>
+
+<Callout type="info">
   **The live workflow has exactly four statuses.** The KAN "IT Helpdesk" project's actual
   workflow, verified directly against Jira, is To Do, In Progress, Waiting for Customer,
   Resolved. The endpoint's code also recognizes Done, Canceled/Cancelled, Blocked, and "Awaiting
@@ -153,6 +160,15 @@ combination of a field-required validator and, since KAN is a **team-managed** p
 has no native "required only if another field equals X" validator), one automation rule
 ("Validate intake fields on In Progress") doing conditional validation reactively across five
 separate checks.
+
+<Callout type="info">
+  This rule's trigger fires on transition to **In Progress or Resolved**, not just In Progress
+  (widened after this page's first review). All five checks below now also re-run as a final
+  gate immediately before a ticket can resolve, catching a field that was valid at In Progress
+  but got cleared or invalidated sometime afterward. See the raw rule export on the
+  [Jira Automation Rules](/azure-secret-governance/source-code/jira-automation-rules/validate-intake-fields-on-in-progress)
+  page.
+</Callout>
 
 **On the To Do &rarr; In Progress transition, required unconditionally** (checked by the rule's
 first block, which bounces the ticket back to To Do if *any* of these is still blank):

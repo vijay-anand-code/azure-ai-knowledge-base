@@ -1,0 +1,30 @@
+---
+title: Jira Automation Rules
+description: Raw rule exports for the three live Jira Automation rules on the KAN project, for reference alongside the Jira Automation setup guide
+---
+
+import { Callout } from 'nextra/components'
+
+# Jira Automation Rules
+
+**Where these live:** KAN project &rarr; Project Settings &rarr; Automation. These are the exact
+exported rule definitions (Jira's own `automation-rule-*.json` export format), kept here as a
+ground-truth reference alongside the prose walkthrough on the
+[Jira Automation](/azure-secret-governance/jira) page. If the two ever disagree, treat this page
+as current as of its own export timestamp and the prose page as the explanatory layer on top of
+it — re-export from Jira and update this page if they drift.
+
+| Rule | Trigger | What it does |
+|------|---------|-------------|
+| [Sync field edits after In Progress](/azure-secret-governance/source-code/jira-automation-rules/sync-field-edits-after-in-progress) | Any edit to 9 named custom fields | Locks those fields while Resolved (reverts + comments); otherwise pushes the edit to SharePoint with `overwrite: true` |
+| [Sync ticket status to SharePoint](/azure-secret-governance/source-code/jira-automation-rules/sync-ticket-status-to-sharepoint) | Transition to Resolved, In Progress, To Do, or Waiting for Customer | The main status-transition sync — calls `/jira-status-update`, alerts Teams via Power Automate on failure |
+| [Validate intake fields on In Progress](/azure-secret-governance/source-code/jira-automation-rules/validate-intake-fields-on-in-progress) | Transition to In Progress or Resolved | Bounces the ticket back to To Do with a comment if required fields are missing or `NewSecretKeyId` fails GUID validation |
+
+<Callout type="warning">
+  **`NewSecretKeyId` format validation on this Jira rule is a UX nicety, not the real backstop.**
+  It only gates this rule's own action (reverting ticket status). Container 2's
+  `/tools/jira-status-update` has its own server-side GUID check as of the
+  [`NewSecretKeyId` validation fix](/azure-secret-governance/source-code/container-2-monitor-api/container2-main)
+  — that's what actually stops an invalid value from reaching SharePoint, regardless of whether
+  this Jira-side rule is configured correctly. See that page's Key design decisions table for why.
+</Callout>
