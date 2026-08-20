@@ -57,7 +57,8 @@ import { Callout } from 'nextra/components'
 | `get_product_service_principal()` | Looks up a Key Vault secret named exactly after a row's `ProductName` and returns its value, or `None` if no such secret exists. A missing secret is expected, not an error, so one unrecognized product doesn't fail the whole run. Passed into `decision_engine.py` as `get_product_service_principal`; no allowlist gate on this path (the separate sync script's `ALLOWED-PRODUCT-NAMES` gate is not part of this file) |
 | `fetch_app_owners()` prefers display names | Returns a comma-separated list of Entra display names now (falling back to UPN/email only when Entra has no display name for that user), per an explicit client requirement ("names, not emails"). An earlier version always returned the UPN |
 | Backup rotation wired here, executed there | `get_list_state`/`create_list_row`/`delete_list_row`/`upload_backup_to_storage` are the actual HTTP/Storage calls; the ordering and abort logic that calls them lives in `decision_engine.py`'s `_rotate_backup_list()` |
-| `NewSecretKeyId` validated as a GUID before every write | Jira's own regex check (in the "Validate intake fields on In Progress" automation rule) only gated the ticket's own status transition, not this endpoint — an invalid value could still reach SharePoint through the separate sync rules. `_AZURE_SECRET_ID_RE` now runs before both the `overwrite` and backfill write sites; a non-matching value is logged and skipped rather than written, and an explicit blank in the `overwrite` branch now actually clears the SharePoint column instead of being silently skipped |
+| `NewSecretKeyId` validated as a GUID before every write | Jira's own regex check (in the "Validate intake fields on In Progress" automation rule) only gated the ticket's own status transition, not this endpoint &mdash; an invalid value could still reach SharePoint through the separate sync rules. `_AZURE_SECRET_ID_RE` now runs before both the `overwrite` and backfill write sites; a non-matching value is logged and skipped rather than written, and an explicit blank in the `overwrite` branch now actually clears the SharePoint column instead of being silently skipped |
+| `create_list_row()` logs row identity on failure | A production incident showed a backup-rotation write failing with only a bare Graph status code and error body in the log, with no way to tell which of up to ~1900 rows in the snapshot it was. The error log now includes that row's `SecretID`, `AppName`, and `AlertStatus` alongside Graph's response, so a future failure is diagnosable from the log line alone |
 
 <Callout type="info">
   Most `/tools/*` endpoints are only ever called by Container 1. `/tools/jira-status-update`
@@ -870,8 +871,13 @@ async def create_list_row(list_id: str, fields: dict) -> dict:
     async with httpx.AsyncClient() as c:
         r = await c.post(url, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
         if not r.is_success:
-            log.error("create_list_row Graph error [%s] for list %s: %s",
-                      r.status_code, list_id, r.text[:2000])
+            # Row identity included so a failure is diagnosable from this one log
+            # line alone - without it, a batch failure only tells you the status
+            # code and Graph's error text, not which row triggered it.
+            log.error("create_list_row Graph error [%s] for list %s (SecretID=%s, "
+                      "AppName=%s, AlertStatus=%s): %s",
+                      r.status_code, list_id, fields.get("SecretID"), fields.get("AppName"),
+                      fields.get("AlertStatus"), r.text[:2000])
         r.raise_for_status()
         return {"item_id": r.json().get("id")}
 
