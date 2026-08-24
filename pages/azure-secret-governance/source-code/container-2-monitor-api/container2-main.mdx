@@ -59,6 +59,7 @@ import { Callout } from 'nextra/components'
 | Backup rotation wired here, executed there | `get_list_state`/`create_list_row`/`delete_list_row`/`upload_backup_to_storage` are the actual HTTP/Storage calls; the ordering and abort logic that calls them lives in `decision_engine.py`'s `_rotate_backup_list()` |
 | `NewSecretKeyId` validated as a GUID before every write | Jira's own regex check (in the "Validate intake fields on In Progress" automation rule) only gated the ticket's own status transition, not this endpoint &mdash; an invalid value could still reach SharePoint through the separate sync rules. `_AZURE_SECRET_ID_RE` now runs before both the `overwrite` and backfill write sites; a non-matching value is logged and skipped rather than written, and an explicit blank in the `overwrite` branch now actually clears the SharePoint column instead of being silently skipped |
 | `create_list_row()` logs row identity on failure | A production incident showed a backup-rotation write failing with only a bare Graph status code and error body in the log, with no way to tell which of up to ~1900 rows in the snapshot it was. The error log now includes that row's `SecretID`, `AppName`, and `AlertStatus` alongside Graph's response, so a future failure is diagnosable from the log line alone |
+| `JIRA_DESCRIPTION_CUSTOM_FIELD_ID` &mdash; plain code constant, not Key Vault | Some projects/work types (confirmed on a Service Desk-style request type) show a customer-facing "Description" field that's actually a separate custom field, not Jira's system description field &mdash; `create_jira_ticket()`'s write to the system `description` field still succeeds, it's just not what's displayed. When this constant (near the other Jira config, defaults to `None`) is set to a real field ID, the same ticket text is also written there as a plain string. Deliberately a code constant the client edits directly, not a Key Vault secret &mdash; explicit choice for this one, unlike every other piece of Jira config in this file |
 
 <Callout type="info">
   Most `/tools/*` endpoints are only ever called by Container 1. `/tools/jira-status-update`
@@ -425,7 +426,16 @@ try:
     JIRA_ISSUE_TYPE = _kv_get("JIRA-ISSUE-TYPE").strip()
 except Exception:
     JIRA_ISSUE_TYPE = "Email request"
- 
+
+# Some projects/work types (e.g. Service Desk request types) show a
+# customer-facing "Description" field that's actually a separate custom
+# field, not Jira's system description field - the system field write in
+# create_jira_ticket() below still succeeds, it just isn't what's displayed.
+# Set this to that field's ID (e.g. "customfield_10258") to also write the
+# same text there. Leave blank/None for projects that don't need this -
+# unchanged original behavior, system description field only.
+JIRA_DESCRIPTION_CUSTOM_FIELD_ID = None  # <-- client edits this line directly
+
 log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
  
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1018,6 +1028,8 @@ async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_
     text = (f"App Registration Name: {app_name}\nApp ID: {app_id}\nSecret ID: {secret_id}\nSecret Description: {secret_description}\nExpiration: {expiration_date}\nDays Remaining: {days_text}\nSeverity: {severity}\n")
     if extra_note: text += f"\nNote: {extra_note}"
     payload = {"fields": {"project": {"key": JIRA_PROJECT_KEY}, "summary": summary_line, "description": text, "issuetype": {"name": JIRA_ISSUE_TYPE}, "priority": {"name": priority}, "labels": ["azure-secret", "rotation-required"]}}
+    if JIRA_DESCRIPTION_CUSTOM_FIELD_ID:
+        payload["fields"][JIRA_DESCRIPTION_CUSTOM_FIELD_ID] = text
     if JIRA_EPIC_KEY and JIRA_EPIC_KEY != "CSD-123": payload["fields"]["parent"] = {"key": JIRA_EPIC_KEY}
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{JIRA_BASE_URL}/rest/api/2/issue", headers={"Authorization": _jira_auth(), "Content-Type": "application/json"}, content=json.dumps(payload), timeout=20)
