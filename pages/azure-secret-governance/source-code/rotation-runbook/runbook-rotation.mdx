@@ -43,8 +43,8 @@ A row must pass every one of these gates in Phase B, in order, or it's skipped f
 |---|------|----------------|----------------|
 | 1 | Actionable status | `AlertStatus` | Not one of `Discovered`, `JiraRaised`, `TeamsAlerted`, `Escalated`, `Expired`, `ExpiredManualReview`. `RotatedPendingDeployment`, `Rotated`, `OverdueManualReview`, and `JiraClosed-Unverified` are all excluded here |
 | 2 | Owned by a human | `DevSecOpsOwnership` | Blank (must be filled by a person directly, or resolved earlier by monitoring/owner sync from `ProductName`) |
-| 3 | Rotation-eligible bucket | `ExpirationDate` → computed bucket | Bucket is P4 (61+ days, safe); only P1/P2/P3 are eligible |
-| 4 | Within threshold | `ExpirationDate` → days remaining | More than 60 days remain (`DEFAULT_ROTATION_THRESHOLD = 60`, hardcoded at the call site) |
+| 3 | Rotation-eligible bucket | `ExpirationDate` → computed bucket | Bucket is P4 (46+ days, safe); only P1/P2/P3 are eligible |
+| 4 | Within threshold | `ExpirationDate` → days remaining | More than 45 days remain (`DEFAULT_ROTATION_THRESHOLD = 45`, hardcoded at the call site) |
 | 5 | Has a Jira ticket | `JiraTicketKey` | Blank (logged as an error, `"no JiraTicketKey, cannot rotate"`), never silently allowed through |
 | 6 | Jira ticket still open | Live status via `get_jira_issue()` | Status is `done`/`closed`/`resolved`; the row instead flips to `JiraClosed-Unverified` for manual review, and no rotation happens |
 | 7 | App still exists in Azure | `app_info_by_client_id` lookup | The app registration's `appId` isn't found across the scanned tenants |
@@ -436,11 +436,11 @@ ACTIONABLE_STATUSES        = {
 
 # CORRECTED — matches decision_engine.py's current bucket names, after the
 # renumbering that merged the old P1/P2 into one P1 (0-7 days) and shifted
-# every bucket below it down by one. P4 is now the SAFE/61+ bucket (it used
+# every bucket below it down by one. P4 is now the SAFE/46+ bucket (it used
 # to be P5) and must NEVER be rotation-eligible, same as P5 never was under
 # the old scheme.
 ROTATION_ELIGIBLE_BUCKETS  = {"P1", "P2", "P3"}
-DEFAULT_ROTATION_THRESHOLD = 60
+DEFAULT_ROTATION_THRESHOLD = 45
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPER (synchronous urllib — no httpx needed)
@@ -554,10 +554,10 @@ def _classify_bucket(days: int) -> str:
     CORRECTED — matches decision_engine.py's classify_bucket() exactly,
     after the renumbering that merged the old P1 (0-3) and P2 (4-7) into a
     single P1 (0-7), and shifted every bucket below it down by one:
-    P1 0-7 days, P2 8-30 days, P3 31-60 days, P4 61+ days (safe).
+    P1 0-7 days, P2 8-30 days, P3 31-45 days, P4 46+ days (safe).
     """
-    if days >= 61:       return "P4"
-    if 31 <= days <= 60: return "P3"
+    if days >= 46:       return "P4"
+    if 31 <= days <= 45: return "P3"
     if 8  <= days <= 30: return "P2"
     if 0  <= days <= 7:  return "P1"
     if -7 <= days <= -1: return "ExpiredManualReview"
@@ -1086,7 +1086,7 @@ def main():
              "DevSecOpsOwnership filter, configurable SECRET-VALIDITY-DAYS, "
              "bucket scheme corrected to match decision_engine.py)", started)
 
-    summary = run_secret_rotation(rotation_threshold_days=60)
+    summary = run_secret_rotation(rotation_threshold_days=45)
 
     print("=" * 60)
     print("ROTATION RUNBOOK v3 — SUMMARY")

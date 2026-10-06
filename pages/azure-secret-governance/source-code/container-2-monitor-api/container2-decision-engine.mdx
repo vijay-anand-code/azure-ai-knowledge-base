@@ -535,8 +535,8 @@ def classify_bucket(days: int) -> str:
                                   specific person; 4-7 days is a plain Teams alert
                                   with no tag. Both are still bucket P1.)
     P2  8-30 days  WARNING      (Jira ticket + Teams alert)
-    P3  31-60 days INFORMATION  (Jira ticket only, no Teams alert)
-    P4  61+ days   SAFE         (logged only, no alert, no ticket, no rotation)
+    P3  31-45 days INFORMATION  (Jira ticket only, no Teams alert)
+    P4  46+ days   SAFE         (logged only, no alert, no ticket, no rotation)
  
     NOTE (renumbering): this replaces an earlier five-bucket scheme
     (P1=0-3, P2=4-7, P3=8-30, P4=31-60, P5=61+). P1 and P2 have been merged
@@ -547,10 +547,10 @@ def classify_bucket(days: int) -> str:
     is now P3, old P5 (safe) is now P4. Jira priority names in SEVERITY_MAP
     already exist as P1 through P4 in the Jira project, so no new priority
     names need to be created for this change, only the day ranges they map
-    to have moved.
+    to have moved. P3 threshold adjusted to 31-45 days (safe starting at 46+ days).
     """
-    if days >= 61:       return "P4"
-    if 31 <= days <= 60: return "P3"
+    if days >= 46:       return "P4"
+    if 31 <= days <= 45: return "P3"
     if 8  <= days <= 30: return "P2"
     if 0  <= days <= 7:  return "P1"
     if -7 <= days <= -1: return "ExpiredManualReview"
