@@ -8,7 +8,11 @@
   "teams-bot": "Teams Bot",
   "dashboard": "Dashboard",
   "source-code": {
-    "title": "Source Code",
+    "title": "Source Code (Baseline)",
+    "defaultOpen": false
+  },
+  "pattern-analysis": {
+    "title": "Pattern Analysis (Latest)",
     "defaultOpen": true
   }
 }

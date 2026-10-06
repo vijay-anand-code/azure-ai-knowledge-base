@@ -1,0 +1,108 @@
+---
+title: Pattern Analysis & 1Password Governance (Latest)
+description: Production-tested Azure Secret Governance engine featuring dynamic pattern matching, Jira ticket bypass for Tenant 2 microservices, automated SharePoint enrichment, and 1Password vault synchronization.
+---
+
+import { Callout } from 'nextra/components'
+
+# Pattern Analysis & 1Password Governance (Latest Architecture)
+
+This section contains the **latest production code** for Azure Secret Governance with **Dynamic Pattern Analysis** and **1Password Vault Isolation**.
+
+While the baseline code routes every single expiring secret through Jira tickets and manual human intake, this architecture introduces intelligent workload classification: **standard enterprise apps follow the formal Jira approval process**, while **high-frequency automated services in the secondary tenant bypass Jira tickets and sync directly into 1Password vaults**.
+
+---
+
+## Architecture: Standard vs. Pattern Workloads
+
+```mermaid
+flowchart TD
+    A["Multi-Tenant Azure Entra Scan<br/>(Tenant 1 & Tenant 2)"] --> B["Evaluate Expiration Horizon<br/>(45-Day Governance Threshold)"]
+
+    B --> C{"Days Remaining?"}
+    C -- "46+ Days" --> D["Bucket P4 (Safe)<br/>Logged only in SharePoint • No Action"]
+    C -- "31 to 45 Days" --> E["Bucket P3 (Active Window)"]
+    C -- "8 to 30 Days" --> F["Bucket P2 (Warning Window)"]
+    C -- "0 to 7 Days" --> G["Bucket P1 (Critical Window)"]
+
+    E & F & G --> H{"Evaluate Pattern Matching Rules"}
+
+    subgraph StandardFlow["Standard Workload Path (Primary Tenant or Non-Pattern)"]
+        H -- "Rule Fails (Tenant 1 or Standard App)" --> I["Create Jira Ticket (KAN)<br/>Literal Priority: P1 / P2 / P3"]
+        I --> J["Teams Alert (P1 / P2 only)<br/>P3 Teams Suppressed"]
+        J --> K["Engineer Completes Intake in Jira<br/>(TeamName, ProductName, Vault)"]
+        K --> L["Rotate in Entra ID ➔ Store in Azure Key Vault"]
+    end
+
+    subgraph PatternFlow["Pattern Analysis Path (Tenant 2 Microservices)"]
+        H -- "Rule Passes (Tenant 2 + Pattern Match)" --> M["BYPASS Jira Ticket Creation<br/>(Zero Human Bottleneck)"]
+        M --> N["Auto-Enrich SharePoint Metadata<br/>(TeamName & ProductName auto-derived)"]
+        N --> O["Automatic Rotation (≤ 45 Days)<br/>New Entra Secret Generated"]
+        O --> P["Provision in Dedicated 1Password Vault<br/>Apply Granular Group Access (RBAC)"]
+        P --> Q["Update SharePoint to Rotated<br/>Record NewSecretKeyId in Ledger"]
+    end
+```
+
+---
+
+## The Two Strict Rules of Pattern Analysis
+
+To protect enterprise compliance, Jira ticket creation is **never** bypassed indiscriminately. A secret candidate must satisfy **BOTH** of the following conditions:
+
+```python
+def should_bypass_jira_for_secret(c: dict, patterns=None, target_tenants=None) -> bool:
+    # Rule 1: MUST originate from the designated Second Tenant
+    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
+    if tenant_id not in [t.lower() for t in (target_tenants or DEFAULT_PATTERN_BYPASS_TENANTS)]:
+        return False
+
+    # Rule 2: Secret display name MUST match configured glob/substring patterns
+    name = (c.get("secret_display_name") or c.get("SecretDescription") or "").lower()
+    return any(fnmatch.fnmatchcase(name, pat.lower()) for pat in (patterns or DEFAULT_BYPASS_JIRA_PATTERNS))
+```
+
+### Rule 1: Strict Tenant 2 Isolation
+* **Condition:** The secret **MUST** originate from Tenant 2 (`c721d616-dcf3-4510-9c3e-548bc6c1f628`).
+* **Protection:** Secrets belonging to the Primary Tenant (`70afdd80-5f5b-4a09-a90d-383f126e8c33`) are **NEVER bypassed**, regardless of their name. They always follow the standard human-governed Jira ticket flow.
+
+### Rule 2: Display Name Pattern Matching
+* **Condition:** The Entra credential `displayName` or description must match one of the configured naming patterns:
+  * `*.select*` (e.g. `reporting.select.appkey`)
+  * `practice-plus-*` (e.g. `practice-plus-worker-cert`)
+  * `*partner*` (e.g. `crm-partner-auth-token`)
+
+---
+
+## 45-Day Governance Threshold
+
+Both the Decision Engine and the Rotation Engine operate on the **45-day threshold** model:
+
+| Horizon (Days Remaining) | Bucket | Jira Ticket (Standard) | Jira Ticket (Pattern App) | Teams Notification | Rotation Eligible |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **46+ Days** | **P4** | Logged Only (Safe) | Logged Only (Safe) | None | No |
+| **31 – 45 Days** | **P3** | Created (`Priority: P3`) | **BYPASSED** | Suppressed | **Yes** (Threshold ≤ 45) |
+| **8 – 30 Days** | **P2** | Created (`Priority: P2`) | **BYPASSED** | Warning Card Sent | **Yes** |
+| **0 – 7 Days** | **P1** | Created (`Priority: P1`) | **BYPASSED** | Critical Card (@mention for 0-3d) | **Yes** |
+| **Past Expiry (-1 to -7d)** | **Expired** | Created (`Priority: P1`) | Logged for Manual Review | Critical Alert | Manual Review Only |
+
+---
+
+## 1Password Vault Isolation & Group Access
+
+For pattern-matched applications, rotation does not stop at Azure Key Vault. It integrates directly with 1Password:
+
+1. **Vault Scoping:** The rotator dynamically locates or provisions a dedicated team vault:
+   ```
+   Vault Name: <AppName>-Vault  (or  <ProductName>-Secrets)
+   ```
+2. **Item Provisioning:** Generates a new secret version in Entra ID, stores the client secret credentials as a secure item inside the target vault, and creates a time-limited 1Password secure share link.
+3. **Group Access Isolation:** Automatically binds the vault to designated 1Password / Entra ID user groups (e.g. `Developers-Group`, `DevSecOps-Engineers`), ensuring team members have immediate access without manual ticket handling.
+4. **SharePoint Record:** Stamps `RotationDetectedDate`, `NewSecretKeyId`, and marks `AlertStatus = RotatedPendingDeployment` / `Rotated`.
+
+---
+
+## Files in this Section
+
+* [`decision_engine.py`](/azure-secret-governance/pattern-analysis/decision-engine): Full Decision Engine code with multi-tenant scanning, 45-day buckets, pattern analysis, and auto-enrichment.
+* [`secret_rotation_engine.py`](/azure-secret-governance/pattern-analysis/rotation-engine): Rotation Engine with dual-routing (Key Vault for Jira tickets, 1Password SDK with group access for pattern apps).
+* [`test_45_day_pattern_matrix.py`](/azure-secret-governance/pattern-analysis/test-matrix): Automated 10-scenario test suite proving thresholds, Jira bypass, and 1Password sync isolation.
