@@ -1,36 +1,8 @@
----
-title: Decision Engine (Container 2)
-description: Production Decision Engine with dynamic pattern matching, 45-day threshold buckets, Tenant 2 Jira bypass, and SharePoint metadata auto-enrichment.
----
+# Pattern Analysis: Decision Engine
 
-import { Callout } from 'nextra/components'
+This is the upgraded decision_engine.py incorporating Dynamic Pattern Analysis and auto-enrichment for Second Tenant service credentials.
 
-# Pattern Analysis Decision Engine (Container 2)
-
-**File Location:** `pages/azure-secret-governance/pattern-analysis/decision_engine.py`
-
-**Runtime:** Python 3.10+ (Azure Container Apps `monitor-mcp` microservice)
-
-The Decision Engine evaluates multi-tenant Entra ID secret expiration horizons and orchestrates governance actions across SharePoint, Jira, and Microsoft Teams.
-
----
-
-## Key Features in this Architecture
-
-| Feature | Implementation Details |
-| :--- | :--- |
-| **45-Day Governance Threshold** | `P4` (46+ days Safe), `P3` (31–45 days Active Ticket), `P2` (8–30 days Warning), `P1` (0–7 days Critical). |
-| **Strict Tenant 2 Scoping** | Only secrets originating from `c721d616-dcf3-4510-9c3e-548bc6c1f628` can qualify for Jira bypass. Primary tenant apps always trigger Jira tickets. |
-| **Display Name Pattern Matching** | Matches glob/substring expressions (`*.select*`, `practice-plus-*`, `*partner*`) against credential `displayName`. |
-| **Jira Bypass for Pattern Apps** | Skips Jira ticket creation in Phase 1 and existing self-healing sweeps for matched microservices. |
-| **SharePoint Metadata Auto-Enrichment** | Auto-populates `TeamName`, `ProductName`, and `ProductTeamsKeyVaultName` directly for pattern apps, removing the human Jira intake requirement. |
-| **PATCH TenantID Protection** | Safe SharePoint updates that never overwrite multi-tenant IDs on status updates. |
-
----
-
-## Source Code
-
-```python filename="decision_engine.py"
+`python
 """
 decision_engine.py - Secret Monitoring Decision Engine (devsecops-secret-governance-monitor-mcp)
 =====================================================================
@@ -1956,7 +1928,7 @@ async def _handle_existing_secret(
         update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
-            if "JiraTicketCreatedDate" not in f:
+            if not f.get("JiraTicketCreatedDate"):
                 update_fields["JiraTicketCreatedDate"] = today
  
         if bucket in TEAMS_ALERT_BUCKETS:
@@ -2005,6 +1977,8 @@ async def _handle_existing_secret(
         update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
+            if not f.get("JiraTicketCreatedDate"):
+                update_fields["JiraTicketCreatedDate"] = today
 
         # DYNAMIC PATTERN ANALYSIS: Auto-enrich metadata for pattern-matching secrets in Second Tenant
         if should_bypass_jira:
@@ -2019,4 +1993,4 @@ async def _handle_existing_secret(
         result["sp_updated"] = True
  
     return result
-```
+`
