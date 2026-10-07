@@ -1,12 +1,27 @@
 ---
-title: Source Code
-description: Full annotated source code for all runbooks and container files
+title: Source Code (Baseline)
+description: Full annotated source code and implementation guide for all runbooks and container files
 ---
 
-# Source Code
+import { Callout } from 'nextra/components'
+
+# Source Code (Baseline)
 
 Complete source for every file in the secret governance system: runbooks that run in
 Azure Automation and the container files that power the monitoring API.
+
+<Callout type="info">
+**Looking to implement the latest fixes and threshold updates?**  
+Check the **[Client Implementation & Upgrade Guide](/azure-secret-governance/source-code/client-implementation-guide)** for exact code diffs covering Jira static summaries, description custom fields, due dates, 45-day thresholds, ignore indexing, -8 days abandonment rules, and multi-tenant guards.
+</Callout>
+
+---
+
+## Architecture & Implementation Guides
+
+| Guide | Description |
+| :--- | :--- |
+| **[Client Implementation & Upgrade Guide](/azure-secret-governance/source-code/client-implementation-guide)** | Exact step-by-step code modifications required to implement the baseline architecture in client environments. |
 
 ---
 
