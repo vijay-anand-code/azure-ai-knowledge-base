@@ -1,6 +1,6 @@
 {
   "index": "Overview",
-  "client-implementation-guide": "Client Implementation Guide",
+  "implementation-guide": "Implementation Guide",
   "discovery-runbook": "Discovery Runbook",
   "owner-sync-runbook": "Owner Sync Runbook",
   "monitoring-runbook": "Monitoring Runbook",

@@ -7,7 +7,7 @@ import { Callout } from 'nextra/components'
 
 # Baseline Implementation & Code Modification Guide
 
-This guide is the complete operational and architectural specification for the **Baseline (Old Solution)** of the Azure Secret Governance system. It details every single modification made to the baseline engine, the exact rationale behind each decision, the precise code diffs, and the step-by-step instructions required for client teams to deploy and maintain these changes in their own environment.
+This guide is the complete operational and architectural specification for the **Baseline (Old Solution)** of the Azure Secret Governance system. It details every single modification made to the baseline engine, the exact rationale behind each decision, the precise code diffs, and the step-by-step instructions required for engineering teams to deploy and maintain these changes in their own environment.
 
 <Callout type="info">
 **Scope:** This document applies exclusively to the **Baseline Solution** (standard enterprise multi-tenant secret governance without pattern analysis). For the automated 1Password rotation engine and secondary tenant Jira bypass, see the [Pattern Analysis](/azure-secret-governance/pattern-analysis) section.
@@ -65,7 +65,7 @@ summary_line = f"[{severity}] Azure Secret Expiry - {app_name}"
 ### Change 2: Jira Description & Custom Field Support
 
 #### The Problem
-In customized Jira Service Management (JSM) and enterprise Jira Software projects, the default system description field is often hidden, restricted, or requires Jira REST API v3 Atlassian Document Format (ADF). Additionally, many client organizations capture description content inside a dedicated custom field (such as `customfield_10028`).
+In customized Jira Service Management (JSM) and enterprise Jira Software projects, the default system description field is often hidden, restricted, or requires Jira REST API v3 Atlassian Document Format (ADF). Additionally, many organizations capture description content inside a dedicated custom field (such as `customfield_10028`).
 
 #### The Solution
 Container 2 now constructs a structured multi-line plain text payload and conditionally injects it into both the system description field and an optional custom field defined by the environment variable `JIRA_DESCRIPTION_CUSTOM_FIELD_ID`.
@@ -113,7 +113,7 @@ if JIRA_DESCRIPTION_CUSTOM_FIELD_ID:
     payload["fields"][JIRA_DESCRIPTION_CUSTOM_FIELD_ID] = text
 ```
 
-#### Client Configuration
+#### Environment Configuration
 If your Jira project uses a custom field for description, set this environment variable in Azure Container App (`container-2`):
 ```bash
 JIRA_DESCRIPTION_CUSTOM_FIELD_ID="customfield_10028"
@@ -454,7 +454,7 @@ Configure a Custom Runtime Environment in Azure Automation:
 
 ---
 
-## 3. Client Deployment Checklist
+## 3. Deployment Checklist
 
 ```markdown
 - [ ] 1. container-2/main.py: Verify static summary line.
