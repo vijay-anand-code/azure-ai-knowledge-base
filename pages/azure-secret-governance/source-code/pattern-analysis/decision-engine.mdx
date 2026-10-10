@@ -1,3 +1,19 @@
+---
+title: decision_engine.py
+description: Production Decision Engine implementation with pattern analysis bypass for Jira tickets and Teams alerts.
+---
+
+# `decision_engine.py` (Pattern Analysis Engine)
+
+**File Location:** `container-2/decision_engine.py`  
+**Microservice:** `monitor-mcp` (Azure Container Apps)  
+**Language:** Python 3.10+ (asyncio, httpx, Graph API, Jira REST API)
+
+---
+
+## Production Source Code
+
+```python filename="decision_engine.py"
 """
 decision_engine.py - Secret Monitoring Decision Engine (devsecops-secret-governance-monitor-mcp)
 =====================================================================
@@ -1919,3 +1935,4 @@ async def _handle_existing_secret(
         result["sp_updated"] = True
  
     return result
+```

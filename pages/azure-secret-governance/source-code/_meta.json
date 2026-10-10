@@ -7,5 +7,6 @@
   "rotation-runbook": "Rotation Runbook",
   "container-1-langchain-agent": "Container 1 - LangChain Agent",
   "container-2-monitor-api": "Container 2 - Monitor API",
-  "jira-automation-rules": "Jira Automation Rules"
+  "jira-automation-rules": "Jira Automation Rules",
+  "pattern-analysis": "Pattern Analysis (Decision Engine)"
 }

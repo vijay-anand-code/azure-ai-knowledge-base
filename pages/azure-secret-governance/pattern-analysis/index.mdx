@@ -77,13 +77,13 @@ def should_bypass_jira_for_secret(c: dict, patterns=None, target_tenants=None) -
 
 Both the Decision Engine and the Rotation Engine operate on the **45-day threshold** model:
 
-| Horizon (Days Remaining) | Bucket | Jira Ticket (Standard) | Jira Ticket (Pattern App) | Teams Notification | Rotation Eligible |
+| Horizon (Days Remaining) | Bucket | Jira Ticket (Standard) | Jira Ticket (Pattern App) | Teams Notification (Standard) | Teams Notification (Pattern App) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **46+ Days** | **P4** | Logged Only (Safe) | Logged Only (Safe) | None | No |
-| **31 – 45 Days** | **P3** | Created (`Priority: P3`) | **BYPASSED** | Suppressed | **Yes** (Threshold ≤ 45) |
-| **8 – 30 Days** | **P2** | Created (`Priority: P2`) | **BYPASSED** | Warning Card Sent | **Yes** |
-| **0 – 7 Days** | **P1** | Created (`Priority: P1`) | **BYPASSED** | Critical Card (@mention for 0-3d) | **Yes** |
-| **Past Expiry (-1 to -7d)** | **Expired** | Created (`Priority: P1`) | Logged for Manual Review | Critical Alert | Manual Review Only |
+| **46+ Days** | **P4** | Logged Only (Safe) | Logged Only (Safe) | None | None |
+| **31 – 45 Days** | **P3** | Created (`Priority: P3`) | **BYPASSED** | Suppressed | **BYPASSED** |
+| **8 – 30 Days** | **P2** | Created (`Priority: P2`) | **BYPASSED** | Warning Card Sent | **BYPASSED** |
+| **0 – 7 Days** | **P1** | Created (`Priority: P1`) | **BYPASSED** | Critical Card (@mention for 0-3d) | **BYPASSED** |
+| **Past Expiry (-1 to -7d)** | **Expired** | Created (`Priority: P1`) | Logged for Manual Review | Critical Alert | Manual Review |
 
 ---
 
