@@ -1,4 +1,5 @@
 {
   "index": "Overview & Architecture",
-  "decision-engine": "decision_engine.py"
+  "decision-engine": "decision_engine.py",
+  "test-suite": "test_pattern_bypass_governance.py"
 }

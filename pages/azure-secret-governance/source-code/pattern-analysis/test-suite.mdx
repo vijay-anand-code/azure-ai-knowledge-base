@@ -1,0 +1,84 @@
+---
+title: Test Suite (test_pattern_bypass_governance.py)
+description: Automated test suite for fail-safe environment variable driven pattern bypass and live SharePoint / Jira verification.
+---
+
+import { Callout } from 'nextra/components'
+
+# Automated Test Suite: Pattern Bypass Governance
+
+**File Location:** `pages/azure-secret-governance/source-code/pattern-analysis/test_pattern_bypass_governance.py`
+
+This test suite executes **16 automated test cases** verifying:
+1. **Part 1: Strict Fail-Safe Logic (Unit Tests):** Verifies that if `BYPASS_JIRA_TENANT_IDS` or `BYPASS_JIRA_PATTERNS` are missing, unset, or empty, bypass is completely disabled (`False`). No hardcoded fallback lists exist in the codebase.
+2. **Part 2: Multi-Tenant Pattern Isolation:** Verifies glob matching (`*.select*`, `practice-plus-*`, `*partner*`), case insensitivity, comma-separated whitespace handling, and strict tenant isolation (Primary Tenant secrets are never bypassed).
+3. **Part 3: Expiry Notice & Bucket Matrix:** Verifies P1..P4 bucket thresholds and formatting of `ExpiryNotice`.
+4. **Part 4: Live Azure & Jira Verification (E2E):** Connects to live Microsoft Graph SharePoint list and verifies that:
+   - `Test-EnvPattern-Partner-Live` has `AlertStatus: Discovered` and `JiraTicketKey: None`.
+   - `Test-EnvStandard-Portal-Live` has `AlertStatus: TeamsAlerted` and `JiraTicketKey: KAN-3367`.
+
+---
+
+## Test Execution Results (16 / 16 Passed)
+
+```text
+==========================================================================================
+AZURE SECRET GOVERNANCE - FAIL-SAFE PATTERN BYPASS TEST MATRIX SUMMARY
+==========================================================================================
+TC #   | Test Scenario                                 | Expected Bypass    | Type
+------------------------------------------------------------------------------------------
+TC-01  | Both env vars missing (BYPASS_* unset)        | False (Fail-Safe)  | Unit
+TC-02  | BYPASS_JIRA_PATTERNS unset                    | False (Fail-Safe)  | Unit
+TC-03  | BYPASS_JIRA_TENANT_IDS unset                  | False (Fail-Safe)  | Unit
+TC-04  | Env vars set to empty spaces ('   ')          | False (Fail-Safe)  | Unit
+TC-05  | Matching Tenant + *partner* secret            | True (Bypassed)    | Unit
+TC-06  | Matching Tenant + *.select* secret            | True (Bypassed)    | Unit
+TC-07  | Matching Tenant + practice-plus-*             | True (Bypassed)    | Unit
+TC-08  | Matching Tenant + standard-portal-key         | False (Ticketing)  | Unit
+TC-09  | Unlisted Tenant + *partner* secret            | False (Isolation)  | Unit
+TC-10  | Case Insensitivity & Uppercase matching       | True (Bypassed)    | Unit
+TC-11  | Whitespace in comma-separated env vars        | True (Bypassed)    | Unit
+TC-12  | Bucket Classification (P1/P2/P3/P4)           | N/A                | Matrix
+TC-13  | Bypassed ExpiryNotice formatting              | True (Notice)      | Matrix
+TC-14  | Standard ExpiryNotice countdown format        | False (Notice)     | Matrix
+TC-15  | Live SP Verification: Pattern App             | True (Discovered)  | Live E2E
+TC-16  | Live SP Verification: Standard App            | False (KAN Ticket) | Live E2E
+==========================================================================================
+
+test_case_insensitivity (TC-10) ............................................ ok
+test_failsafe_both_env_vars_missing (TC-01) ................................ ok
+test_failsafe_empty_strings (TC-04) ........................................ ok
+test_failsafe_patterns_env_missing (TC-02) ................................. ok
+test_failsafe_tenants_env_missing (TC-03) .................................. ok
+test_matching_pattern_in_unlisted_tenant_returns_false (TC-09) ............. ok
+test_matching_tenant_and_pattern_returns_true (TC-05) ...................... ok
+test_matching_tenant_and_prefix_pattern_returns_true (TC-07) ............... ok
+test_matching_tenant_and_select_pattern_returns_true (TC-06) ............... ok
+test_non_matching_pattern_in_allowed_tenant_returns_false (TC-08) .......... ok
+test_whitespace_tolerance_in_env_vars (TC-11) .............................. ok
+test_bucket_classification (TC-12) ......................................... ok
+test_expiry_notice_bypassed_format (TC-13) ................................. ok
+test_expiry_notice_standard_format (TC-14) ................................. ok
+test_live_pattern_app_sharepoint_record (TC-15 LIVE) ....................... ok
+test_live_standard_app_sharepoint_record (TC-16 LIVE) ...................... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 1.714s
+
+OK
+```
+
+---
+
+## CLI Execution Options
+
+```bash
+# Run unit and matrix tests (no Azure credentials required)
+python test_pattern_bypass_governance.py
+
+# Run all 16 tests including live Azure SharePoint & Jira checks
+python test_pattern_bypass_governance.py --all
+
+# Run live E2E integration verification only
+python test_pattern_bypass_governance.py --live
+```

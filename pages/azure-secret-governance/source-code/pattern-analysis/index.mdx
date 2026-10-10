@@ -73,14 +73,15 @@ The pattern analysis implementation was verified live against Azure production i
 
 * **Execution Trigger**: Azure Automation Runbook `secret-monitoring` (`secret-rotation-sentinel` in resource group `Foundry-Project`).
 * **Container Endpoint**: `https://secret-governance-v2.ambitiousbay-f708bc7b.southindia.azurecontainerapps.io/run`
-* **Test Apps Evaluated**:
-  1. `Test-Pattern-App-Select-Live` (`auth.select.credential`) &rarr; **Bypassed**: Logged in SharePoint as `AlertStatus: Discovered`, `JiraTicketKey: None`, 0 Teams alerts, 0 Jira tickets.
-  2. `Test-Standard-App-Gateway-Live` (`standard-gateway-secret`) &rarr; **Standard**: Ticket `KAN-3364` created, Teams alert sent, logged as `AlertStatus: TeamsAlerted`.
-* **SharePoint List Count**: Verified delta from `1,294` &rarr; `1,296` items (+2 items logged).
-* **Jira Ticket Count**: Verified delta from `233` &rarr; `236` issues (Standard app ticket `KAN-3364` created; pattern app ticket completely bypassed).
+* **Test Apps Evaluated (Dynamic Environment Variables)**:
+  1. `Test-EnvPattern-Partner-Live` (`service.partner.webhook` matching `*partner*`) &rarr; **Bypassed**: Logged in SharePoint as `AlertStatus: Discovered`, `JiraTicketKey: None`, `ExpiryNotice: P2: Pattern-matched workload (Jira & Teams bypassed)`.
+  2. `Test-EnvStandard-Portal-Live` (`standard-portal-key` non-matching) &rarr; **Standard**: Ticket `KAN-3367` created, Teams alert sent, logged as `AlertStatus: TeamsAlerted`.
+* **SharePoint Master Registry Count**: Verified delta from `1,296` &rarr; `1,298` items (+2 items logged).
+* **Jira Ticket Count**: Verified delta from `236` &rarr; `237` issues (Standard app ticket `KAN-3367` created; pattern app ticket completely bypassed).
 
 ---
 
 ## Files in this Section
 
 * [`decision_engine.py`](/azure-secret-governance/source-code/pattern-analysis/decision-engine): Full production Decision Engine source code.
+* [`test_pattern_bypass_governance.py`](/azure-secret-governance/source-code/pattern-analysis/test-suite): Automated 16-test unit and E2E verification suite.
