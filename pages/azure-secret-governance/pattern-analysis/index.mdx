@@ -50,15 +50,20 @@ flowchart TD
 To protect enterprise compliance, Jira ticket creation is **never** bypassed indiscriminately. A secret candidate must satisfy **BOTH** of the following conditions:
 
 ```python
-def should_bypass_jira_for_secret(c: dict, patterns=None, target_tenants=None) -> bool:
-    # Rule 1: MUST originate from the designated Second Tenant
-    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
-    if tenant_id not in [t.lower() for t in (target_tenants or DEFAULT_PATTERN_BYPASS_TENANTS)]:
+def should_bypass_jira_for_secret(c: dict) -> bool:
+    env_tenants = os.environ.get("BYPASS_JIRA_TENANT_IDS")
+    if not env_tenants:
+        return False
+    allowed_tenants = [t.strip().lower() for t in env_tenants.split(",") if t.strip()]
+    if not allowed_tenants:
         return False
 
-    # Rule 2: Secret display name MUST match configured glob/substring patterns
-    name = (c.get("secret_display_name") or c.get("SecretDescription") or "").lower()
-    return any(fnmatch.fnmatchcase(name, pat.lower()) for pat in (patterns or DEFAULT_BYPASS_JIRA_PATTERNS))
+    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
+    if tenant_id not in allowed_tenants:
+        return False
+
+    desc = c.get("secret_desc") or c.get("SecretDescription") or ""
+    return matches_bypass_jira_pattern(desc)
 ```
 
 ### Rule 1: Strict Tenant 2 Isolation

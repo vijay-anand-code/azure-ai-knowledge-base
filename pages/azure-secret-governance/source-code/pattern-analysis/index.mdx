@@ -50,31 +50,19 @@ To guarantee enterprise compliance and prevent accidental alert suppression, a s
      * `practice-plus-*` (e.g. `practice-plus-worker-key`)
      * `*partner*` (e.g. `partner-gateway-secret`)
 
-```python
-DEFAULT_BYPASS_JIRA_PATTERNS = [
-    "*.select*",
-    "practice-plus-*",
-    "*partner*",
-]
-
-DEFAULT_PATTERN_BYPASS_TENANTS = [
-    "c721d616-dcf3-4510-9c3e-548bc6c1f628",
-]
-```
-
 ---
 
-## Dynamic Configuration & Fallback Support
+## Environment Variable Configuration (Fail-Safe Default)
 
-The Decision Engine supports dynamic overrides via Container App environment variables without requiring code modifications:
+The bypass mechanism is strictly driven by Azure Container App environment variables. To prevent production issues or accidental alert suppression, **there are no hardcoded default bypass lists in the code**:
 
-| Environment Variable | Description | Default Fallback Value |
-| :--- | :--- | :--- |
-| `BYPASS_JIRA_PATTERNS` | Comma-separated list of glob/substring patterns to bypass | `*.select*,practice-plus-*,*partner*` |
-| `BYPASS_JIRA_TENANT_IDS` | Comma-separated list of Entra tenant IDs where bypass applies | `c721d616-dcf3-4510-9c3e-548bc6c1f628` |
+| Environment Variable | Description | Value Example | Missing / Unset Behavior |
+| :--- | :--- | :--- | :--- |
+| `BYPASS_JIRA_PATTERNS` | Comma-separated list of glob/substring patterns to bypass | `*.select*,practice-plus-*,*partner*` | **Bypass Disabled** (No patterns match) |
+| `BYPASS_JIRA_TENANT_IDS` | Comma-separated list of Entra tenant IDs where bypass applies | `c721d616-dcf3-4510-9c3e-548bc6c1f628` | **Bypass Disabled** (No tenants match) |
 
-<Callout type="info">
-  When these environment variables are omitted or unset, the engine automatically falls back to the hardcoded default constants above.
+<Callout type="warning">
+  **Fail-Safe Design:** If either `BYPASS_JIRA_PATTERNS` or `BYPASS_JIRA_TENANT_IDS` is unset or empty, the Decision Engine automatically defaults to `False` (zero bypasses). All expiring secrets will follow standard Jira ticket creation and Teams alert lifecycles.
 </Callout>
 
 ---
